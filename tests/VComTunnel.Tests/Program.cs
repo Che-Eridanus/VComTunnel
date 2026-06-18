@@ -15,6 +15,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("KMDF control path uses visible COM", () => Task.Run(KmdfControlPathUsesVisibleCom)),
     ("KMDF pnputil CSV parser finds VComTunnel ports", () => Task.Run(KmdfPnpUtilCsvParserFindsPorts)),
     ("RFC2217 command encoding", () => Task.Run(Rfc2217CommandEncoding)),
+    ("hub4com RFC2217 client baseline", () => Task.Run(Hub4comRfc2217ClientBaseline)),
     ("RFC2217 telnet parser", () => Task.Run(Rfc2217TelnetParser)),
     ("RFC2217 ack semantics", () => Task.Run(Rfc2217AckSemantics)),
     ("RFC2217 notification mappings", () => Task.Run(Rfc2217NotificationMappings)),
@@ -249,6 +250,80 @@ static void Rfc2217CommandEncoding()
     AssertBytes(
         [0xFF, 0xFA, 0x2C, 0x00, 0x56, 0x43, 0x6F, 0x6D, 0xFF, 0xF0],
         Rfc2217Client.BuildSignature("VCom"));
+}
+
+static void Hub4comRfc2217ClientBaseline()
+{
+    var initial = new Rfc2217Client().BuildInitialNegotiation();
+    AssertBytes(
+        [
+            0xFF, 0xFB, 0x2C,
+            0xFF, 0xFD, 0x2C,
+            0xFF, 0xFB, 0x00,
+            0xFF, 0xFD, 0x00,
+            0xFF, 0xFB, 0x03,
+            0xFF, 0xFD, 0x03
+        ],
+        initial.Take(18).ToArray());
+    AssertRfc2217Notifications(
+        initial,
+        new Rfc2217Notification(10, [0x1E]),
+        new Rfc2217Notification(11, [0xFF]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetBaudRate(115200),
+        new Rfc2217Notification(1, [0x00, 0x01, 0xC2, 0x00]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetLineControl(stopBits: 0, parity: 0, wordLength: 8),
+        new Rfc2217Notification(2, [8]),
+        new Rfc2217Notification(3, [1]),
+        new Rfc2217Notification(4, [1]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetModemControl(dtr: true, rts: true),
+        new Rfc2217Notification(5, [8]),
+        new Rfc2217Notification(5, [11]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetModemControl(dtr: false, rts: false),
+        new Rfc2217Notification(5, [9]),
+        new Rfc2217Notification(5, [12]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetBreak(enabled: true),
+        new Rfc2217Notification(5, [5]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetBreak(enabled: false),
+        new Rfc2217Notification(5, [6]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetHandflow(controlHandshake: 0, flowReplace: 0),
+        new Rfc2217Notification(5, [1]),
+        new Rfc2217Notification(5, [14]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetHandflow(controlHandshake: 0, flowReplace: 0x03),
+        new Rfc2217Notification(5, [2]),
+        new Rfc2217Notification(5, [15]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetHandflow(controlHandshake: 0x08, flowReplace: 0x80),
+        new Rfc2217Notification(5, [3]),
+        new Rfc2217Notification(5, [16]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetHandflow(controlHandshake: 0x12, flowReplace: 0),
+        new Rfc2217Notification(5, [19]),
+        new Rfc2217Notification(5, [18]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildSetHandflow(controlHandshake: 0x20, flowReplace: 0x80),
+        new Rfc2217Notification(5, [17]),
+        new Rfc2217Notification(5, [16]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildPurge(0x0C),
+        new Rfc2217Notification(12, [3]));
+
+    AssertEqual("240", Rfc2217Client.MapNotifyModemStateToWindowsStatus(0xF0).ToString());
+    AssertEqual("312", Rfc2217Client.MapNotifyModemStateToWindowsEvents(0x0F).ToString());
+    AssertEqual("23", Rfc2217Client.MapNotifyLineStateToWindowsErrors(0x1E).ToString());
 }
 
 static void Rfc2217TelnetParser()
@@ -623,6 +698,17 @@ static void AssertBytes(byte[] expected, byte[] actual)
     if (!expected.SequenceEqual(actual))
     {
         throw new Exception($"Expected {Convert.ToHexString(expected)}, got {Convert.ToHexString(actual)}.");
+    }
+}
+
+static void AssertRfc2217Notifications(byte[] frame, params Rfc2217Notification[] expected)
+{
+    var actual = new Rfc2217Client().ProcessNetworkBytes(frame, frame.Length).Notifications;
+    AssertEqual(expected.Length.ToString(), actual.Count.ToString());
+    for (var i = 0; i < expected.Length; i++)
+    {
+        AssertEqual(expected[i].Command.ToString(), actual[i].Command.ToString());
+        AssertBytes(expected[i].Payload, actual[i].Payload);
     }
 }
 
