@@ -280,11 +280,6 @@ public sealed class KmdfTunnelSession : IDisposable
             while (!_stop.IsCancellationRequested)
             {
                 await Task.Delay(KeepAlivePollInterval, _stop.Token).ConfigureAwait(false);
-                if (IsRemoteFlowSuspended())
-                {
-                    continue;
-                }
-
                 var idle = Stopwatch.GetElapsedTime(Interlocked.Read(ref _lastNetworkActivityTicks));
                 if (idle >= KeepAliveInterval)
                 {

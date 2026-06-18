@@ -103,15 +103,19 @@ Current implementation note:
 - Known RFC2217 subnegotiations are validated for their expected payload length
   before service-side handling; malformed known commands are ignored and any
   pending ACK wait follows the existing timeout/retry policy.
-- RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and control commands
-  until FLOWCONTROL-RESUME is received.
+- RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and serial-control
+  commands until FLOWCONTROL-RESUME is received. Telnet negotiation replies,
+  RX-backpressure FLOWCONTROL frames, and idle NOP keep-alives are still allowed
+  so the TCP/Telnet session can stay healthy while serial data is paused.
 - Local `IOCTL_SERIAL_SET_XOFF` and `IOCTL_SERIAL_SET_XON` requests are sent to
   the RFC2217 endpoint as FLOWCONTROL-SUSPEND and FLOWCONTROL-RESUME.
 - If the driver's RX queue is full while network bytes arrive, the service sends
   RFC2217 FLOWCONTROL-SUSPEND, retries the same RX frame without duplicating
   bytes, then sends FLOWCONTROL-RESUME once the driver accepts it.
 - TCP writes are serialized across driver events, Telnet negotiation replies,
-  and idle keep-alive. Idle RFC2217 sessions send Telnet NOP every 30 seconds.
+  RX-backpressure flow-control frames, and idle keep-alive. Idle RFC2217
+  sessions send Telnet NOP every 30 seconds, including while remote serial
+  flow-control is suspended.
 - Startup connection failures and runtime network drops feed the same
   `RestartOnFailure` policy. Manual Stop invalidates delayed restarts so a
   stopped mapping stays stopped.

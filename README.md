@@ -199,7 +199,8 @@ startup line/modem mask ACK validation, remote flow-control suspend/resume
 handling, local XOFF/XON and RX backpressure through RFC2217
 FLOWCONTROL-SUSPEND/RESUME,
 SIGNATURE request response, serialized Telnet/RFC2217 writes with idle NOP
-keep-alive, modem/line notification handling, and basic wait-mask notifications
+keep-alive that continues during serial flow-control suspension,
+modem/line notification handling, and basic wait-mask notifications
 for RX, RXFLAG/EventChar, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events,
 plus serial RX/TX/error statistics through `IOCTL_SERIAL_GET_STATS` and
 `IOCTL_SERIAL_CLEAR_STATS`, and immediate-character transmit through
