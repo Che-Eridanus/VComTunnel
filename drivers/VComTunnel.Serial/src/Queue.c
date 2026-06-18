@@ -1054,7 +1054,27 @@ VctEvtIoDeviceControl(
         break;
 
     case IOCTL_VCOMTUNNEL_SET_CONNECTION_STATE:
-        status = VctCopyInputBuffer(Request, &context->ConnectionState, sizeof(context->ConnectionState));
+        {
+            VCOMTUNNEL_CONNECTION_STATE connectionState;
+            WDFREQUEST readRequest = NULL;
+
+            status = VctCopyInputBuffer(Request, &connectionState, sizeof(connectionState));
+            if (NT_SUCCESS(status)) {
+                WdfSpinLockAcquire(context->Lock);
+                context->ConnectionState = connectionState;
+                if (connectionState != VComTunnelConnecting &&
+                    connectionState != VComTunnelConnected &&
+                    context->PendingRead != NULL) {
+                    readRequest = context->PendingRead;
+                    context->PendingRead = NULL;
+                }
+                WdfSpinLockRelease(context->Lock);
+
+                if (readRequest != NULL) {
+                    VctCompleteUnmarkedRequest(readRequest, STATUS_DEVICE_NOT_READY);
+                }
+            }
+        }
         break;
 
     case IOCTL_VCOMTUNNEL_SET_MODEM_STATE:
@@ -1181,11 +1201,17 @@ VctEvtIoRead(
     UCHAR* readBuffer;
     size_t readBufferLength;
     ULONG copied = 0;
+    BOOLEAN pending = FALSE;
 
     device = WdfIoQueueGetDevice(Queue);
     context = DeviceGetContext(device);
 
-    status = WdfRequestRetrieveOutputBuffer(Request, Length == 0 ? 1 : Length, (PVOID*)&readBuffer, &readBufferLength);
+    if (Length == 0) {
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 0);
+        return;
+    }
+
+    status = WdfRequestRetrieveOutputBuffer(Request, Length, (PVOID*)&readBuffer, &readBufferLength);
     if (!NT_SUCCESS(status)) {
         WdfRequestComplete(Request, status);
         return;
@@ -1194,8 +1220,25 @@ VctEvtIoRead(
     WdfSpinLockAcquire(context->Lock);
     if (context->RxCount > 0) {
         copied = VctRxCopyOutLocked(context, readBuffer, (ULONG)readBufferLength);
+    } else if (context->ConnectionState != VComTunnelConnecting &&
+        context->ConnectionState != VComTunnelConnected) {
+        status = STATUS_DEVICE_NOT_READY;
+    } else if (context->PendingRead != NULL) {
+        status = STATUS_DEVICE_BUSY;
+    } else {
+        context->PendingRead = Request;
+        status = WdfRequestMarkCancelableEx(Request, VctEvtRequestCancel);
+        if (NT_SUCCESS(status)) {
+            pending = TRUE;
+        } else {
+            context->PendingRead = NULL;
+        }
     }
     WdfSpinLockRelease(context->Lock);
+
+    if (pending) {
+        return;
+    }
 
     WdfRequestCompleteWithInformation(Request, status, copied);
 }

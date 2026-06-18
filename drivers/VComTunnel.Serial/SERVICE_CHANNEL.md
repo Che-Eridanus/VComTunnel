@@ -174,6 +174,11 @@ Driver behavior:
 - Validate `ByteCount <= MaxRxBytes`.
 - If the full frame fits, copy it into the RX ring buffer.
 - Complete pending reads in FIFO order.
+- Serial reads with an empty RX queue are held as one cancelable pending read
+  while the service is connecting/online, and completed when the next `PUSH_RX`
+  frame arrives.
+- If connection state changes to offline/faulted, any pending serial read is
+  completed with `STATUS_DEVICE_NOT_READY`.
 - If the full frame does not fit, fail the IOCTL with `STATUS_BUFFER_OVERFLOW`
   without copying a partial frame; service sends RFC2217 `FLOWCONTROL-SUSPEND`,
   retries the same frame, then sends `FLOWCONTROL-RESUME` after success.
@@ -190,8 +195,8 @@ Faulted
 Stopping
 ```
 
-The driver uses this state for `GET_COMMSTATUS`, write failure behavior, and
-diagnostics. It must not reconnect by itself.
+The driver uses this state for `GET_COMMSTATUS`, empty-read behavior, write
+failure behavior, and diagnostics. It must not reconnect by itself.
 
 ## Remote Accepted Settings
 
