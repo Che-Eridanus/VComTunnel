@@ -5,6 +5,7 @@ namespace VComTunnel.Core;
 public enum TunnelBackend
 {
     Com0comHub4com,
+    Com0comService,
     Kmdf
 }
 

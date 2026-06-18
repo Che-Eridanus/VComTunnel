@@ -1903,6 +1903,8 @@ public sealed class MappingRow : INotifyPropertyChanged
         {
             var normalized = string.Equals(value, "kmdf", StringComparison.OrdinalIgnoreCase)
                 ? "kmdf"
+                : string.Equals(value, "com0comService", StringComparison.OrdinalIgnoreCase)
+                    ? "com0comService"
                 : "com0comHub4com";
             if (string.Equals(_backend, normalized, StringComparison.Ordinal))
             {
@@ -1979,7 +1981,12 @@ public sealed class MappingRow : INotifyPropertyChanged
         {
             Id = mapping.Id,
             Name = mapping.Name,
-            Backend = mapping.Backend == TunnelBackend.Kmdf ? "kmdf" : "com0comHub4com",
+            Backend = mapping.Backend switch
+            {
+                TunnelBackend.Kmdf => "kmdf",
+                TunnelBackend.Com0comService => "com0comService",
+                _ => "com0comHub4com"
+            },
             VisiblePort = mapping.VisiblePort,
             BackingPort = mapping.BackingPort,
             Host = mapping.Host,
@@ -1994,6 +2001,8 @@ public sealed class MappingRow : INotifyPropertyChanged
     {
         var backend = string.Equals(Backend, "kmdf", StringComparison.OrdinalIgnoreCase)
             ? TunnelBackend.Kmdf
+            : string.Equals(Backend, "com0comService", StringComparison.OrdinalIgnoreCase)
+                ? TunnelBackend.Com0comService
             : TunnelBackend.Com0comHub4com;
 
         return new TunnelMapping

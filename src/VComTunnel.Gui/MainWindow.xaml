@@ -171,6 +171,7 @@
                             <DataGridComboBoxColumn.ItemsSource>
                                 <x:Array Type="{x:Type sys:String}">
                                     <sys:String>com0comHub4com</sys:String>
+                                    <sys:String>com0comService</sys:String>
                                     <sys:String>kmdf</sys:String>
                                 </x:Array>
                             </DataGridComboBoxColumn.ItemsSource>

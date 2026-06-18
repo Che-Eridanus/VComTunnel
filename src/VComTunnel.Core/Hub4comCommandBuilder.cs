@@ -33,7 +33,8 @@ public sealed class Hub4comCommandBuilder
 
     public string BuildCom0comCreateHint(TunnelMapping mapping)
     {
-        if (mapping.Backend != TunnelBackend.Com0comHub4com || string.IsNullOrWhiteSpace(mapping.BackingPort))
+        if (mapping.Backend is not (TunnelBackend.Com0comHub4com or TunnelBackend.Com0comService)
+            || string.IsNullOrWhiteSpace(mapping.BackingPort))
         {
             return "No com0com pair is needed for KMDF mappings.";
         }

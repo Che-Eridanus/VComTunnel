@@ -31,11 +31,11 @@ public static class ConfigValidator
                 errors.Add($"{mapping.Name}: visiblePort '{mapping.VisiblePort}' is used more than once.");
             }
 
-            if (mapping.Backend == TunnelBackend.Com0comHub4com)
+            if (mapping.Backend is TunnelBackend.Com0comHub4com or TunnelBackend.Com0comService)
             {
                 if (!IsCom0comPortName(mapping.BackingPort))
                 {
-                    errors.Add($"{mapping.Name}: backingPort must look like COM27, CNCA0, or CNCB12 for com0com/hub4com.");
+                    errors.Add($"{mapping.Name}: backingPort must look like COM27, CNCA0, or CNCB12 for com0com mappings.");
                 }
                 else if (!backingPorts.Add(mapping.BackingPort!))
                 {

@@ -7,11 +7,8 @@ using Microsoft.Win32.SafeHandles;
 
 namespace VComTunnel.Core;
 
-public interface IKmdfTunnelSession : IDisposable
+public interface IKmdfTunnelSession : IManagedTunnelSession
 {
-    TunnelRunState State { get; }
-    string? LastError { get; }
-    Task StartAsync(CancellationToken cancellationToken);
 }
 
 public sealed class KmdfTunnelSession : IKmdfTunnelSession

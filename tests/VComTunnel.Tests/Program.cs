@@ -24,6 +24,8 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("com2tcp command uses batch wrapper", () => Task.Run(Com2TcpCommandUsesBatchWrapper)),
     ("missing dependencies fault mapping", MissingDependenciesFaultMappingAsync),
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
+    ("com0com service backend starts without hub4com", Com0comServiceBackendStartsWithoutHub4comAsync),
+    ("com0com service backend restarts after network fault", Com0comServiceBackendRestartsAfterNetworkFaultAsync),
     ("com0com create and remove plans", Com0comCreateAndRemovePlansAsync),
     ("KMDF mapping reports startup fault", KmdfMappingReportsStartupFaultAsync),
     ("KMDF session restarts after network fault", KmdfSessionRestartsAfterNetworkFaultAsync),
@@ -59,6 +61,7 @@ static void ValidMultiMappingConfig()
         Mappings =
         [
             new TunnelMapping { Name = "A", VisiblePort = "COM12", BackingPort = "CNCB12", Host = "esp-dap.local", Port = 3333 },
+            new TunnelMapping { Name = "S", Backend = TunnelBackend.Com0comService, VisiblePort = "COM32", BackingPort = "CNCB32", Host = "127.0.0.1", Port = 5000 },
             new TunnelMapping { Name = "B", Backend = TunnelBackend.Kmdf, VisiblePort = "COM22", BackingPort = null, Host = "192.168.1.50", Port = 3333 }
         ]
     };
@@ -156,8 +159,12 @@ static async Task ConfigRoundTripAsync()
 static void Com0comCreateHints()
 {
     var mapping = new TunnelMapping { Name = "A", VisiblePort = "COM12", BackingPort = "CNCB12" };
-    var hint = new Hub4comCommandBuilder(new DependencyDetector()).BuildCom0comCreateHint(mapping);
+    var builder = new Hub4comCommandBuilder(new DependencyDetector());
+    var hint = builder.BuildCom0comCreateHint(mapping);
     AssertEqual("setupc.exe install PortName=COM12 PortName=CNCB12", hint);
+
+    var serviceHint = builder.BuildCom0comCreateHint(mapping with { Backend = TunnelBackend.Com0comService });
+    AssertEqual("setupc.exe install PortName=COM12 PortName=CNCB12", serviceHint);
 }
 
 static void KmdfControlPathUsesVisibleCom()
@@ -641,6 +648,80 @@ static async Task MissingBackingPortFaultsBeforeHub4comAsync()
     AssertStringContains(status.LastError ?? "", "Existing ports: COM27, COM28");
 }
 
+static async Task Com0comServiceBackendStartsWithoutHub4comAsync()
+{
+    using var temp = new TempDir();
+    File.WriteAllText(Path.Combine(temp.Path, "setupc.exe"), "");
+    var mapping = new TunnelMapping
+    {
+        Name = "Managed com0com",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM30",
+        BackingPort = "CNCB30",
+        Host = "127.0.0.1",
+        Port = 5000
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var starts = 0;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        new InMemoryLog(),
+        ["COM30", "CNCB30"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            Interlocked.Increment(ref starts);
+            return new FakeManagedTunnelSession(faulted, failAfterStart: null);
+        });
+
+    var status = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
+    AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
+    AssertEqual("1", Volatile.Read(ref starts).ToString());
+}
+
+static async Task Com0comServiceBackendRestartsAfterNetworkFaultAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Name = "Restarting managed com0com",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM31",
+        BackingPort = "CNCB31",
+        Host = "127.0.0.1",
+        Port = 5000,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog();
+    var starts = 0;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM31", "CNCB31"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            var startNumber = Interlocked.Increment(ref starts);
+            return new FakeManagedTunnelSession(
+                faulted,
+                failAfterStart: startNumber == 1 ? "Remote endpoint closed the TCP connection." : null);
+        },
+        restartDelay: TimeSpan.FromMilliseconds(50));
+
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+    var first = await orchestrator.StartAsync(id);
+    AssertEqual(TunnelRunState.Running.ToString(), first.State.ToString());
+
+    await WaitUntilAsync(() => Volatile.Read(ref starts) >= 2, "com0com service backend restart did not run.");
+
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
+    AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
+    AssertTrue(
+        log.Snapshot().Any(e => e.Message.Contains("Scheduling Com0comService restart", StringComparison.OrdinalIgnoreCase)),
+        "com0com service network fault should schedule a restart.");
+}
+
 static async Task KmdfMappingReportsStartupFaultAsync()
 {
     using var temp = new TempDir();
@@ -689,14 +770,14 @@ static async Task KmdfSessionRestartsAfterNetworkFaultAsync()
         new DependencyDetector([temp.Path], pathOverride: ""),
         log,
         [],
-        (sessionMapping, sessionLog, faulted) =>
+        kmdfSessionFactory: (sessionMapping, sessionLog, faulted) =>
         {
             var startNumber = Interlocked.Increment(ref starts);
             return new FakeKmdfTunnelSession(
                 faulted,
                 failAfterStart: startNumber == 1 ? "Remote endpoint closed the TCP connection." : null);
         },
-        TimeSpan.FromMilliseconds(50));
+        restartDelay: TimeSpan.FromMilliseconds(50));
 
     var id = (await store.LoadAsync()).Mappings.Single().Id;
     var first = await orchestrator.StartAsync(id);
@@ -730,7 +811,7 @@ static async Task KmdfPermanentDriverFaultDoesNotRestartAsync()
         new DependencyDetector([temp.Path], pathOverride: ""),
         log,
         [],
-        (sessionMapping, sessionLog, faulted) =>
+        kmdfSessionFactory: (sessionMapping, sessionLog, faulted) =>
         {
             Interlocked.Increment(ref starts);
             return new FakeKmdfTunnelSession(
@@ -738,7 +819,7 @@ static async Task KmdfPermanentDriverFaultDoesNotRestartAsync()
                 failAfterStart: null,
                 failOnStart: "KMDF driver protocol 1.1 is older than required 1.2. Rebuild and reinstall VComTunnel.Serial.");
         },
-        TimeSpan.FromMilliseconds(50));
+        restartDelay: TimeSpan.FromMilliseconds(50));
 
     var id = (await store.LoadAsync()).Mappings.Single().Id;
     var first = await orchestrator.StartAsync(id);
@@ -759,23 +840,35 @@ static async Task Com0comCreateAndRemovePlansAsync()
     CreateFakeDependencies(temp.Path);
     var mapping = new TunnelMapping
     {
+        Id = "hub",
         Name = "Managed",
         VisiblePort = "COM29",
         BackingPort = "CNCB29",
         Host = "127.0.0.1",
         Port = 4000
     };
-    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var serviceMapping = mapping with
+    {
+        Id = "svc",
+        Name = "Managed service",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM30",
+        BackingPort = "CNCB30"
+    };
+    var store = new ConfigStore(Path.Combine(temp.Path, "config.json"));
+    await store.SaveAsync(new VComTunnelConfig { Mappings = [mapping, serviceMapping] });
     var detector = new DependencyDetector([temp.Path], pathOverride: "");
     var manager = new Com0comSetupManager(
         store,
         detector,
         new FakeComPortInventory(["COM29", "CNCB29"], [new Com0comPairInfo(2, "COM29", "CNCB29", @"\Device\com0com12", @"\Device\com0com22", true)]));
 
-    var id = (await store.LoadAsync()).Mappings.Single().Id;
-    var create = await manager.BuildCreatePlanAsync(id);
+    var create = await manager.BuildCreatePlanAsync("hub");
     AssertStringContains(create.Arguments, "install PortName=COM29 PortName=CNCB29");
     AssertTrue(create.RequiresElevation, "setupc plans should require elevation.");
+
+    var serviceCreate = await manager.BuildCreatePlanAsync("svc");
+    AssertStringContains(serviceCreate.Arguments, "install PortName=COM30 PortName=CNCB30");
 
     var remove = manager.BuildRemovePlan(2);
     AssertStringContains(remove.Arguments, "remove 2");
@@ -967,6 +1060,7 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
     InMemoryLog log,
     IReadOnlyList<string>? registeredPorts,
     Func<TunnelMapping, InMemoryLog, Action<IKmdfTunnelSession, string>, IKmdfTunnelSession>? kmdfSessionFactory = null,
+    Func<TunnelMapping, InMemoryLog, Action<IManagedTunnelSession, string>, IManagedTunnelSession>? com0comServiceSessionFactory = null,
     TimeSpan? restartDelay = null)
 {
     return new TunnelOrchestrator(
@@ -976,6 +1070,7 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
         new FakeComPortInventory(registeredPorts),
         log,
         kmdfSessionFactory,
+        com0comServiceSessionFactory,
         restartDelay);
 }
 
@@ -1143,6 +1238,51 @@ internal sealed class ThrowingHandler : HttpMessageHandler
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         throw new InvalidOperationException("Network should not be used when bundled dependency archives are available.");
+    }
+}
+
+internal sealed class FakeManagedTunnelSession : IManagedTunnelSession
+{
+    private readonly Action<IManagedTunnelSession, string> _faulted;
+    private readonly string? _failAfterStart;
+
+    public FakeManagedTunnelSession(Action<IManagedTunnelSession, string> faulted, string? failAfterStart)
+    {
+        _faulted = faulted;
+        _failAfterStart = failAfterStart;
+    }
+
+    public TunnelRunState State { get; private set; } = TunnelRunState.Starting;
+    public string? LastError { get; private set; }
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        State = TunnelRunState.Running;
+        if (_failAfterStart is not null)
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(25, cancellationToken);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                LastError = _failAfterStart;
+                State = TunnelRunState.Faulted;
+                _faulted(this, _failAfterStart);
+            }, cancellationToken);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public void Dispose()
+    {
+        if (LastError is null)
+        {
+            State = TunnelRunState.Stopped;
+        }
     }
 }
 

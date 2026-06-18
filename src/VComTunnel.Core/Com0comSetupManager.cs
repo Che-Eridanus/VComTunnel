@@ -21,9 +21,9 @@ public sealed class Com0comSetupManager
     public async Task<SetupcCommandPlan> BuildCreatePlanAsync(string mappingId, CancellationToken cancellationToken = default)
     {
         var mapping = await GetMappingAsync(mappingId, cancellationToken);
-        if (mapping.Backend != TunnelBackend.Com0comHub4com)
+        if (mapping.Backend is not (TunnelBackend.Com0comHub4com or TunnelBackend.Com0comService))
         {
-            throw new InvalidOperationException("Only com0comHub4com mappings can create com0com pairs.");
+            throw new InvalidOperationException("Only com0com mappings can create com0com pairs.");
         }
 
         if (string.IsNullOrWhiteSpace(mapping.BackingPort))
