@@ -41,9 +41,12 @@ public sealed class KmdfTunnelSession : IDisposable
     private readonly Action<KmdfTunnelSession, string> _faulted;
     private readonly Rfc2217Client _rfc2217 = new();
     private readonly object _ackLock = new();
-    private readonly List<byte> _pendingAckCommands = [];
+    private readonly List<Rfc2217ExpectedAck> _pendingAcks = [];
+    private readonly object _flowLock = new();
     private readonly CancellationTokenSource _stop = new();
     private TaskCompletionSource? _pendingAckCompletion;
+    private TaskCompletionSource? _flowResumeCompletion;
+    private bool _remoteFlowSuspended;
     private SafeFileHandle? _eventDriver;
     private SafeFileHandle? _commandDriver;
     private TcpClient? _tcp;
@@ -263,7 +266,13 @@ public sealed class KmdfTunnelSession : IDisposable
     {
         if (Rfc2217Client.IsCommandAck(notification.Command))
         {
-            CompletePendingAck(notification.Command);
+            CompletePendingAck(notification);
+            return;
+        }
+
+        if (Rfc2217Client.IsFlowControlCommand(notification.Command))
+        {
+            SetRemoteFlowSuspended(notification.Command == Rfc2217Client.FlowControlSuspend);
             return;
         }
 
@@ -290,6 +299,7 @@ public sealed class KmdfTunnelSession : IDisposable
     {
         if (frame.ExpectedAckCommands.Length == 0)
         {
+            await WaitForRemoteFlowAsync().ConfigureAwait(false);
             await stream.WriteAsync(frame.Bytes, _stop.Token).ConfigureAwait(false);
             return;
         }
@@ -297,6 +307,7 @@ public sealed class KmdfTunnelSession : IDisposable
         for (var attempt = 0; attempt < 2; attempt++)
         {
             var wait = PrepareAckWait(frame.ExpectedAckCommands);
+            await WaitForRemoteFlowAsync().ConfigureAwait(false);
             await stream.WriteAsync(frame.Bytes, _stop.Token).ConfigureAwait(false);
 
             try
@@ -310,15 +321,17 @@ public sealed class KmdfTunnelSession : IDisposable
                 _log.Warn(_mapping.Name, $"RFC2217 {frame.Description} ack timed out{(attempt == 0 ? ", retrying" : "")}.");
             }
         }
+
+        throw new IOException($"RFC2217 {frame.Description} ack timed out after retry.");
     }
 
-    private Task PrepareAckWait(IReadOnlyList<byte> commands)
+    private Task PrepareAckWait(IReadOnlyList<Rfc2217ExpectedAck> expectedAcks)
     {
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_ackLock)
         {
-            _pendingAckCommands.Clear();
-            _pendingAckCommands.AddRange(commands);
+            _pendingAcks.Clear();
+            _pendingAcks.AddRange(expectedAcks);
             _pendingAckCompletion = completion;
         }
 
@@ -329,31 +342,73 @@ public sealed class KmdfTunnelSession : IDisposable
     {
         lock (_ackLock)
         {
-            _pendingAckCommands.Clear();
+            _pendingAcks.Clear();
             _pendingAckCompletion = null;
         }
     }
 
-    private void CompletePendingAck(byte command)
+    private void CompletePendingAck(Rfc2217Notification notification)
     {
         TaskCompletionSource? completion = null;
         lock (_ackLock)
         {
-            var index = _pendingAckCommands.IndexOf(command);
-            if (index < 0)
+            var index = _pendingAcks.FindIndex(expected => expected.Matches(notification));
+            if (index >= 0)
             {
-                return;
+                _pendingAcks.RemoveAt(index);
+                if (_pendingAcks.Count == 0)
+                {
+                    completion = _pendingAckCompletion;
+                    _pendingAckCompletion = null;
+                }
             }
-
-            _pendingAckCommands.RemoveAt(index);
-            if (_pendingAckCommands.Count == 0)
+            else if (_pendingAcks.Any(expected => expected.IsSameCommand(notification)))
             {
-                completion = _pendingAckCompletion;
-                _pendingAckCompletion = null;
+                var expected = string.Join(", ", _pendingAcks.Select(ack => ack.Describe()));
+                throw new IOException($"RFC2217 ack returned unexpected value {Rfc2217ExpectedAck.Describe(notification)}; expected {expected}.");
             }
         }
 
         completion?.TrySetResult();
+    }
+
+    private Task WaitForRemoteFlowAsync()
+    {
+        lock (_flowLock)
+        {
+            return _remoteFlowSuspended
+                ? (_flowResumeCompletion ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).Task.WaitAsync(_stop.Token)
+                : Task.CompletedTask;
+        }
+    }
+
+    private void SetRemoteFlowSuspended(bool suspended)
+    {
+        TaskCompletionSource? resume = null;
+        lock (_flowLock)
+        {
+            if (_remoteFlowSuspended == suspended)
+            {
+                return;
+            }
+
+            _remoteFlowSuspended = suspended;
+            if (!suspended)
+            {
+                resume = _flowResumeCompletion;
+                _flowResumeCompletion = null;
+            }
+        }
+
+        if (suspended)
+        {
+            _log.Warn(_mapping.Name, "RFC2217 peer requested flow-control suspend.");
+        }
+        else
+        {
+            _log.Info(_mapping.Name, "RFC2217 peer resumed flow-control.");
+            resume?.TrySetResult();
+        }
     }
 
     private static uint MapRfc2217ModemState(byte value)
@@ -403,7 +458,7 @@ public sealed class KmdfTunnelSession : IDisposable
                 _log.Info(_mapping.Name, $"RFC2217 set baud {baudRate}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetBaudRate(baudRate),
-                    [Rfc2217Client.AckSetBaudRate],
+                    [new Rfc2217ExpectedAck(Rfc2217Client.AckSetBaudRate, Rfc2217Client.BuildUInt32Payload(baudRate))],
                     "baud-rate");
 
             case EventTypeSetLineControl:
@@ -414,7 +469,11 @@ public sealed class KmdfTunnelSession : IDisposable
                 _log.Info(_mapping.Name, $"RFC2217 set line data={wordLength}, parity={parity}, stop={stopBits}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetLineControl(stopBits, parity, wordLength),
-                    [Rfc2217Client.AckSetDataSize, Rfc2217Client.AckSetParity, Rfc2217Client.AckSetStopSize],
+                    [
+                        new Rfc2217ExpectedAck(Rfc2217Client.AckSetDataSize, [wordLength]),
+                        new Rfc2217ExpectedAck(Rfc2217Client.AckSetParity, [Rfc2217Client.MapWindowsParityToRfc2217(parity)]),
+                        new Rfc2217ExpectedAck(Rfc2217Client.AckSetStopSize, [Rfc2217Client.MapWindowsStopBitsToRfc2217(stopBits)])
+                    ],
                     "line-control");
 
             case EventTypeSetModemControl:
@@ -425,7 +484,9 @@ public sealed class KmdfTunnelSession : IDisposable
                 _log.Info(_mapping.Name, $"RFC2217 set modem dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetModemControl(dtr, rts),
-                    BuildRepeatedAckList(Rfc2217Client.AckSetControl, dtr is not null, rts is not null),
+                    BuildSetControlAcks(
+                        dtr is null ? null : dtr.Value ? (byte)8 : (byte)9,
+                        rts is null ? null : rts.Value ? (byte)11 : (byte)12),
                     "modem-control");
 
             case EventTypeSetHandflow:
@@ -435,7 +496,9 @@ public sealed class KmdfTunnelSession : IDisposable
                 _log.Info(_mapping.Name, $"RFC2217 set handflow control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetHandflow(controlHandshake, flowReplace),
-                    [Rfc2217Client.AckSetControl, Rfc2217Client.AckSetControl],
+                    BuildSetControlAcks(
+                        Rfc2217Client.MapOutboundFlowControl(controlHandshake, flowReplace),
+                        Rfc2217Client.MapInboundFlowControl(controlHandshake, flowReplace)),
                     "handflow");
 
             case EventTypeSetBreak:
@@ -444,7 +507,7 @@ public sealed class KmdfTunnelSession : IDisposable
                 _log.Info(_mapping.Name, $"RFC2217 set break {breakEnabled}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetBreak(breakEnabled),
-                    [Rfc2217Client.AckSetControl],
+                    [new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [breakEnabled ? (byte)5 : (byte)6])],
                     "break");
 
             case EventTypePurge:
@@ -454,7 +517,7 @@ public sealed class KmdfTunnelSession : IDisposable
                 var purgeFrame = Rfc2217Client.BuildPurge(purgeMask);
                 return new Rfc2217OutboundFrame(
                     purgeFrame,
-                    purgeFrame.Length == 0 ? [] : [Rfc2217Client.AckPurgeData],
+                    purgeFrame.Length == 0 ? [] : [new Rfc2217ExpectedAck(Rfc2217Client.AckPurgeData, [Rfc2217Client.MapPurge(purgeMask)])],
                     "purge");
 
             default:
@@ -462,12 +525,12 @@ public sealed class KmdfTunnelSession : IDisposable
         }
     }
 
-    private static byte[] BuildRepeatedAckList(byte ackCommand, params bool[] include)
+    private static Rfc2217ExpectedAck[] BuildSetControlAcks(params byte?[] values)
     {
-        var count = include.Count(value => value);
-        var commands = new byte[count];
-        Array.Fill(commands, ackCommand);
-        return commands;
+        return values
+            .Where(value => value is not null)
+            .Select(value => new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [value!.Value]))
+            .ToArray();
     }
 
     private static void EnsurePayload(ushort type, int actualLength, int minimumLength)
@@ -516,7 +579,7 @@ public sealed class KmdfTunnelSession : IDisposable
     private static void WriteUInt16(byte[] buffer, int offset, ushort value) => BitConverter.GetBytes(value).CopyTo(buffer, offset);
     private static void WriteUInt32(byte[] buffer, int offset, uint value) => BitConverter.GetBytes(value).CopyTo(buffer, offset);
 
-    private sealed record Rfc2217OutboundFrame(byte[] Bytes, byte[] ExpectedAckCommands, string Description);
+    private sealed record Rfc2217OutboundFrame(byte[] Bytes, Rfc2217ExpectedAck[] ExpectedAckCommands, string Description);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern SafeFileHandle CreateFileW(

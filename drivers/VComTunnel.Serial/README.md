@@ -1,8 +1,9 @@
 # VComTunnel.Serial KMDF Prototype
 
-This directory contains the phase 2 driver design and the first KMDF driver
-skeleton. It is not a usable RFC2217 bridge yet: read/write currently returns a
-controlled not-ready result until the service channel is implemented.
+This directory contains the phase 2 driver design and KMDF driver prototype.
+The driver and service channel are implemented enough for experimental
+single-port RFC2217 bridging, but the package remains test-signed prototype
+work until broader serial-tool and ESP-DAP validation is complete.
 
 The intended phase 2 result is a single visible COM device backed by
 `VComTunnel.Service`, replacing the phase 1 `com0com + hub4com` chain for one
@@ -16,11 +17,13 @@ Read these documents before writing driver code:
 
 Current status:
 
-- The `.NET` service and GUI still treat `kmdf` mappings as unsupported.
-- `VComTunnel.Serial.vcxproj` builds the first fixed-port KMDF prototype.
-- The driver publishes a fixed test link: `COM40`.
-- The M2 data-path skeleton supports service `ATTACH`, service `WAIT_EVENT`
-  receiving `TxData`, service `PUSH_RX`, and pending serial reads.
+- The `.NET` service can start `kmdf` mappings through `KmdfTunnelSession`.
+- `VComTunnel.Serial.vcxproj` builds the KMDF prototype and test-signed package.
+- KMDF ports are installed/removed by the management tooling rather than
+  through com0com pairs.
+- The data path supports service `ATTACH`, service `WAIT_EVENT`, serial TX
+  events, RFC2217 control events, service `PUSH_RX`, modem/line-state updates,
+  pending serial reads, and basic wait-mask notifications.
 - `VComTunnel.Serial.inf` is usable as the package INF after the WDK build
   produces a matching `.sys` and `.cat`.
 - `install-test-driver.ps1` refuses to install unless those package files exist.
@@ -31,11 +34,10 @@ Implementation entry point:
    `powershell -ExecutionPolicy Bypass -File .\build-driver.ps1 -Configuration Release`
 2. Confirm the package contains `VComTunnel.Serial.sys`, `VComTunnel.Serial.inf`,
    and `VComTunnel.Serial.cat`.
-3. Implement the private service channel described in `SERVICE_CHANNEL.md`.
-4. Implement buffered read/write and service-side event forwarding.
-5. Add the service-side backend described in `SERVICE_BACKEND.md`.
-6. Add fake-driver tests before real RFC2217.
-7. Only then install the test-signed package on a disposable or
+3. Review the private service channel described in `SERVICE_CHANNEL.md`.
+4. Review the service-side backend described in `SERVICE_BACKEND.md`.
+5. Run the user-mode tests and driver build before installing a new package.
+6. Only then install the test-signed package on a disposable or
    backed-up Windows 10/11 x64 machine.
 
 Build notes:

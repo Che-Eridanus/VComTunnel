@@ -9,6 +9,8 @@ public sealed class Rfc2217Client
     public const byte AckSetControl = 105;
     public const byte NotifyLineState = 106;
     public const byte NotifyModemState = 107;
+    public const byte FlowControlSuspend = 108;
+    public const byte FlowControlResume = 109;
     public const byte AckSetLineStateMask = 110;
     public const byte AckSetModemStateMask = 111;
     public const byte AckPurgeData = 112;
@@ -57,7 +59,7 @@ public sealed class Rfc2217Client
             Iac, Do, TelnetBinary,
             Iac, Will, SuppressGoAhead,
             Iac, Do, SuppressGoAhead,
-            .. BuildSetLineStateMask(0),
+            .. BuildSetLineStateMask(0x1E),
             .. BuildSetModemStateMask(255)
         ];
     }
@@ -175,8 +177,8 @@ public sealed class Rfc2217Client
     {
         return Combine(
             BuildSetDataSize(wordLength),
-            BuildSetParity(MapParity(parity)),
-            BuildSetStopSize(MapStopBits(stopBits)));
+            BuildSetParity(MapWindowsParityToRfc2217(parity)),
+            BuildSetStopSize(MapWindowsStopBitsToRfc2217(stopBits)));
     }
 
     public static byte[] BuildSetModemControl(bool? dtr, bool? rts)
@@ -202,33 +204,14 @@ public sealed class Rfc2217Client
 
     public static byte[] BuildSetHandflow(uint controlHandshake, uint flowReplace)
     {
-        var outbound = (controlHandshake & SerialDcdHandshake) != 0
-            ? (byte)17
-            : (controlHandshake & SerialDsrHandshake) != 0
-                ? (byte)19
-                : (controlHandshake & SerialCtsHandshake) != 0
-                    ? (byte)3
-                    : (flowReplace & SerialAutoTransmit) != 0
-                        ? (byte)2
-                        : (byte)1;
-        var inbound = (controlHandshake & SerialDtrHandshake) != 0
-            ? (byte)18
-            : (flowReplace & SerialAutoReceive) != 0
-                ? (byte)15
-                : (byte)14;
-
-        return Combine(BuildSetControl(outbound), BuildSetControl(inbound));
+        return Combine(
+            BuildSetControl(MapOutboundFlowControl(controlHandshake, flowReplace)),
+            BuildSetControl(MapInboundFlowControl(controlHandshake, flowReplace)));
     }
 
     public static byte[] BuildPurge(uint purgeMask)
     {
-        var purge = (purgeMask & (SerialPurgeRxClear | SerialPurgeTxClear)) switch
-        {
-            SerialPurgeRxClear => (byte)1,
-            SerialPurgeTxClear => (byte)2,
-            SerialPurgeRxClear | SerialPurgeTxClear => (byte)3,
-            _ => (byte)0
-        };
+        var purge = MapPurge(purgeMask);
 
         return purge == 0 ? [] : BuildSubnegotiation(PurgeData, purge);
     }
@@ -243,6 +226,79 @@ public sealed class Rfc2217Client
             or AckSetLineStateMask
             or AckSetModemStateMask
             or AckPurgeData;
+    }
+
+    public static bool IsFlowControlCommand(byte command)
+    {
+        return command is FlowControlSuspend or FlowControlResume;
+    }
+
+    public static byte MapWindowsParityToRfc2217(byte windowsParity)
+    {
+        return windowsParity switch
+        {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            3 => 4,
+            4 => 5,
+            _ => 1
+        };
+    }
+
+    public static byte MapWindowsStopBitsToRfc2217(byte windowsStopBits)
+    {
+        return windowsStopBits switch
+        {
+            0 => 1,
+            1 => 3,
+            2 => 2,
+            _ => 1
+        };
+    }
+
+    public static byte[] BuildUInt32Payload(uint value)
+    {
+        return
+        [
+            (byte)(value >> 24),
+            (byte)(value >> 16),
+            (byte)(value >> 8),
+            (byte)value
+        ];
+    }
+
+    public static byte MapOutboundFlowControl(uint controlHandshake, uint flowReplace)
+    {
+        return (controlHandshake & SerialDcdHandshake) != 0
+            ? (byte)17
+            : (controlHandshake & SerialDsrHandshake) != 0
+                ? (byte)19
+                : (controlHandshake & SerialCtsHandshake) != 0
+                    ? (byte)3
+                    : (flowReplace & SerialAutoTransmit) != 0
+                        ? (byte)2
+                        : (byte)1;
+    }
+
+    public static byte MapInboundFlowControl(uint controlHandshake, uint flowReplace)
+    {
+        return (controlHandshake & SerialDtrHandshake) != 0
+            ? (byte)18
+            : (flowReplace & SerialAutoReceive) != 0
+                ? (byte)15
+                : (byte)14;
+    }
+
+    public static byte MapPurge(uint purgeMask)
+    {
+        return (purgeMask & (SerialPurgeRxClear | SerialPurgeTxClear)) switch
+        {
+            SerialPurgeRxClear => (byte)1,
+            SerialPurgeTxClear => (byte)2,
+            SerialPurgeRxClear | SerialPurgeTxClear => (byte)3,
+            _ => (byte)0
+        };
     }
 
     private static byte[] BuildSetDataSize(byte value) => BuildSubnegotiation(SetDataSize, value);
@@ -274,30 +330,6 @@ public sealed class Rfc2217Client
         frame.Add(Iac);
         frame.Add(Se);
         return frame.ToArray();
-    }
-
-    private static byte MapParity(byte windowsParity)
-    {
-        return windowsParity switch
-        {
-            0 => 1,
-            1 => 2,
-            2 => 3,
-            3 => 4,
-            4 => 5,
-            _ => 1
-        };
-    }
-
-    private static byte MapStopBits(byte windowsStopBits)
-    {
-        return windowsStopBits switch
-        {
-            0 => 1,
-            1 => 3,
-            2 => 2,
-            _ => 1
-        };
     }
 
     private static void AddNegotiationReply(List<byte> replies, byte command, byte option)
@@ -367,3 +399,31 @@ public sealed class Rfc2217Client
 public sealed record Rfc2217Frame(byte[] SerialData, byte[] Replies, IReadOnlyList<Rfc2217Notification> Notifications);
 
 public sealed record Rfc2217Notification(byte Command, byte[] Payload);
+
+public sealed record Rfc2217ExpectedAck(byte Command, byte[] Payload)
+{
+    public bool Matches(Rfc2217Notification notification)
+    {
+        return notification.Command == Command && Payload.SequenceEqual(notification.Payload);
+    }
+
+    public bool IsSameCommand(Rfc2217Notification notification)
+    {
+        return notification.Command == Command;
+    }
+
+    public string Describe()
+    {
+        return $"{Command} [{ToHex(Payload)}]";
+    }
+
+    public static string Describe(Rfc2217Notification notification)
+    {
+        return $"{notification.Command} [{ToHex(notification.Payload)}]";
+    }
+
+    private static string ToHex(byte[] bytes)
+    {
+        return bytes.Length == 0 ? "-" : Convert.ToHexString(bytes);
+    }
+}

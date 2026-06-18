@@ -177,8 +177,8 @@ serial tool -> COMx -> VComTunnel.Serial.sys -> VComTunnel.Service -> RFC2217
 Current status is still experimental: the WDK project produces a test-signed
 `.sys` and `.cat`, and the user-mode path now performs RFC2217/Telnet
 negotiation plus baud-rate, line-control, DTR/RTS, BREAK, flow-control, purge,
-command ACK correlation with timeout/retry warnings, modem/line notification
-handling, and basic wait-mask notifications for RX, CTS, DSR, RLSD, RING,
-BREAK, and ERR events. Remaining hardening work is stricter rejected/late ACK
-failure policy, broader serial compatibility coverage, and live ESP-DAP
-compatibility validation against real tools.
+command ACK correlation with accepted-value validation and timeout retry,
+remote flow-control suspend/resume handling, modem/line notification handling,
+and basic wait-mask notifications for RX, CTS, DSR, RLSD, RING, BREAK, and ERR
+events. Remaining hardening work is broader serial compatibility coverage and
+live ESP-DAP compatibility validation against real tools.

@@ -16,6 +16,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("KMDF pnputil CSV parser finds VComTunnel ports", () => Task.Run(KmdfPnpUtilCsvParserFindsPorts)),
     ("RFC2217 command encoding", () => Task.Run(Rfc2217CommandEncoding)),
     ("RFC2217 telnet parser", () => Task.Run(Rfc2217TelnetParser)),
+    ("RFC2217 ack semantics", () => Task.Run(Rfc2217AckSemantics)),
     ("com2tcp command uses batch wrapper", () => Task.Run(Com2TcpCommandUsesBatchWrapper)),
     ("missing dependencies fault mapping", MissingDependenciesFaultMappingAsync),
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
@@ -176,6 +177,19 @@ InstanceId,DeviceDescription,ClassName,ClassGuid,ManufacturerName,Status,Problem
 static void Rfc2217CommandEncoding()
 {
     AssertBytes(
+        [
+            0xFF, 0xFB, 0x2C,
+            0xFF, 0xFD, 0x2C,
+            0xFF, 0xFB, 0x00,
+            0xFF, 0xFD, 0x00,
+            0xFF, 0xFB, 0x03,
+            0xFF, 0xFD, 0x03,
+            0xFF, 0xFA, 0x2C, 0x0A, 0x1E, 0xFF, 0xF0,
+            0xFF, 0xFA, 0x2C, 0x0B, 0xFF, 0xFF, 0xFF, 0xF0
+        ],
+        new Rfc2217Client().BuildInitialNegotiation());
+
+    AssertBytes(
         [0xFF, 0xFA, 0x2C, 0x01, 0x00, 0x01, 0xC2, 0x00, 0xFF, 0xF0],
         Rfc2217Client.BuildSetBaudRate(115200));
 
@@ -221,6 +235,27 @@ static void Rfc2217TelnetParser()
 
     var ack = client.ProcessNetworkBytes([0xFF, 0xFA, 0x2C, 0x65, 0x00, 0x01, 0xC2, 0x00, 0xFF, 0xF0], 10);
     AssertTrue(Rfc2217Client.IsCommandAck(ack.Notifications.Single().Command), "SET-BAUDRATE ack should be recognized.");
+
+    var suspend = client.ProcessNetworkBytes([0xFF, 0xFA, 0x2C, 0x6C, 0xFF, 0xF0], 6);
+    AssertEqual(Rfc2217Client.FlowControlSuspend.ToString(), suspend.Notifications.Single().Command.ToString());
+    AssertTrue(Rfc2217Client.IsFlowControlCommand(suspend.Notifications.Single().Command), "FLOWCONTROL-SUSPEND should be recognized.");
+}
+
+static void Rfc2217AckSemantics()
+{
+    var expectedBaud = new Rfc2217ExpectedAck(Rfc2217Client.AckSetBaudRate, [0x00, 0x01, 0xC2, 0x00]);
+    AssertTrue(
+        expectedBaud.Matches(new Rfc2217Notification(Rfc2217Client.AckSetBaudRate, [0x00, 0x01, 0xC2, 0x00])),
+        "ACK should match the command and accepted value.");
+    AssertTrue(
+        !expectedBaud.Matches(new Rfc2217Notification(Rfc2217Client.AckSetBaudRate, [0x00, 0x00, 0x25, 0x80])),
+        "ACK with a different accepted value must not satisfy the pending command.");
+    AssertTrue(
+        expectedBaud.IsSameCommand(new Rfc2217Notification(Rfc2217Client.AckSetBaudRate, [0x00, 0x00, 0x25, 0x80])),
+        "Different ACK value for the same command should be distinguishable as a rejection.");
+    AssertEqual("17", Rfc2217Client.MapOutboundFlowControl(0x20, 0).ToString());
+    AssertEqual("18", Rfc2217Client.MapInboundFlowControl(0x02, 0).ToString());
+    AssertEqual("3", Rfc2217Client.MapPurge(0x0C).ToString());
 }
 
 static void Com2TcpCommandUsesBatchWrapper()

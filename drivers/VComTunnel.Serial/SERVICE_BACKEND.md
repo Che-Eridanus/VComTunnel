@@ -81,13 +81,15 @@ Current implementation note:
   stop-size, DTR/RTS, BREAK, flow-control, purge, NOTIFY-LINESTATE, and
   NOTIFY-MODEMSTATE.
 - RFC2217 command ACK correlation is implemented for outbound serial controls.
-  The service waits for the expected ACK command, retries once on timeout, then
-  logs a warning while keeping the tunnel alive.
+  The service waits for the expected ACK command and accepted value, retries
+  once on timeout, and faults the tunnel if the peer rejects the value or does
+  not acknowledge after retry.
+- RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and control commands
+  until FLOWCONTROL-RESUME is received.
 - Wait-mask notifications currently cover RXCHAR, CTS, DSR, RLSD, RING, BREAK,
   and ERR events raised by received bytes or RFC2217 modem/line notifications.
-- Remaining hardening: strict failure policy for rejected or late ACKs,
-  additional serial events beyond the current wait-mask subset, and live
-  hardware/tool compatibility validation.
+- Remaining hardening: additional serial events beyond the current wait-mask
+  subset and live hardware/tool compatibility validation.
 
 ## Start Flow
 
@@ -148,11 +150,14 @@ TxData
 SetBaudRate / SetLineControl / SetModemControl / SetHandflow
   -> translate to RFC2217 negotiation/control
   -> complete the serial IOCTL after the driver has queued the event; service
-     waits for the expected RFC2217 acknowledgement with a bounded timeout and
-     one retry, logging a warning if the peer still does not acknowledge
+     waits for the expected RFC2217 acknowledgement command and value with a
+     bounded timeout and one retry, faulting the tunnel on rejection or timeout
 
 Purge
   -> translate RX/TX clear requests to RFC2217 PURGE-DATA and wait for ACK
+
+FLOWCONTROL-SUSPEND / FLOWCONTROL-RESUME
+  -> pause and resume outbound serial data and control command writes
 
 SetWaitMask / CancelWaitMask
   -> keep one pending WAIT_ON_MASK request and complete it when supported
@@ -161,8 +166,8 @@ SetWaitMask / CancelWaitMask
 
 The first prototype prefers deterministic completion over perfect serial
 semantics. Driver IOCTLs complete after the event is queued to the service; the
-service applies RFC2217 ACK wait/retry policy independently so a slow or partial
-peer does not hang serial applications.
+service applies RFC2217 ACK wait/retry/fault policy independently so a slow or
+partial peer does not hang serial applications.
 
 ## State Model
 
