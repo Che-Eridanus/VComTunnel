@@ -342,8 +342,14 @@ static void Hub4comRfc2217ClientBaseline()
 
     AssertRfc2217Notifications(
         Rfc2217Client.BuildPurge(0x0C),
+        new Rfc2217Notification(12, [3]));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildPurge(0x04),
         new Rfc2217Notification(12, [2]));
-    AssertRfc2217Notifications(Rfc2217Client.BuildPurge(0x08));
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildPurge(0x08),
+        new Rfc2217Notification(12, [1]));
+    AssertRfc2217Notifications(Rfc2217Client.BuildPurge(0x03));
 
     AssertEqual("240", Rfc2217Client.MapNotifyModemStateToWindowsStatus(0xF0).ToString());
     AssertEqual("312", Rfc2217Client.MapNotifyModemStateToWindowsEvents(0x0F).ToString());
@@ -526,8 +532,9 @@ static void Rfc2217AckSemantics()
     AssertEqual("18", Rfc2217Client.MapInboundFlowControl(0x02, 0).ToString());
     AssertEqual("16", Rfc2217Client.MapInboundFlowControl(0, 0x80).ToString());
     AssertEqual("16", Rfc2217Client.MapInboundFlowControl(0, 0x82).ToString());
-    AssertEqual("2", Rfc2217Client.MapPurge(0x0C).ToString());
-    AssertEqual("0", Rfc2217Client.MapPurge(0x08).ToString());
+    AssertEqual("3", Rfc2217Client.MapPurge(0x0C).ToString());
+    AssertEqual("1", Rfc2217Client.MapPurge(0x08).ToString());
+    AssertEqual("0", Rfc2217Client.MapPurge(0x03).ToString());
     AssertEqual("2", Rfc2217Client.MapRfc2217ParityToWindows(3).ToString());
     AssertEqual("1", Rfc2217Client.MapRfc2217StopBitsToWindows(3).ToString());
 }

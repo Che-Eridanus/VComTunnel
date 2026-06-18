@@ -94,6 +94,9 @@ Current implementation note:
 - Raw modem-control IOCTLs support MCR DTR/RTS changes by reusing the normal
   RFC2217 SET-CONTROL DTR/RTS path; OUT1, OUT2, and LOOP are cached locally for
   Windows compatibility and have no RFC2217 equivalent.
+- Windows purge requests map TX clear, RX clear, and TX+RX clear to RFC2217
+  PURGE-DATA values 2, 1, and 3 respectively; TX/RX abort-only requests remain
+  local because RFC2217 has no abort-only equivalent.
 - The service requires driver protocol 1.2 so remote accepted settings can use
   `IOCTL_VCOMTUNNEL_SET_REMOTE_SETTINGS` and RFC2217 line-state notifications
   can wake Windows wait masks through the extended `VCT_LINE_STATE.EventMask`

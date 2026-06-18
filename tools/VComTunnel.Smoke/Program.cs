@@ -394,9 +394,9 @@ static async Task ProbeRfc2217EndpointAsync(SmokeOptions options, CancellationTo
         var purgeExchange = await ProbeRfc2217ExchangeAsync(
             stream,
             client,
-            "purge tx",
+            "purge tx+rx",
             Rfc2217Client.BuildPurge(NativeSerial.PurgeTxClear | NativeSerial.PurgeRxClear),
-            [new Rfc2217ExpectedAck(Rfc2217Client.AckPurgeData, [2])],
+            [new Rfc2217ExpectedAck(Rfc2217Client.AckPurgeData, [3])],
             options.ReadSeconds,
             cancellationToken);
         DumpProbeExchange(purgeExchange);
@@ -773,8 +773,8 @@ static async Task<int> ExerciseControlIoctlsAsync(
     serial.Purge(NativeSerial.PurgeTxClear | NativeSerial.PurgeRxClear);
     await WaitForRfc2217Async(
         probe,
-        notification => notification.Command == purgeData && notification.Payload is [2],
-        "PURGE-DATA tx",
+        notification => notification.Command == purgeData && notification.Payload is [3],
+        "PURGE-DATA tx+rx",
         readTimeout,
         cancellationToken);
 
