@@ -239,6 +239,14 @@ static void Rfc2217CommandEncoding()
         Rfc2217Client.BuildTelnetNop());
 
     AssertBytes(
+        [0xFF, 0xFA, 0x2C, 0x08, 0xFF, 0xF0],
+        Rfc2217Client.BuildLocalFlowControlSuspend());
+
+    AssertBytes(
+        [0xFF, 0xFA, 0x2C, 0x09, 0xFF, 0xF0],
+        Rfc2217Client.BuildLocalFlowControlResume());
+
+    AssertBytes(
         [0xFF, 0xFA, 0x2C, 0x00, 0x56, 0x43, 0x6F, 0x6D, 0xFF, 0xF0],
         Rfc2217Client.BuildSignature("VCom"));
 }

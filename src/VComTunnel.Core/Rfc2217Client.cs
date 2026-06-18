@@ -38,6 +38,8 @@ public sealed class Rfc2217Client
     private const byte SetLineStateMask = 10;
     private const byte SetModemStateMask = 11;
     private const byte PurgeData = 12;
+    private const byte LocalFlowControlSuspend = 8;
+    private const byte LocalFlowControlResume = 9;
     private const byte LineStateErrorMask = 0x1E;
     private const byte ModemStateMask = 0xFF;
     private const string ClientSignature = "VComTunnel";
@@ -86,6 +88,16 @@ public sealed class Rfc2217Client
     public static byte[] BuildTelnetNop()
     {
         return [Iac, Nop];
+    }
+
+    public static byte[] BuildLocalFlowControlSuspend()
+    {
+        return BuildSubnegotiation(LocalFlowControlSuspend);
+    }
+
+    public static byte[] BuildLocalFlowControlResume()
+    {
+        return BuildSubnegotiation(LocalFlowControlResume);
     }
 
     public static byte[] BuildSignature(string signature)

@@ -169,10 +169,11 @@ struct VCT_PUSH_RX {
 Driver behavior:
 
 - Validate `ByteCount <= MaxRxBytes`.
-- Copy into RX ring buffer.
+- If the full frame fits, copy it into the RX ring buffer.
 - Complete pending reads in FIFO order.
-- If buffer is full, fail the IOCTL with `STATUS_BUFFER_OVERFLOW`; service
-  logs and applies backpressure/reconnect policy.
+- If the full frame does not fit, fail the IOCTL with `STATUS_BUFFER_OVERFLOW`
+  without copying a partial frame; service sends RFC2217 `FLOWCONTROL-SUSPEND`,
+  retries the same frame, then sends `FLOWCONTROL-RESUME` after success.
 
 ## Connection State
 

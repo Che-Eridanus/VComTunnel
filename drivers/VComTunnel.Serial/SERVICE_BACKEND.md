@@ -100,6 +100,9 @@ Current implementation note:
   pending ACK wait follows the existing timeout/retry policy.
 - RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and control commands
   until FLOWCONTROL-RESUME is received.
+- If the driver's RX queue is full while network bytes arrive, the service sends
+  RFC2217 FLOWCONTROL-SUSPEND, retries the same RX frame without duplicating
+  bytes, then sends FLOWCONTROL-RESUME once the driver accepts it.
 - TCP writes are serialized across driver events, Telnet negotiation replies,
   and idle keep-alive. Idle RFC2217 sessions send Telnet NOP every 30 seconds.
 - Startup connection failures and runtime network drops feed the same

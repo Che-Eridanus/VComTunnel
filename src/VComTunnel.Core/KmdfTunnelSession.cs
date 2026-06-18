@@ -16,6 +16,9 @@ public sealed class KmdfTunnelSession : IDisposable
     private const uint OpenExisting = 3;
     private const uint FileAttributeNormal = 0x00000080;
     private const int EventHeaderSize = 24;
+    private const int ErrorBufferOverflow = 111;
+    private const int ErrorInsufficientBuffer = 122;
+    private const int ErrorMoreData = 234;
     private const ushort EventTypeTxData = 1;
     private const ushort EventTypeSetBaudRate = 2;
     private const ushort EventTypeSetLineControl = 3;
@@ -34,6 +37,7 @@ public sealed class KmdfTunnelSession : IDisposable
     private const int MaxEventBytes = 4096;
     private const int MaxRxBytes = 4096;
     private static readonly TimeSpan CommandAckTimeout = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan RxBackpressureRetryInterval = TimeSpan.FromMilliseconds(25);
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan KeepAlivePollInterval = TimeSpan.FromSeconds(5);
 
@@ -258,8 +262,7 @@ public sealed class KmdfTunnelSession : IDisposable
                 WriteUInt32(push, 4, (uint)frame.SerialData.Length);
                 Buffer.BlockCopy(frame.SerialData, 0, push, 8, frame.SerialData.Length);
                 _log.Info(_mapping.Name, $"RFC2217 RX serial {frame.SerialData.Length} byte(s).");
-                DeviceIoControlChecked(_commandDriver, IoctlPushRx, push, null);
-                _log.Info(_mapping.Name, $"Driver RX push completed {frame.SerialData.Length} byte(s).");
+                await PushRxWithBackpressureAsync(stream, push, frame.SerialData.Length).ConfigureAwait(false);
             }
         }
         catch (Exception ex) when (!_stop.IsCancellationRequested)
@@ -464,6 +467,44 @@ public sealed class KmdfTunnelSession : IDisposable
         finally
         {
             _networkWriteLock.Release();
+        }
+    }
+
+    private async Task PushRxWithBackpressureAsync(NetworkStream stream, byte[] push, int byteCount)
+    {
+        var suspended = false;
+        try
+        {
+            while (!_stop.IsCancellationRequested)
+            {
+                if (TryDeviceIoControl(_commandDriver, IoctlPushRx, push, null, out var error))
+                {
+                    _log.Info(_mapping.Name, $"Driver RX push completed {byteCount} byte(s).");
+                    return;
+                }
+
+                if (!IsRxBackpressureError(error))
+                {
+                    throw new Win32Exception(error);
+                }
+
+                if (!suspended)
+                {
+                    await WriteNetworkAsync(stream, Rfc2217Client.BuildLocalFlowControlSuspend()).ConfigureAwait(false);
+                    suspended = true;
+                    _log.Warn(_mapping.Name, "Driver RX buffer full; sent RFC2217 FLOWCONTROL-SUSPEND.");
+                }
+
+                await Task.Delay(RxBackpressureRetryInterval, _stop.Token).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            if (suspended && !_stop.IsCancellationRequested)
+            {
+                await WriteNetworkAsync(stream, Rfc2217Client.BuildLocalFlowControlResume()).ConfigureAwait(false);
+                _log.Info(_mapping.Name, "Driver RX buffer accepted data; sent RFC2217 FLOWCONTROL-RESUME.");
+            }
         }
     }
 
@@ -736,6 +777,32 @@ public sealed class KmdfTunnelSession : IDisposable
         }
 
         return bytesReturned;
+    }
+
+    private static bool TryDeviceIoControl(SafeFileHandle? driver, uint ioctl, byte[]? input, byte[]? output, out int error)
+    {
+        if (driver is null)
+        {
+            throw new InvalidOperationException("KMDF driver is not open.");
+        }
+
+        var ok = DeviceIoControl(
+            driver,
+            ioctl,
+            input,
+            input?.Length ?? 0,
+            output,
+            output?.Length ?? 0,
+            out _,
+            IntPtr.Zero);
+
+        error = ok ? 0 : Marshal.GetLastWin32Error();
+        return ok;
+    }
+
+    private static bool IsRxBackpressureError(int error)
+    {
+        return error is ErrorBufferOverflow or ErrorInsufficientBuffer or ErrorMoreData;
     }
 
     private static uint CtlCode(uint function)

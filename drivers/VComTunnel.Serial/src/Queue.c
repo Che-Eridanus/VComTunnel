@@ -606,7 +606,7 @@ VctPushRx(
     PVCT_PUSH_RX push;
     size_t inputLength;
     WDFREQUEST readRequest = NULL;
-    ULONG pushed;
+    ULONG pushed = 0;
     ULONG readBytes = 0;
     UCHAR* readBuffer = NULL;
     size_t readBufferLength = 0;
@@ -622,15 +622,19 @@ VctPushRx(
     }
 
     WdfSpinLockAcquire(Context->Lock);
-    pushed = VctRxCopyInLocked(Context, push->Bytes, push->ByteCount);
-    if (pushed == push->ByteCount && Context->PendingRead != NULL) {
-        readRequest = Context->PendingRead;
-        Context->PendingRead = NULL;
+    if (push->ByteCount > (VCOMTUNNEL_RX_QUEUE_SIZE - Context->RxCount)) {
+        status = STATUS_BUFFER_OVERFLOW;
+    } else {
+        pushed = VctRxCopyInLocked(Context, push->Bytes, push->ByteCount);
+        if (pushed == push->ByteCount && Context->PendingRead != NULL) {
+            readRequest = Context->PendingRead;
+            Context->PendingRead = NULL;
+        }
     }
     WdfSpinLockRelease(Context->Lock);
 
-    if (pushed != push->ByteCount) {
-        return STATUS_BUFFER_OVERFLOW;
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
 
     if (pushed > 0) {
