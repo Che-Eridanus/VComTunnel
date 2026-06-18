@@ -91,6 +91,9 @@ Current implementation note:
   value, such as no-flow-control; DTR, RTS, BREAK, and purge ACKs remain strict.
 - Windows handflow maps outbound CTS/DSR/DCD/XON-XOFF and inbound DTR/RTS/XON-XOFF
   into the corresponding RFC2217 SET-CONTROL FCO/FCI values.
+- Raw modem-control IOCTLs support MCR DTR/RTS changes by reusing the normal
+  RFC2217 SET-CONTROL DTR/RTS path; OUT1, OUT2, and LOOP are cached locally for
+  Windows compatibility and have no RFC2217 equivalent.
 - The service requires driver protocol 1.1 so remote accepted settings can use
   `IOCTL_VCOMTUNNEL_SET_REMOTE_SETTINGS`.
 - Startup sends the initial line-state and modem-state masks and waits for

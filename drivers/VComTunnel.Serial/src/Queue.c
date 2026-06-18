@@ -221,6 +221,100 @@ VctAccumulateLineStatsLocked(
 }
 
 static VOID
+VctQueueControlEvent(
+    _Inout_ PDEVICE_CONTEXT Context,
+    _In_ USHORT Type,
+    _In_reads_bytes_opt_(PayloadSize) const VOID* Payload,
+    _In_ ULONG PayloadSize
+    );
+
+static ULONG
+VctSnapshotModemControlLocked(
+    _In_ PDEVICE_CONTEXT Context
+    )
+{
+    ULONG modemControl;
+
+    modemControl = Context->ModemControl &
+        (SERIAL_IOC_MCR_OUT1 | SERIAL_IOC_MCR_OUT2 | SERIAL_IOC_MCR_LOOP);
+    if (Context->Dtr) {
+        modemControl |= SERIAL_IOC_MCR_DTR;
+    }
+    if (Context->Rts) {
+        modemControl |= SERIAL_IOC_MCR_RTS;
+    }
+
+    return modemControl;
+}
+
+static NTSTATUS
+VctCompleteModemControl(
+    _In_ WDFREQUEST Request,
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    ULONG modemControl;
+
+    WdfSpinLockAcquire(Context->Lock);
+    modemControl = VctSnapshotModemControlLocked(Context);
+    WdfSpinLockRelease(Context->Lock);
+
+    return VctCopyOutputBuffer(Request, &modemControl, sizeof(modemControl));
+}
+
+static NTSTATUS
+VctSetRawModemControl(
+    _In_ WDFREQUEST Request,
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    NTSTATUS status;
+    ULONG modemControl;
+    ULONG changedMask = 0;
+    BOOLEAN dtr;
+    BOOLEAN rts;
+    VCT_MODEM_CONTROL_EVENT event;
+
+    status = VctCopyInputBuffer(Request, &modemControl, sizeof(modemControl));
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if ((modemControl & ~(SERIAL_IOC_MCR_DTR |
+        SERIAL_IOC_MCR_RTS |
+        SERIAL_IOC_MCR_OUT1 |
+        SERIAL_IOC_MCR_OUT2 |
+        SERIAL_IOC_MCR_LOOP)) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    dtr = (modemControl & SERIAL_IOC_MCR_DTR) != 0;
+    rts = (modemControl & SERIAL_IOC_MCR_RTS) != 0;
+
+    WdfSpinLockAcquire(Context->Lock);
+    if (Context->Dtr != dtr) {
+        changedMask |= VCOMTUNNEL_MODEM_CONTROL_DTR;
+    }
+    if (Context->Rts != rts) {
+        changedMask |= VCOMTUNNEL_MODEM_CONTROL_RTS;
+    }
+    Context->Dtr = dtr;
+    Context->Rts = rts;
+    Context->ModemControl = modemControl;
+    WdfSpinLockRelease(Context->Lock);
+
+    if (changedMask != 0) {
+        RtlZeroMemory(&event, sizeof(event));
+        event.Mask = changedMask;
+        event.Dtr = dtr;
+        event.Rts = rts;
+        VctQueueControlEvent(Context, VComTunnelEventSetModemControl, &event, sizeof(event));
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static VOID
 VctCompleteUnmarkedRequest(
     _In_ WDFREQUEST Request,
     _In_ NTSTATUS Status
@@ -1195,6 +1289,14 @@ VctEvtIoDeviceControl(
             modemStatus |= SERIAL_RTS_STATE;
         }
         status = VctCopyOutputBuffer(Request, &modemStatus, sizeof(modemStatus));
+        break;
+
+    case IOCTL_SERIAL_GET_MODEM_CONTROL:
+        status = VctCompleteModemControl(Request, context);
+        break;
+
+    case IOCTL_SERIAL_SET_MODEM_CONTROL:
+        status = VctSetRawModemControl(Request, context);
         break;
 
     case IOCTL_SERIAL_SET_DTR:

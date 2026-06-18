@@ -289,6 +289,17 @@ event for the service. The service translates those events to RFC2217
 endpoint to pause or resume data sent toward the local COM port. If the service
 is not attached, the IOCTL fails with `STATUS_DEVICE_NOT_READY`.
 
+## Raw Modem Control
+
+`IOCTL_SERIAL_GET_MODEM_CONTROL` returns the driver's cached MCR-style control
+bits. `IOCTL_SERIAL_SET_MODEM_CONTROL` accepts `SERIAL_IOC_MCR_DTR`,
+`SERIAL_IOC_MCR_RTS`, `SERIAL_IOC_MCR_OUT1`, `SERIAL_IOC_MCR_OUT2`, and
+`SERIAL_IOC_MCR_LOOP`; unsupported bits fail with `STATUS_INVALID_PARAMETER`.
+Changes to DTR or RTS are queued as normal modem-control events so the service
+translates them to RFC2217 SET-CONTROL commands. OUT1, OUT2, and LOOP are
+cached for local `GET_MODEM_CONTROL` compatibility and do not generate RFC2217
+traffic.
+
 ## Ordering Rules
 
 - Preserve TxData order per serial handle.

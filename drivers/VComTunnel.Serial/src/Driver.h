@@ -33,6 +33,7 @@ typedef struct _DEVICE_CONTEXT {
     SERIALPERF_STATS Stats;
     ULONG WaitMask;
     ULONG ModemStatus;
+    ULONG ModemControl;
     ULONG LineErrors;
     BOOLEAN Dtr;
     BOOLEAN Rts;
