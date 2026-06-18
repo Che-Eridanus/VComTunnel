@@ -1,6 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <PackageReference Include="MahApps.Metro.IconPacks.Material" Version="4.11.0" />
     <ProjectReference Include="..\VComTunnel.Core\VComTunnel.Core.csproj" />
   </ItemGroup>
 

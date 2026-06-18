@@ -9,7 +9,7 @@ The current implementation delivers the phase 1 baseline:
 - WPF GUI for mappings, dependencies, start/stop, and logs
 - CLI helper `vcomtunnelctl`
 - External dependency detection for `com0com`, `hub4com.exe`, and `com2tcp-rfc2217.bat`
-- Assisted dependency download/extraction for com0com and hub4com
+- Release-package bundled setup for com0com and hub4com, with download fallback for development builds
 - KMDF backend scaffold with explicit "not ready" diagnostics
 
 Flutter was checked first, but `flutter --version` timed out repeatedly in this environment. The GUI therefore uses the planned `.NET WPF` fallback.
@@ -73,7 +73,14 @@ vcomtunnelctl service install C:\Tools\VComTunnel\VComTunnel.Service.exe
 
 ## Phase 1 dependency model
 
-VComTunnel does not redistribute `com0com` or `hub4com`. Install them externally, then run:
+Published VComTunnel packages include the upstream `com0com` and `hub4com`
+archives under the release `dependencies` directory:
+
+- `dependencies\hub4com-2.1.0.0-386.zip`
+- `dependencies\com0com-3.0.0.0-i386-and-x64-signed.zip`
+
+When you run dependency setup, VComTunnel first uses those bundled archives. If
+they are missing, development builds fall back to downloading the same archives.
 
 ```powershell
 vcomtunnelctl diagnose
@@ -87,14 +94,39 @@ vcomtunnelctl deps install
 vcomtunnelctl deps launch-com0com
 ```
 
-`deps install` downloads and extracts:
+`deps install` extracts or downloads:
 
 - hub4com 2.1.0.0 to `%ProgramData%\VComTunnel\tools\hub4com`
 - com0com 3.0.0.0 signed package to `%ProgramData%\VComTunnel\tools\com0com`
 
 hub4com becomes usable after extraction because VComTunnel scans its tools cache. com0com is a Windows driver, so it still requires an interactive elevated installer run; use `deps launch-com0com` or install the downloaded package manually. Restart `VComTunnel.Service` after installing dependencies so the GUI/API sees the new files.
 
-The GUI has a single `Setup deps` button. It checks local dependency state, downloads/extracts hub4com and the com0com installer when needed, and asks whether to launch the elevated com0com driver installer if `setupc.exe` is still missing. After launching the installer, the GUI polls dependency status for a few minutes and refreshes automatically when `setupc.exe` becomes available.
+The GUI has a single `Setup deps` button. It checks local dependency state, extracts bundled archives or downloads them when needed, and asks whether to launch the elevated com0com driver installer if `setupc.exe` is still missing. After launching the installer, the GUI polls dependency status for a few minutes and refreshes automatically when `setupc.exe` becomes available.
+
+## Release packaging
+
+Use the packaging script to publish GUI, service, CLI, and bundled dependency
+archives into one distributable folder and `.zip`:
+
+```powershell
+scripts\package-release.ps1 -Version 0.1.0 -Runtime win-x64
+```
+
+The script defaults to `--no-restore`; run a normal restore/build first, or pass
+`-Restore` when the release machine is allowed to access NuGet.
+
+By default the script downloads the two upstream dependency archives into the
+package `dependencies` directory. For repeatable/offline release builds, provide
+a pre-populated archive cache:
+
+```powershell
+scripts\package-release.ps1 -Version 0.1.0 -Runtime win-x64 -DependencyArchiveRoot C:\Deps\VComTunnel
+```
+
+The package also writes `THIRD-PARTY-NOTICES.txt` and `SHA256SUMS.txt`. The
+included com0com driver package still requires an interactive elevated install
+step on the target machine; bundling it removes the runtime network dependency,
+but does not bypass Windows driver installation policy.
 
 Each `com0comHub4com` mapping expects:
 
@@ -124,4 +156,15 @@ Current stopping point without external integration: this repo can build, valida
 
 ## Phase 2 KMDF scaffold
 
-`drivers/VComTunnel.Serial` contains the driver-side design notes, INF skeleton, and manual install script placeholder. The service returns an explicit unsupported status for `kmdf` mappings until the driver and user-mode channel are implemented.
+`drivers/VComTunnel.Serial` contains the driver-side design notes, private
+service-channel protocol, INF skeleton, and guarded manual install script. The
+service returns an explicit unsupported status for `kmdf` mappings until the
+driver and user-mode channel are implemented.
+
+The intended KMDF backend removes the phase 1 dependency on com0com and hub4com:
+
+```text
+serial tool -> COMx -> VComTunnel.Serial.sys -> VComTunnel.Service -> RFC2217
+```
+
+Current status remains design/scaffold only; no `.sys` or signed package exists.

@@ -17,9 +17,9 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
     ("com0com create and remove plans", Com0comCreateAndRemovePlansAsync),
     ("KMDF mapping reports unsupported", KmdfMappingReportsUnsupportedAsync),
-    ("fake com2tcp process starts and stops", FakeCom2TcpProcessStartsAndStopsAsync)
-    ,
-    ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync)
+    ("fake com2tcp process starts and stops", FakeCom2TcpProcessStartsAndStopsAsync),
+    ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync),
+    ("dependency installer uses bundled release archives", DependencyInstallerUsesBundledReleaseArchivesAsync)
 };
 
 var failed = 0;
@@ -302,6 +302,41 @@ static async Task DependencyInstallerExtractsToolZipsAsync()
     }
 }
 
+static async Task DependencyInstallerUsesBundledReleaseArchivesAsync()
+{
+    using var temp = new TempDir();
+    var oldHome = Environment.GetEnvironmentVariable("VCOMTUNNEL_HOME");
+    var oldArchiveRoot = Environment.GetEnvironmentVariable(DependencyInstaller.BundledDependencyArchiveDirectoryVariable);
+    Environment.SetEnvironmentVariable("VCOMTUNNEL_HOME", Path.Combine(temp.Path, "home"));
+    Environment.SetEnvironmentVariable(DependencyInstaller.BundledDependencyArchiveDirectoryVariable, Path.Combine(temp.Path, "bundled"));
+    try
+    {
+        var archiveRoot = Environment.GetEnvironmentVariable(DependencyInstaller.BundledDependencyArchiveDirectoryVariable)!;
+        Directory.CreateDirectory(archiveRoot);
+        CreateZip(
+            Path.Combine(archiveRoot, DependencyInstaller.Hub4comArchiveName),
+            new Dictionary<string, string> { ["hub4com.exe"] = "", ["com2tcp-rfc2217.bat"] = "@echo off" });
+        CreateZip(
+            Path.Combine(archiveRoot, DependencyInstaller.Com0comArchiveName),
+            new Dictionary<string, string> { ["Setup_com0com_v3.0.0.0_W7_x64_signed.exe"] = "", ["Setup_com0com_v3.0.0.0_W7_x86_signed.exe"] = "" });
+
+        var http = new HttpClient(new ThrowingHandler());
+        var detector = new DependencyDetector([AppPaths.ToolsDirectory], pathOverride: "");
+        var installer = new DependencyInstaller(detector, http);
+        var result = await installer.InstallAsync(new DependencyInstallRequest());
+
+        AssertTrue(result.Steps.All(s => s.Success), string.Join("; ", result.Steps.Select(s => s.Message)));
+        AssertTrue(result.Steps.All(s => s.Message.Contains("bundled release archive", StringComparison.OrdinalIgnoreCase)), "Bundled archives should be used before network downloads.");
+        AssertTrue(File.Exists(Path.Combine(AppPaths.ToolsDirectory, "hub4com", "com2tcp-rfc2217.bat")), "hub4com batch should be extracted from bundled archive.");
+        AssertTrue(File.Exists(Path.Combine(AppPaths.ToolsDirectory, "com0com", "Setup_com0com_v3.0.0.0_W7_x64_signed.exe")), "com0com installer should be extracted from bundled archive.");
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("VCOMTUNNEL_HOME", oldHome);
+        Environment.SetEnvironmentVariable(DependencyInstaller.BundledDependencyArchiveDirectoryVariable, oldArchiveRoot);
+    }
+}
+
 static async Task<ConfigStore> StoreWithMappingAsync(string root, TunnelMapping mapping)
 {
     var store = new ConfigStore(Path.Combine(root, "config.json"));
@@ -372,6 +407,18 @@ static void AssertTrue(bool condition, string message)
     }
 }
 
+static void CreateZip(string path, IReadOnlyDictionary<string, string> files)
+{
+    using var stream = File.Create(path);
+    using var archive = new ZipArchive(stream, ZipArchiveMode.Create);
+    foreach (var (name, content) in files)
+    {
+        var entry = archive.CreateEntry(name);
+        using var writer = new StreamWriter(entry.Open());
+        writer.Write(content);
+    }
+}
+
 internal sealed class TempDir : IDisposable
 {
     public TempDir()
@@ -420,6 +467,14 @@ internal sealed class ZipHandler : HttpMessageHandler
             Content = new StreamContent(stream)
         };
         return Task.FromResult(response);
+    }
+}
+
+internal sealed class ThrowingHandler : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        throw new InvalidOperationException("Network should not be used when bundled dependency archives are available.");
     }
 }
 

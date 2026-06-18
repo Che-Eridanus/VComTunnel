@@ -5,6 +5,9 @@ namespace VComTunnel.Core;
 
 public sealed class DependencyInstaller
 {
+    public const string BundledDependencyArchiveDirectoryVariable = "VCOMTUNNEL_DEPENDENCY_ARCHIVE_DIR";
+    public const string Hub4comArchiveName = "hub4com-2.1.0.0-386.zip";
+    public const string Com0comArchiveName = "com0com-3.0.0.0-i386-and-x64-signed.zip";
     public const string Hub4comUrl = "https://sourceforge.net/projects/com0com/files/hub4com/2.1.0.0/hub4com-2.1.0.0-386.zip/download";
     public const string Com0comUrl = "https://sourceforge.net/projects/com0com/files/com0com/3.0.0.0/com0com-3.0.0.0-i386-and-x64-signed.zip/download";
 
@@ -30,7 +33,8 @@ public sealed class DependencyInstaller
             steps.Add(await DownloadAndExtractAsync(
                 "hub4com",
                 Hub4comUrl,
-                Path.Combine(AppPaths.DownloadsDirectory, "hub4com-2.1.0.0-386.zip"),
+                Hub4comArchiveName,
+                Path.Combine(AppPaths.DownloadsDirectory, Hub4comArchiveName),
                 Path.Combine(AppPaths.ToolsDirectory, "hub4com"),
                 "com2tcp-rfc2217.bat",
                 request.Force,
@@ -42,11 +46,12 @@ public sealed class DependencyInstaller
             steps.Add(await DownloadAndExtractAnyAsync(
                 "com0com",
                 Com0comUrl,
-                Path.Combine(AppPaths.DownloadsDirectory, "com0com-3.0.0.0-i386-and-x64-signed.zip"),
+                Com0comArchiveName,
+                Path.Combine(AppPaths.DownloadsDirectory, Com0comArchiveName),
                 Path.Combine(AppPaths.ToolsDirectory, "com0com"),
                 ["setupc.exe", "Setup_com0com_v3.0.0.0_W7_x64_signed.exe", "Setup_com0com_v3.0.0.0_W7_x86_signed.exe"],
                 request.Force,
-                "Downloaded com0com installer package. Run the installer with administrator approval, then refresh dependencies.",
+                "Prepared com0com installer package. Run the installer with administrator approval, then refresh dependencies.",
                 cancellationToken));
         }
 
@@ -98,6 +103,7 @@ public sealed class DependencyInstaller
     private async Task<DependencyInstallStep> DownloadAndExtractAsync(
         string name,
         string url,
+        string archiveName,
         string archivePath,
         string extractPath,
         string expectedFile,
@@ -113,7 +119,7 @@ public sealed class DependencyInstaller
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(archivePath)!);
-            await DownloadAsync(url, archivePath, cancellationToken);
+            var archiveSource = await PrepareArchiveAsync(archiveName, url, archivePath, cancellationToken);
 
             if (force && Directory.Exists(extractPath))
             {
@@ -129,7 +135,7 @@ public sealed class DependencyInstaller
                 return new DependencyInstallStep(name, false, $"{expectedFile} was not found after extraction.", extractPath);
             }
 
-            return new DependencyInstallStep(name, true, "Downloaded and extracted.", found);
+            return new DependencyInstallStep(name, true, $"{archiveSource} and extracted.", found);
         }
         catch (Exception ex)
         {
@@ -140,6 +146,7 @@ public sealed class DependencyInstaller
     private async Task<DependencyInstallStep> DownloadAndExtractAnyAsync(
         string name,
         string url,
+        string archiveName,
         string archivePath,
         string extractPath,
         IReadOnlyList<string> expectedFiles,
@@ -159,7 +166,7 @@ public sealed class DependencyInstaller
             }
 
             Directory.CreateDirectory(Path.GetDirectoryName(archivePath)!);
-            await DownloadAsync(url, archivePath, cancellationToken);
+            var archiveSource = await PrepareArchiveAsync(archiveName, url, archivePath, cancellationToken);
 
             if (force && Directory.Exists(extractPath))
             {
@@ -175,7 +182,7 @@ public sealed class DependencyInstaller
                 return new DependencyInstallStep(name, false, $"None of the expected files were found after extraction: {string.Join(", ", expectedFiles)}.", extractPath);
             }
 
-            return new DependencyInstallStep(name, true, successMessage, found);
+            return new DependencyInstallStep(name, true, $"{archiveSource}. {successMessage}", found);
         }
         catch (Exception ex)
         {
@@ -195,6 +202,49 @@ public sealed class DependencyInstaller
         }
 
         return null;
+    }
+
+    private async Task<string> PrepareArchiveAsync(
+        string archiveName,
+        string url,
+        string archivePath,
+        CancellationToken cancellationToken)
+    {
+        var bundledArchive = FindBundledArchive(archiveName);
+        if (bundledArchive is not null)
+        {
+            File.Copy(bundledArchive, archivePath, overwrite: true);
+            return "Installed from bundled release archive";
+        }
+
+        await DownloadAsync(url, archivePath, cancellationToken);
+        return "Downloaded";
+    }
+
+    private static string? FindBundledArchive(string archiveName)
+    {
+        foreach (var directory in BundledArchiveDirectories())
+        {
+            var candidate = Path.Combine(directory, archiveName);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<string> BundledArchiveDirectories()
+    {
+        var overrideDirectory = Environment.GetEnvironmentVariable(BundledDependencyArchiveDirectoryVariable);
+        if (!string.IsNullOrWhiteSpace(overrideDirectory))
+        {
+            yield return overrideDirectory;
+        }
+
+        yield return AppPaths.BundledDependenciesDirectory;
+        yield return Path.Combine(Environment.CurrentDirectory, "dependencies");
     }
 
     private async Task DownloadAsync(string url, string archivePath, CancellationToken cancellationToken)

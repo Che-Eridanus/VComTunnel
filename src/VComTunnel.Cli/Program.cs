@@ -184,7 +184,7 @@ internal static class VComTunnelCtl
         }
 
         Console.WriteLine($"com0com/hub4com ready: {result.DependencyReport.IsReadyForCom0comHub4com}");
-        Console.WriteLine("If com0com is downloaded but not installed, run: vcomtunnelctl deps launch-com0com");
+        Console.WriteLine("If com0com is prepared but not installed, run: vcomtunnelctl deps launch-com0com");
         return result.Steps.All(s => s.Success) ? 0 : 2;
     }
 

@@ -7,6 +7,10 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Controls;
+using System.Windows.Input;
+using MahApps.Metro.IconPacks;
 using VComTunnel.Core;
 
 namespace VComTunnel.Gui;
@@ -21,15 +25,21 @@ public partial class MainWindow : Window
 
     private readonly HttpClient _client = new() { BaseAddress = new Uri("http://127.0.0.1:44817") };
     private readonly ObservableCollection<MappingRow> _mappings = [];
+    private readonly ObservableCollection<ComPairRow> _comPairs = [];
     private readonly List<string> _guiLogLines = [];
     private Process? _ownedServiceProcess;
     private bool _serviceStartAttempted;
     private bool _dependencyPollActive;
+    private bool _updatingLanguage;
+    private UiLanguage _language = GuiText.DefaultLanguage;
 
     public MainWindow()
     {
         InitializeComponent();
         MappingsGrid.ItemsSource = _mappings;
+        ComPairsList.ItemsSource = _comPairs;
+        ApplyLocalization();
+        UpdateMappingCommandState();
         _ = InitializeAsync();
     }
 
@@ -40,6 +50,116 @@ public partial class MainWindow : Window
         _client.Dispose();
     }
 
+    private string T(string key) => GuiText.Get(_language, key);
+
+    private string TF(string key, params object?[] args) => GuiText.Format(_language, key, args);
+
+    private void SetLanguageMenuSelection()
+    {
+        _updatingLanguage = true;
+        EnglishLanguageMenuItem.IsChecked = _language == UiLanguage.English;
+        ChineseLanguageMenuItem.IsChecked = _language == UiLanguage.Chinese;
+        _updatingLanguage = false;
+    }
+
+    private void ApplyLocalization()
+    {
+        ServiceMenuItem.Header = T("Menu.Service");
+        MappingsMenuItem.Header = T("Menu.Mappings");
+        ComPairsMenuItem.Header = T("Menu.ComPairs");
+        ToolsMenuItem.Header = T("Menu.Tools");
+        LanguageMenuItem.Header = T("Menu.Language");
+        EnglishLanguageMenuItem.Header = T("Language.English");
+        ChineseLanguageMenuItem.Header = T("Language.Chinese");
+        StatusLabel.Text = T("Label.Status");
+
+        SetToolbarButton(RefreshButton, PackIconMaterialKind.Refresh, "Action.Refresh");
+        SetToolbarButton(AddButton, PackIconMaterialKind.Plus, "Action.Add");
+        SetToolbarButton(SaveButton, PackIconMaterialKind.ContentSave, "Action.Save");
+        SetToolbarButton(DeleteMappingButton, PackIconMaterialKind.DeleteOutline, "Action.DeleteMapping");
+        SetToolbarButton(StartButton, PackIconMaterialKind.Play, "Action.Start");
+        SetToolbarButton(StopButton, PackIconMaterialKind.Stop, "Action.Stop");
+        SetToolbarButton(PortsButton, PackIconMaterialKind.FormatListBulleted, "Action.Ports");
+        SetToolbarButton(CreatePairButton, PackIconMaterialKind.Link, "Action.CreatePair");
+        SetToolbarButton(DeletePairButton, PackIconMaterialKind.DeleteOutline, "Action.DeletePair");
+        SetToolbarButton(SetupDepsButton, PackIconMaterialKind.Cog, "Action.SetupDeps");
+        SetToolbarButton(ClearLogsButton, PackIconMaterialKind.Broom, "Action.ClearLogs");
+
+        SetCommandMenuItem(RefreshMenuItem, PackIconMaterialKind.Refresh, "Action.Refresh");
+        SetCommandMenuItem(AddMenuItem, PackIconMaterialKind.Plus, "Action.Add");
+        SetCommandMenuItem(SaveMenuItem, PackIconMaterialKind.ContentSave, "Action.Save");
+        SetCommandMenuItem(DeleteMappingMenuItem, PackIconMaterialKind.DeleteOutline, "Action.DeleteMapping");
+        SetCommandMenuItem(StartMappingCommandMenuItem, PackIconMaterialKind.Play, "Action.Start");
+        SetCommandMenuItem(StopMappingCommandMenuItem, PackIconMaterialKind.Stop, "Action.Stop");
+        SetCommandMenuItem(PortsMenuItem, PackIconMaterialKind.FormatListBulleted, "Action.Ports");
+        SetCommandMenuItem(CreatePairMenuItem, PackIconMaterialKind.Link, "Action.CreatePair");
+        SetCommandMenuItem(DeletePairMenuItem, PackIconMaterialKind.DeleteOutline, "Action.DeletePair");
+        SetCommandMenuItem(SetupDepsMenuItem, PackIconMaterialKind.Cog, "Action.SetupDeps");
+        SetCommandMenuItem(ClearLogsMenuItem, PackIconMaterialKind.Broom, "Action.ClearLogs");
+        SetCommandMenuItem(StartMappingMenuItem, PackIconMaterialKind.Play, "Action.Start");
+        SetCommandMenuItem(StopMappingMenuItem, PackIconMaterialKind.Stop, "Action.Stop");
+        SetCommandMenuItem(DeleteSelectedMappingMenuItem, PackIconMaterialKind.DeleteOutline, "Action.DeleteMapping");
+        SetCommandMenuItem(DeleteSelectedComPairMenuItem, PackIconMaterialKind.DeleteOutline, "Action.DeleteSelectedPair");
+
+        TunnelMappingsGroupBox.Header = T("Group.Mappings");
+        DependenciesGroupBox.Header = T("Group.DependenciesPairs");
+        LogsGroupBox.Header = T("Group.Logs");
+        NameColumn.Header = T("Column.Name");
+        BackendColumn.Header = T("Column.Backend");
+        VisibleComColumn.Header = T("Column.VisibleCom");
+        BackingColumn.Header = T("Column.Backing");
+        HostColumn.Header = T("Column.Host");
+        PortColumn.Header = T("Column.Port");
+        AutoColumn.Header = T("Column.Auto");
+        RestartColumn.Header = T("Column.Restart");
+        MappingStateColumn.Header = T("Column.State");
+        PairNumberColumn.Header = T("Column.PairNumber");
+        PairPortAColumn.Header = T("Column.PortA");
+        PairPortBColumn.Header = T("Column.PortB");
+        PairStateColumn.Header = T("Column.State");
+
+        RefreshMappingStateLabels();
+        SetComPairs(_comPairs.Select(pair => pair.ToInfo()).ToList());
+        SetLanguageMenuSelection();
+        UpdateMappingCommandState();
+    }
+
+    private void SetToolbarButton(Button button, PackIconMaterialKind iconKind, string textKey)
+    {
+        var label = T(textKey);
+        button.Content = BuildIcon(iconKind, 18);
+        button.ToolTip = label;
+        AutomationProperties.SetName(button, label);
+    }
+
+    private void SetCommandMenuItem(MenuItem item, PackIconMaterialKind iconKind, string textKey)
+    {
+        item.Header = T(textKey);
+        item.Icon = BuildIcon(iconKind, 16);
+    }
+
+    private static PackIconMaterial BuildIcon(PackIconMaterialKind iconKind, double size)
+    {
+        return new PackIconMaterial
+        {
+            Kind = iconKind,
+            Width = size,
+            Height = size,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+    }
+
+    private void RefreshMappingStateLabels()
+    {
+        foreach (var row in _mappings)
+        {
+            row.StateLabel = GuiText.State(_language, row.RunState);
+        }
+
+        MappingsGrid.Items.Refresh();
+        UpdateMappingCommandState();
+    }
+
     private async void Refresh_Click(object sender, RoutedEventArgs e)
     {
         _serviceStartAttempted = false;
@@ -48,17 +168,128 @@ public partial class MainWindow : Window
 
     private async void SetupDeps_Click(object sender, RoutedEventArgs e) => await SetupDependenciesAsync();
     private async void Save_Click(object sender, RoutedEventArgs e) => await SaveAsync();
-    private async void Start_Click(object sender, RoutedEventArgs e) => await PostSelectedAsync("start");
-    private async void Stop_Click(object sender, RoutedEventArgs e) => await PostSelectedAsync("stop");
     private async void Ports_Click(object sender, RoutedEventArgs e) => await ShowCom0comPairsAsync();
     private async void CreatePair_Click(object sender, RoutedEventArgs e) => await CreatePairForSelectedAsync();
     private async void DeletePair_Click(object sender, RoutedEventArgs e) => await DeletePairForSelectedAsync();
+    private async void DeleteMapping_Click(object sender, RoutedEventArgs e) => await DeleteSelectedMappingAsync();
     private async void ClearLogs_Click(object sender, RoutedEventArgs e) => await ClearLogsAsync();
+
+    private async void StartSelectedMapping_Click(object sender, RoutedEventArgs e) => await PostSelectedAsync("start");
+    private async void StopSelectedMapping_Click(object sender, RoutedEventArgs e) => await PostSelectedAsync("stop");
+
+    private void EnglishLanguageMenuItem_Click(object sender, RoutedEventArgs e) => SetLanguage(UiLanguage.English);
+
+    private void ChineseLanguageMenuItem_Click(object sender, RoutedEventArgs e) => SetLanguage(UiLanguage.Chinese);
+
+    private void SetLanguage(UiLanguage language)
+    {
+        if (_updatingLanguage)
+        {
+            return;
+        }
+
+        if (_language == language)
+        {
+            SetLanguageMenuSelection();
+            return;
+        }
+
+        _language = language;
+        ApplyLocalization();
+    }
+
+    private async void DeleteSelectedComPair_Click(object sender, RoutedEventArgs e)
+    {
+        if (ComPairsList.SelectedItem is not ComPairRow row)
+        {
+            SetStatus(T("Status.SelectPairFirst"), "warn");
+            return;
+        }
+
+        await DeleteCom0comPairAsync(row.ToInfo());
+    }
+
+    private void ComPairsList_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not ListView list || e.OriginalSource is not DependencyObject source)
+        {
+            return;
+        }
+
+        if (ItemsControl.ContainerFromElement(list, source) is ListViewItem item)
+        {
+            item.IsSelected = true;
+            item.Focus();
+            return;
+        }
+
+        list.SelectedItem = null;
+    }
+
+    private void MappingsGrid_SelectionChanged(object sender, SelectionChangedEventArgs e) => UpdateMappingCommandState();
+
+    private async void MappingsGrid_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Delete || e.OriginalSource is TextBox)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        await DeleteSelectedMappingAsync();
+    }
+
+    private void MappingsGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not DataGrid grid || e.OriginalSource is not DependencyObject source)
+        {
+            return;
+        }
+
+        if (ItemsControl.ContainerFromElement(grid, source) is DataGridRow row)
+        {
+            row.IsSelected = true;
+            row.Focus();
+            return;
+        }
+
+        grid.SelectedItem = null;
+    }
+
+    private void MappingsGrid_ContextMenuOpening(object sender, ContextMenuEventArgs e)
+    {
+        if (MappingsGrid.SelectedItem is not MappingRow row)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        CommitGridEdits();
+        UpdateMappingCommandState();
+    }
+
+    private void UpdateMappingCommandState()
+    {
+        var row = MappingsGrid.SelectedItem as MappingRow;
+        var canStart = row?.CanStart == true;
+        var canStop = row?.CanStop == true;
+        var canDelete = row is not null;
+
+        DeleteMappingButton.IsEnabled = canDelete;
+        DeleteMappingMenuItem.IsEnabled = canDelete;
+        DeleteSelectedMappingMenuItem.IsEnabled = canDelete;
+        StartButton.IsEnabled = canStart;
+        StopButton.IsEnabled = canStop;
+        StartMappingCommandMenuItem.IsEnabled = canStart;
+        StopMappingCommandMenuItem.IsEnabled = canStop;
+        StartMappingMenuItem.IsEnabled = canStart;
+        StopMappingMenuItem.IsEnabled = canStop;
+    }
 
     private void Add_Click(object sender, RoutedEventArgs e)
     {
         var portNumber = 12 + _mappings.Count;
-        _mappings.Add(new MappingRow
+        var row = new MappingRow
         {
             Id = Guid.NewGuid().ToString("n"),
             Name = $"Tunnel {_mappings.Count + 1}",
@@ -68,8 +299,15 @@ public partial class MainWindow : Window
             Host = "127.0.0.1",
             Port = 3333,
             AutoStart = false,
-            RestartOnFailure = true
-        });
+            RestartOnFailure = true,
+            StateLabel = GuiText.State(_language, TunnelRunState.Stopped)
+        };
+        _mappings.Add(row);
+        MappingsGrid.SelectedItem = row;
+        MappingsGrid.ScrollIntoView(row);
+        MappingsGrid.Items.Refresh();
+        SetStatus(T("Status.AddedMapping"));
+        UpdateMappingCommandState();
     }
 
     private async Task RefreshAsync()
@@ -82,7 +320,8 @@ public partial class MainWindow : Window
 
         try
         {
-            ServiceStateText.Text = "Service: connecting...";
+            ServiceStateText.Text = T("Status.ServiceConnecting");
+            var dependencyStale = false;
             var mappings = await _client.GetFromJsonAsync<List<TunnelMapping>>("/api/mappings", JsonOptions) ?? [];
             _mappings.Clear();
             foreach (var mapping in mappings)
@@ -90,32 +329,36 @@ public partial class MainWindow : Window
                 _mappings.Add(MappingRow.From(mapping));
             }
 
+            await RefreshMappingStatesAsync();
             var dependencies = await _client.GetFromJsonAsync<SystemDependencyReport>("/api/dependencies", JsonOptions);
             DependenciesText.Text = FormatDependencies(dependencies);
             var localDependencies = new DependencyDetector().Detect();
             if (dependencies?.IsReadyForCom0comHub4com == false && localDependencies.IsReadyForCom0comHub4com)
             {
-                SetStatus("Service dependency cache is stale. Restart VComTunnel.Service or close/reopen the GUI.", "warn");
-                DependenciesText.Text += Environment.NewLine + "Local detector is ready, but the running service is not. The service process is likely stale.";
-                DependenciesText.Text += Environment.NewLine + Environment.NewLine + "Local detector:";
+                dependencyStale = true;
+                SetStatus(T("Status.ServiceDependencyCacheStale"), "warn");
+                DependenciesText.Text += Environment.NewLine + T("Diag.LocalDetectorStale");
+                DependenciesText.Text += Environment.NewLine + Environment.NewLine + T("Diag.LocalDetector");
                 DependenciesText.Text += Environment.NewLine + FormatDependencies(localDependencies);
             }
+            await RefreshComPairsListAsync(updateDetails: false);
             await RefreshLogsAsync();
-            if (!ServiceStateText.Text.Contains("stale", StringComparison.OrdinalIgnoreCase))
+            if (!dependencyStale)
             {
-                ServiceStateText.Text = $"Service: connected, {_mappings.Count} mapping(s)";
+                ServiceStateText.Text = TF("Status.ServiceConnected", _mappings.Count);
             }
         }
         catch (Exception ex)
         {
-            ServiceStateText.Text = "Service: offline";
+            ServiceStateText.Text = T("Status.ServiceOffline");
+            ClearComPairsList();
             DependenciesText.Text = BuildOfflineMessage(ex) + Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
         }
     }
 
     private async Task InitializeAsync()
     {
-        ServiceStateText.Text = "Service: checking...";
+        ServiceStateText.Text = T("Status.ServiceChecking");
         if (!await IsServiceReadyAsync())
         {
             await StartServiceAndRefreshAsync(force: false);
@@ -142,20 +385,22 @@ public partial class MainWindow : Window
     {
         if (_serviceStartAttempted && !force)
         {
-            ServiceStateText.Text = "Service: offline";
-            DependenciesText.Text = "VComTunnel.Service is not reachable at 127.0.0.1:44817. Click Refresh to retry auto-start, or run VComTunnel.Service manually.";
+            ServiceStateText.Text = T("Status.ServiceOffline");
+            ClearComPairsList();
+            DependenciesText.Text = T("Diag.OfflineRetry");
             DependenciesText.Text += Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
             return;
         }
 
         _serviceStartAttempted = true;
-        ServiceStateText.Text = "Service: starting...";
+        ServiceStateText.Text = T("Status.ServiceStarting");
 
         var servicePath = ResolveServicePath();
         if (servicePath is null)
         {
-            ServiceStateText.Text = "Service: offline";
-            DependenciesText.Text = "Could not find VComTunnel.Service.exe near the GUI. Build the solution or start the service manually.";
+            ServiceStateText.Text = T("Status.ServiceOffline");
+            ClearComPairsList();
+            DependenciesText.Text = T("Diag.ServiceNotFound");
             DependenciesText.Text += Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
             return;
         }
@@ -184,7 +429,8 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            ServiceStateText.Text = "Service: start failed";
+            ServiceStateText.Text = T("Status.ServiceStartFailed");
+            ClearComPairsList();
             DependenciesText.Text = BuildOfflineMessage(ex) + Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
             return;
         }
@@ -195,9 +441,10 @@ public partial class MainWindow : Window
             return;
         }
 
-        ServiceStateText.Text = "Service: offline";
-        DependenciesText.Text = $"Started {servicePath}, but 127.0.0.1:44817 did not become ready within 10 seconds.";
-        DependenciesText.Text += Environment.NewLine + $"Startup log: {Path.Combine(AppPaths.LogsDirectory, "gui-started-service.log")}";
+        ServiceStateText.Text = T("Status.ServiceOffline");
+        ClearComPairsList();
+        DependenciesText.Text = TF("Diag.StartedButNotReady", servicePath);
+        DependenciesText.Text += Environment.NewLine + TF("Diag.StartupLog", Path.Combine(AppPaths.LogsDirectory, "gui-started-service.log"));
         DependenciesText.Text += Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
     }
 
@@ -217,6 +464,22 @@ public partial class MainWindow : Window
         return false;
     }
 
+    private async Task RefreshMappingStatesAsync()
+    {
+        var status = await _client.GetFromJsonAsync<ServiceStatus>("/api/status", JsonOptions);
+        var stateById = status?.Tunnels.ToDictionary(t => t.Id, StringComparer.OrdinalIgnoreCase)
+            ?? new Dictionary<string, TunnelStatus>(StringComparer.OrdinalIgnoreCase);
+        foreach (var row in _mappings)
+        {
+            row.RunState = stateById.TryGetValue(row.Id, out var tunnel)
+                ? tunnel.State
+                : TunnelRunState.Stopped;
+            row.StateLabel = GuiText.State(_language, row.RunState);
+        }
+
+        MappingsGrid.Items.Refresh();
+    }
+
     private static string? ResolveServicePath()
     {
         var baseDirectory = AppContext.BaseDirectory;
@@ -230,9 +493,9 @@ public partial class MainWindow : Window
         return candidates.FirstOrDefault(File.Exists);
     }
 
-    private static string BuildOfflineMessage(Exception ex)
+    private string BuildOfflineMessage(Exception ex)
     {
-        return $"VComTunnel.Service is not reachable at 127.0.0.1:44817.\r\n\r\n{ex.Message}\r\n\r\nClick Refresh to retry auto-start, or run VComTunnel.Service manually.";
+        return TF("Diag.Offline", ex.Message);
     }
 
     private static void AppendServiceStartLog(string logPath, string? line)
@@ -276,11 +539,58 @@ public partial class MainWindow : Window
         try
         {
             var saved = await SaveMappingsAsync();
-            ServiceStateText.Text = saved ? "Saved." : ServiceStateText.Text;
+            if (saved)
+            {
+                await RefreshAsync();
+                SetStatus(T("Status.Saved"));
+            }
         }
         catch (Exception ex)
         {
-            ServiceStateText.Text = $"Save failed: {ex.Message}";
+            ServiceStateText.Text = TF("Status.SaveFailed", ex.Message);
+        }
+    }
+
+    private async Task DeleteSelectedMappingAsync()
+    {
+        if (MappingsGrid.SelectedItem is not MappingRow row)
+        {
+            SetStatus(T("Status.SelectMappingFirst"), "warn");
+            return;
+        }
+
+        var answer = MessageBox.Show(
+            TF("Prompt.DeleteMapping", row.Name, row.VisiblePort),
+            T("Title.Mapping"),
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning);
+        if (answer != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        try
+        {
+            if (row.CanStop)
+            {
+                await _client.PostAsync($"/api/mappings/{row.Id}/stop", null);
+            }
+
+            _mappings.Remove(row);
+            MappingsGrid.SelectedItem = null;
+            if (!await SaveMappingsAsync())
+            {
+                await RefreshAsync();
+                return;
+            }
+
+            await RefreshAsync();
+            SetStatus(TF("Status.DeletedMapping", row.Name));
+        }
+        catch (Exception ex)
+        {
+            SetStatus(TF("Status.DeleteMappingFailed", ex.Message), "error");
+            await RefreshAsync();
         }
     }
 
@@ -288,21 +598,27 @@ public partial class MainWindow : Window
     {
         if (MappingsGrid.SelectedItem is not MappingRow row)
         {
-            ServiceStateText.Text = "Select a mapping first.";
+            ServiceStateText.Text = T("Status.SelectMappingFirst");
             return;
         }
 
+        await PostMappingAsync(row, action);
+    }
+
+    private async Task PostMappingAsync(MappingRow row, string action)
+    {
+        var actionLabel = ActionLabel(action);
         try
         {
             if (row.IsKmdf)
             {
-                SetStatus("KMDF backend is only a scaffold. Use com0comHub4com for now.");
+                SetStatus(T("Status.KmdfUnsupported"));
                 return;
             }
 
             if (await IsServiceDependencyStateStaleAsync())
             {
-                SetStatus("Service dependency state is stale. Close/reopen the GUI, then retry Start.", "warn");
+                SetStatus(T("Status.DependencyStateStale"), "warn");
                 return;
             }
 
@@ -322,18 +638,19 @@ public partial class MainWindow : Window
             if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
                 await RefreshAsync();
-                SetStatus($"{action}: mapping was not found after save. Select the row again and retry.");
+                SetStatus(TF("Status.MappingNotFoundAfterSave", actionLabel));
                 return;
             }
 
             var message = FormatActionResult(action, response, responseBody);
             SetStatus(message, response.IsSuccessStatusCode ? "info" : "error");
-            AppendGuiLog("debug", "api", responseBody);
+            AppendGuiLog("debug", T("Log.Api"), responseBody);
+            await RefreshMappingStatesAsync();
             await RefreshLogsAsync();
         }
         catch (Exception ex)
         {
-            SetStatus($"{action} failed: {ex.Message}");
+            SetStatus(TF("Status.ActionFailed", actionLabel, ex.Message));
         }
     }
 
@@ -346,12 +663,19 @@ public partial class MainWindow : Window
         var body = await response.Content.ReadAsStringAsync();
         if (response.IsSuccessStatusCode)
         {
-            AppendGuiLog("info", "gui", $"Saved {_mappings.Count} mapping(s).");
+            AppendGuiLog("info", T("Log.Gui"), TF("Status.SavedMappings", _mappings.Count));
             return true;
         }
 
-        SetStatus($"Save failed: {body}");
+        SetStatus(TF("Status.SaveFailed", body));
         return false;
+    }
+
+    private string ActionLabel(string action)
+    {
+        return string.Equals(action, "start", StringComparison.OrdinalIgnoreCase)
+            ? T("Action.Start")
+            : T("Action.Stop");
     }
 
     private async Task ShowCom0comPairsAsync()
@@ -364,13 +688,12 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var pairs = await _client.GetFromJsonAsync<List<Com0comPairInfo>>("/api/com0com/pairs", JsonOptions) ?? [];
-            DependenciesText.Text = FormatCom0comPairs(pairs);
-            SetStatus($"Found {pairs.Count} com0com pair(s).");
+            var pairs = await RefreshComPairsListAsync(updateDetails: true);
+            SetStatus(TF("Status.FoundPairs", pairs.Count));
         }
         catch (Exception ex)
         {
-            SetStatus($"Ports failed: {ex.Message}", "error");
+            SetStatus(TF("Status.PortsFailed", ex.Message), "error");
         }
     }
 
@@ -378,7 +701,7 @@ public partial class MainWindow : Window
     {
         if (MappingsGrid.SelectedItem is not MappingRow row)
         {
-            ServiceStateText.Text = "Select a mapping first.";
+            ServiceStateText.Text = T("Status.SelectMappingFirst");
             return;
         }
 
@@ -386,7 +709,7 @@ public partial class MainWindow : Window
         {
             if (row.IsKmdf)
             {
-                SetStatus("KMDF mappings do not use com0com pairs.");
+                SetStatus(T("Status.KmdfUnsupported"));
                 return;
             }
 
@@ -396,8 +719,8 @@ public partial class MainWindow : Window
             }
 
             var answer = MessageBox.Show(
-                $"Create com0com pair {row.VisiblePort} <-> {row.BackingPort}?\r\n\r\nThis launches setupc.exe with administrator approval.",
-                "VComTunnel COM pair",
+                TF("Prompt.CreatePair", row.VisiblePort, row.BackingPort),
+                T("Title.ComPair"),
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Question);
             if (answer != MessageBoxResult.Yes)
@@ -409,23 +732,25 @@ public partial class MainWindow : Window
             var body = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                SetStatus($"Create pair failed: {ExtractError(body)}", "error");
+                SetStatus(TF("Status.CreatePairFailed", ExtractError(body)), "error");
                 return;
             }
 
             var plan = JsonSerializer.Deserialize<SetupcCommandPlan>(body, JsonOptions);
             if (plan is null)
             {
-                SetStatus("Create pair failed: empty setupc plan.", "error");
+                SetStatus(T("Status.CreatePairEmptyPlan"), "error");
                 return;
             }
 
             LaunchSetupcPlan(plan);
+            await RefreshComPairsListAsync(updateDetails: true);
+            SetStatus(T("Status.WaitingPairAppear"));
             _ = PollCom0comPairsAfterSetupcAsync();
         }
         catch (Exception ex)
         {
-            SetStatus($"Create pair failed: {ex.Message}", "error");
+            SetStatus(TF("Status.CreatePairFailed", ex.Message), "error");
         }
     }
 
@@ -433,7 +758,7 @@ public partial class MainWindow : Window
     {
         if (MappingsGrid.SelectedItem is not MappingRow row)
         {
-            ServiceStateText.Text = "Select a mapping first.";
+            ServiceStateText.Text = T("Status.SelectMappingFirst");
             return;
         }
 
@@ -441,17 +766,30 @@ public partial class MainWindow : Window
         {
             CommitGridEdits();
             var pairs = await _client.GetFromJsonAsync<List<Com0comPairInfo>>("/api/com0com/pairs", JsonOptions) ?? [];
+            SetComPairs(pairs);
             var pair = pairs.FirstOrDefault(p => PairMatchesMapping(p, row));
             if (pair is null)
             {
                 DependenciesText.Text = FormatCom0comPairs(pairs);
-                SetStatus($"No registered com0com pair matches {row.VisiblePort} <-> {row.BackingPort}.", "warn");
+                SetStatus(TF("Status.NoPairMatches", row.VisiblePort, row.BackingPort), "warn");
                 return;
             }
 
+            await DeleteCom0comPairAsync(pair);
+        }
+        catch (Exception ex)
+        {
+            SetStatus(TF("Status.DeletePairFailed", ex.Message), "error");
+        }
+    }
+
+    private async Task DeleteCom0comPairAsync(Com0comPairInfo pair)
+    {
+        try
+        {
             var answer = MessageBox.Show(
-                $"Delete com0com pair {pair.PairNumber}: {pair.PortA} <-> {pair.PortB}?\r\n\r\nStop tools using these ports before continuing.",
-                "VComTunnel COM pair",
+                TF("Prompt.DeletePair", pair.PairNumber, PairPortText(pair.PortA, "Diag.MissingA"), PairPortText(pair.PortB, "Diag.MissingB")),
+                T("Title.ComPair"),
                 MessageBoxButton.YesNo,
                 MessageBoxImage.Warning);
             if (answer != MessageBoxResult.Yes)
@@ -463,23 +801,25 @@ public partial class MainWindow : Window
             var body = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode)
             {
-                SetStatus($"Delete pair failed: {ExtractError(body)}", "error");
+                SetStatus(TF("Status.DeletePairFailed", ExtractError(body)), "error");
                 return;
             }
 
             var plan = JsonSerializer.Deserialize<SetupcCommandPlan>(body, JsonOptions);
             if (plan is null)
             {
-                SetStatus("Delete pair failed: empty setupc plan.", "error");
+                SetStatus(T("Status.DeletePairEmptyPlan"), "error");
                 return;
             }
 
             LaunchSetupcPlan(plan);
-            _ = PollCom0comPairsAfterSetupcAsync();
+            await RefreshComPairsListAsync(updateDetails: true);
+            SetStatus(TF("Status.WaitingPairRemoved", pair.PairNumber));
+            _ = PollCom0comPairsAfterSetupcAsync(removedPairNumber: pair.PairNumber);
         }
         catch (Exception ex)
         {
-            SetStatus($"Delete pair failed: {ex.Message}", "error");
+            SetStatus(TF("Status.DeletePairFailed", ex.Message), "error");
         }
     }
 
@@ -494,12 +834,12 @@ public partial class MainWindow : Window
             Verb = plan.RequiresElevation ? "runas" : ""
         });
 
-        SetStatus($"Launched setupc: {plan.Arguments}");
+        SetStatus(TF("Status.LaunchSetupc", plan.Arguments));
     }
 
     private async Task<bool> EnsurePairExistsBeforeStartAsync(MappingRow row)
     {
-        var pairs = await _client.GetFromJsonAsync<List<Com0comPairInfo>>("/api/com0com/pairs", JsonOptions) ?? [];
+        var pairs = await RefreshComPairsListAsync(updateDetails: false);
         if (pairs.Any(pair => PairMatchesMapping(pair, row)))
         {
             return true;
@@ -507,13 +847,13 @@ public partial class MainWindow : Window
 
         DependenciesText.Text = FormatCom0comPairs(pairs);
         var answer = MessageBox.Show(
-            $"The com0com pair {row.VisiblePort} <-> {row.BackingPort} does not exist.\r\n\r\nCreate it now and then start this tunnel?",
-            "VComTunnel COM pair",
+            TF("Prompt.MissingPair", row.VisiblePort, row.BackingPort),
+            T("Title.ComPair"),
             MessageBoxButton.YesNo,
             MessageBoxImage.Question);
         if (answer != MessageBoxResult.Yes)
         {
-            SetStatus($"Start canceled: missing com0com pair {row.VisiblePort} <-> {row.BackingPort}.", "warn");
+            SetStatus(TF("Status.StartCanceledMissingPair", row.VisiblePort, row.BackingPort), "warn");
             return false;
         }
 
@@ -521,26 +861,26 @@ public partial class MainWindow : Window
         var body = await response.Content.ReadAsStringAsync();
         if (!response.IsSuccessStatusCode)
         {
-            SetStatus($"Create pair failed: {ExtractError(body)}", "error");
+            SetStatus(TF("Status.CreatePairFailed", ExtractError(body)), "error");
             return false;
         }
 
         var plan = JsonSerializer.Deserialize<SetupcCommandPlan>(body, JsonOptions);
         if (plan is null)
         {
-            SetStatus("Create pair failed: empty setupc plan.", "error");
+            SetStatus(T("Status.CreatePairEmptyPlan"), "error");
             return false;
         }
 
         LaunchSetupcPlan(plan);
-        SetStatus("Waiting for com0com pair to appear...");
+        SetStatus(T("Status.WaitingPairAppear"));
         if (await WaitForPairAsync(row, TimeSpan.FromSeconds(45)))
         {
-            SetStatus($"Created com0com pair {row.VisiblePort} <-> {row.BackingPort}. Starting...");
+            SetStatus(TF("Status.CreatedPairStarting", row.VisiblePort, row.BackingPort));
             return true;
         }
 
-        SetStatus($"Pair creation was not detected. Click Ports to inspect, then Start again.", "warn");
+        SetStatus(T("Status.PairCreationNotDetected"), "warn");
         return false;
     }
 
@@ -550,8 +890,7 @@ public partial class MainWindow : Window
         while (DateTimeOffset.UtcNow < deadline)
         {
             await Task.Delay(TimeSpan.FromSeconds(2));
-            var pairs = await _client.GetFromJsonAsync<List<Com0comPairInfo>>("/api/com0com/pairs", JsonOptions) ?? [];
-            DependenciesText.Text = FormatCom0comPairs(pairs);
+            var pairs = await RefreshComPairsListAsync(updateDetails: true);
             if (pairs.Any(pair => PairMatchesMapping(pair, row)))
             {
                 return true;
@@ -561,23 +900,66 @@ public partial class MainWindow : Window
         return false;
     }
 
-    private async Task PollCom0comPairsAfterSetupcAsync()
+    private async Task PollCom0comPairsAfterSetupcAsync(int? removedPairNumber = null)
     {
-        await Task.Delay(TimeSpan.FromSeconds(5));
-        if (!await IsServiceReadyAsync())
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(removedPairNumber is null ? 5 : 45);
+        while (DateTimeOffset.UtcNow < deadline)
         {
-            return;
+            await Task.Delay(TimeSpan.FromSeconds(removedPairNumber is null ? 5 : 2));
+            if (!await IsServiceReadyAsync())
+            {
+                return;
+            }
+
+            try
+            {
+                var pairs = await RefreshComPairsListAsync(updateDetails: true);
+                if (removedPairNumber is null)
+                {
+                    return;
+                }
+
+                if (pairs.All(pair => pair.PairNumber != removedPairNumber.Value))
+                {
+                    SetStatus(TF("Status.DeletedPair", removedPairNumber.Value));
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                SetStatus(TF("Status.PairRefreshFailed", ex.Message), "warn");
+                return;
+            }
         }
 
-        try
+        if (removedPairNumber is not null)
         {
-            var pairs = await _client.GetFromJsonAsync<List<Com0comPairInfo>>("/api/com0com/pairs", JsonOptions) ?? [];
-            DependenciesText.Text = FormatCom0comPairs(pairs);
-        }
-        catch
-        {
+            SetStatus(TF("Status.DeleteStillListed", removedPairNumber.Value), "warn");
         }
     }
+
+    private async Task<IReadOnlyList<Com0comPairInfo>> RefreshComPairsListAsync(bool updateDetails)
+    {
+        var pairs = await _client.GetFromJsonAsync<List<Com0comPairInfo>>("/api/com0com/pairs", JsonOptions) ?? [];
+        SetComPairs(pairs);
+        if (updateDetails)
+        {
+            DependenciesText.Text = FormatCom0comPairs(pairs);
+        }
+
+        return pairs;
+    }
+
+    private void SetComPairs(IReadOnlyList<Com0comPairInfo> pairs)
+    {
+        _comPairs.Clear();
+        foreach (var pair in pairs)
+        {
+            _comPairs.Add(ComPairRow.From(pair, _language));
+        }
+    }
+
+    private void ClearComPairsList() => _comPairs.Clear();
 
     private void CommitGridEdits()
     {
@@ -593,7 +975,7 @@ public partial class MainWindow : Window
                 && TryGetComPortNumber(row.VisiblePort, out var portNumber))
             {
                 row.BackingPort = $"CNCB{portNumber}";
-                AppendGuiLog("warn", "gui", $"{row.Name}: Backing cannot equal Visible; changed backing to {row.BackingPort}.");
+                AppendGuiLog("warn", T("Log.Gui"), TF("Log.BackingChanged", row.Name, row.BackingPort));
             }
         }
 
@@ -627,12 +1009,12 @@ public partial class MainWindow : Window
     {
         try
         {
-            ServiceStateText.Text = "Checking dependencies...";
+            ServiceStateText.Text = T("Status.ServiceChecking");
             var localReport = new DependencyDetector().Detect();
             DependenciesText.Text = FormatDependencies(localReport);
             if (localReport.IsReadyForCom0comHub4com)
             {
-                SetStatus("Dependencies already ready.");
+                SetStatus(T("Status.DependenciesAlreadyReady"));
                 return;
             }
 
@@ -642,7 +1024,7 @@ public partial class MainWindow : Window
                 var response = await _client.PostAsJsonAsync("/api/dependencies/install", new DependencyInstallRequest(), JsonOptions);
                 if (!response.IsSuccessStatusCode)
                 {
-                    SetStatus($"Dependency setup failed: {await response.Content.ReadAsStringAsync()}");
+                    SetStatus(TF("Status.DependencySetupFailed", await response.Content.ReadAsStringAsync()));
                     return;
                 }
 
@@ -658,8 +1040,8 @@ public partial class MainWindow : Window
             var refreshed = new DependencyDetector().Detect();
             if (refreshed.IsReadyForCom0comHub4com)
             {
-                ServiceStateText.Text = "Dependencies ready.";
-                AppendGuiLog("info", "gui", "Dependencies ready.");
+                ServiceStateText.Text = T("Status.DependenciesReady");
+                AppendGuiLog("info", T("Log.Gui"), T("Log.DependenciesReady"));
                 DependenciesText.Text += Environment.NewLine + FormatDependencies(refreshed);
                 await RefreshAsync();
                 return;
@@ -669,8 +1051,8 @@ public partial class MainWindow : Window
             if (installer.FindCom0comInstaller() is not null)
             {
                 var answer = MessageBox.Show(
-                    "com0com driver still needs an elevated installer run. Launch it now?",
-                    "VComTunnel dependency setup",
+                    T("Prompt.LaunchCom0comInstaller"),
+                    T("Title.DependencySetup"),
                     MessageBoxButton.YesNo,
                     MessageBoxImage.Question);
                 if (answer == MessageBoxResult.Yes)
@@ -680,13 +1062,13 @@ public partial class MainWindow : Window
                 }
             }
 
-            ServiceStateText.Text = "Dependencies downloaded. com0com driver install is still required.";
-            AppendGuiLog("warn", "gui", "Dependencies downloaded. com0com driver install is still required.");
+            ServiceStateText.Text = T("Status.DependenciesDownloadedNeedInstall");
+            AppendGuiLog("warn", T("Log.Gui"), T("Log.DependenciesDownloadedNeedInstall"));
             await RefreshAsync();
         }
         catch (Exception ex)
         {
-            SetStatus($"Dependency setup failed: {ex.Message}");
+            SetStatus(TF("Status.DependencySetupFailed", ex.Message));
         }
     }
 
@@ -697,7 +1079,7 @@ public partial class MainWindow : Window
             var dependencyReport = new DependencyDetector().Detect();
             if (dependencyReport.IsReadyForCom0comHub4com)
             {
-                SetStatus("Dependencies already ready.");
+                SetStatus(T("Status.DependenciesAlreadyReady"));
                 DependenciesText.Text = FormatDependencies(dependencyReport);
                 return;
             }
@@ -715,7 +1097,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            SetStatus($"Could not launch com0com installer: {ex.Message}");
+            SetStatus(TF("Status.LaunchCom0comFailed", ex.Message));
         }
     }
 
@@ -744,20 +1126,20 @@ public partial class MainWindow : Window
 
                 if (dependencies?.IsReadyForCom0comHub4com == true)
                 {
-                    SetStatus("Dependencies ready.");
+                    SetStatus(T("Status.DependenciesReady"));
                     await RefreshAsync();
                     return;
                 }
 
-                ServiceStateText.Text = "Waiting for com0com installer to finish...";
+                ServiceStateText.Text = T("Status.WaitingInstaller");
             }
 
-            SetStatus("Dependency refresh timed out. Click Refresh after the installer finishes.");
+            SetStatus(T("Status.DependencyRefreshTimeout"));
             await RefreshAsync();
         }
         catch (Exception ex)
         {
-            SetStatus($"Dependency refresh failed: {ex.Message}");
+            SetStatus(TF("Status.DependencyRefreshFailed", ex.Message));
         }
         finally
         {
@@ -783,24 +1165,24 @@ public partial class MainWindow : Window
                 using var response = await _client.DeleteAsync("/api/logs");
                 if (!response.IsSuccessStatusCode)
                 {
-                    ServiceStateText.Text = $"Clear logs failed: {(int)response.StatusCode}";
+                    ServiceStateText.Text = TF("Status.ClearLogsStatusFailed", (int)response.StatusCode);
                     return;
                 }
             }
 
             LogsText.Clear();
-            ServiceStateText.Text = "Logs cleared.";
+            ServiceStateText.Text = T("Status.LogsCleared");
         }
         catch (Exception ex)
         {
-            ServiceStateText.Text = $"Clear logs failed: {ex.Message}";
+            ServiceStateText.Text = TF("Status.ClearLogsFailed", ex.Message);
         }
     }
 
     private void SetStatus(string message, string level = "info")
     {
         ServiceStateText.Text = message;
-        AppendGuiLog(level, "gui", message);
+        AppendGuiLog(level, T("Log.Gui"), message);
     }
 
     private void AppendGuiLog(string level, string source, string message)
@@ -818,20 +1200,20 @@ public partial class MainWindow : Window
         LogsText.ScrollToEnd();
     }
 
-    private static string FormatDependencies(SystemDependencyReport? report)
+    private string FormatDependencies(SystemDependencyReport? report)
     {
         if (report is null)
         {
-            return "No dependency report.";
+            return T("Diag.NoDependencyReport");
         }
 
         var builder = new StringBuilder();
-        builder.AppendLine($"com0com/hub4com ready: {report.IsReadyForCom0comHub4com}");
-        builder.AppendLine($"KMDF install tooling ready: {report.IsReadyForKmdf}");
+        builder.AppendLine(TF("Diag.ComReady", report.IsReadyForCom0comHub4com));
+        builder.AppendLine(TF("Diag.KmdfReady", report.IsReadyForKmdf));
         builder.AppendLine();
         foreach (var item in report.Items)
         {
-            builder.AppendLine($"{(item.Found ? "OK" : "MISS")} {item.Name}");
+            builder.AppendLine($"{(item.Found ? T("Diag.Found") : T("Diag.Missing"))} {item.Name}");
             builder.AppendLine(item.Path ?? item.Message);
             builder.AppendLine();
         }
@@ -839,12 +1221,12 @@ public partial class MainWindow : Window
         return builder.ToString();
     }
 
-    private static string FormatInstallResult(DependencyInstallResult result)
+    private string FormatInstallResult(DependencyInstallResult result)
     {
         var builder = new StringBuilder();
         foreach (var step in result.Steps)
         {
-            builder.AppendLine($"{(step.Success ? "OK" : "FAIL")} {step.Name}");
+            builder.AppendLine($"{(step.Success ? T("Diag.Found") : T("Diag.Fail"))} {step.Name}");
             builder.AppendLine(step.Message);
             if (!string.IsNullOrWhiteSpace(step.Path))
             {
@@ -857,21 +1239,21 @@ public partial class MainWindow : Window
         return builder.ToString();
     }
 
-    private static string FormatCom0comPairs(IReadOnlyList<Com0comPairInfo> pairs)
+    private string FormatCom0comPairs(IReadOnlyList<Com0comPairInfo> pairs)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("com0com pairs");
+        builder.AppendLine(T("Diag.ComPairsTitle"));
         builder.AppendLine();
         if (pairs.Count == 0)
         {
-            builder.AppendLine("No com0com pairs found in Windows COM database.");
+            builder.AppendLine(T("Diag.NoComPairs"));
             return builder.ToString();
         }
 
         foreach (var pair in pairs)
         {
-            var state = pair.IsComplete ? "OK" : "PARTIAL";
-            builder.AppendLine($"{state} pair {pair.PairNumber}: {pair.PortA ?? "(missing A)"} <-> {pair.PortB ?? "(missing B)"}");
+            var state = pair.IsComplete ? T("Diag.Found") : T("Diag.Partial");
+            builder.AppendLine(TF("Diag.PairLine", state, pair.PairNumber, PairPortText(pair.PortA, "Diag.MissingA"), PairPortText(pair.PortB, "Diag.MissingB")));
             if (!string.IsNullOrWhiteSpace(pair.DeviceA))
             {
                 builder.AppendLine($"  A: {pair.DeviceA}");
@@ -882,11 +1264,16 @@ public partial class MainWindow : Window
                 builder.AppendLine($"  B: {pair.DeviceB}");
             }
 
-            builder.AppendLine($"  delete: setupc.exe remove {pair.PairNumber}");
+            builder.AppendLine(TF("Diag.DeleteCommand", pair.PairNumber));
             builder.AppendLine();
         }
 
         return builder.ToString();
+    }
+
+    private string PairPortText(string? port, string missingKey)
+    {
+        return string.IsNullOrWhiteSpace(port) ? T(missingKey) : port;
     }
 
     private static bool PairMatchesMapping(Com0comPairInfo pair, MappingRow row)
@@ -901,11 +1288,12 @@ public partial class MainWindow : Window
                 || string.Equals(pair.PortB, port, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static string FormatActionResult(string action, HttpResponseMessage response, string responseBody)
+    private string FormatActionResult(string action, HttpResponseMessage response, string responseBody)
     {
+        var actionLabel = ActionLabel(action);
         if (!response.IsSuccessStatusCode)
         {
-            return $"{action}: {(int)response.StatusCode} {ExtractError(responseBody)}";
+            return $"{actionLabel}: {(int)response.StatusCode} {ExtractError(responseBody)}";
         }
 
         try
@@ -926,11 +1314,11 @@ public partial class MainWindow : Window
                 suffix += $" ({lastError})";
             }
 
-            return $"{action}: {state ?? response.StatusCode.ToString()}{suffix}";
+            return $"{actionLabel}: {state ?? response.StatusCode.ToString()}{suffix}";
         }
         catch
         {
-            return $"{action}: {(int)response.StatusCode}";
+            return $"{actionLabel}: {(int)response.StatusCode}";
         }
     }
 
@@ -963,7 +1351,11 @@ public sealed class MappingRow
     public int Port { get; set; }
     public bool AutoStart { get; set; }
     public bool RestartOnFailure { get; set; } = true;
+    public TunnelRunState RunState { get; set; } = TunnelRunState.Stopped;
+    public string StateLabel { get; set; } = "";
     public bool IsKmdf => string.Equals(Backend, "kmdf", StringComparison.OrdinalIgnoreCase);
+    public bool CanStart => !IsKmdf && RunState is not TunnelRunState.Running and not TunnelRunState.Starting and not TunnelRunState.Unsupported;
+    public bool CanStop => RunState is TunnelRunState.Running or TunnelRunState.Starting;
 
     public static MappingRow From(TunnelMapping mapping)
     {
@@ -977,7 +1369,8 @@ public sealed class MappingRow
             Host = mapping.Host,
             Port = mapping.Port,
             AutoStart = mapping.AutoStart,
-            RestartOnFailure = mapping.RestartOnFailure
+            RestartOnFailure = mapping.RestartOnFailure,
+            RunState = TunnelRunState.Stopped
         };
     }
 
@@ -999,5 +1392,35 @@ public sealed class MappingRow
             AutoStart = AutoStart,
             RestartOnFailure = RestartOnFailure
         };
+    }
+}
+
+public sealed class ComPairRow
+{
+    public int PairNumber { get; set; }
+    public string? PortA { get; set; }
+    public string? PortB { get; set; }
+    public string? DeviceA { get; set; }
+    public string? DeviceB { get; set; }
+    public bool IsComplete { get; set; }
+    public string State { get; set; } = "";
+
+    public static ComPairRow From(Com0comPairInfo pair, UiLanguage language)
+    {
+        return new ComPairRow
+        {
+            PairNumber = pair.PairNumber,
+            PortA = pair.PortA,
+            PortB = pair.PortB,
+            DeviceA = pair.DeviceA,
+            DeviceB = pair.DeviceB,
+            IsComplete = pair.IsComplete,
+            State = pair.IsComplete ? GuiText.Get(language, "Diag.Found") : GuiText.Get(language, "Diag.Partial")
+        };
+    }
+
+    public Com0comPairInfo ToInfo()
+    {
+        return new Com0comPairInfo(PairNumber, PortA, PortB, DeviceA, DeviceB, IsComplete);
     }
 }

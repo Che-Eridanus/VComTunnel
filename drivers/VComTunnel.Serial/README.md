@@ -1,21 +1,32 @@
 # VComTunnel.Serial KMDF Prototype
 
-This directory is the phase 2 driver scaffold. It is intentionally not installed or built by the default .NET solution.
+This directory contains the phase 2 driver design. It is not a working driver yet:
+there is no `VComTunnel.Serial.sys`, no catalog, and no WDK project in this tree.
 
-Target behavior:
+The intended phase 2 result is a single visible COM device backed by
+`VComTunnel.Service`, replacing the phase 1 `com0com + hub4com` chain for one
+mapping at a time.
 
-- Register a single visible COM port such as `COM22`
-- Implement the minimum serial IOCTL/read/write surface needed by standard Windows serial clients
-- Exchange bytes and line-control events with `VComTunnel.Service`
-- Keep RFC2217 negotiation, reconnect behavior, logging, and configuration in user mode
+Read these documents before writing driver code:
 
-Manual implementation checkpoints:
+- [DESIGN.md](DESIGN.md) - driver architecture, queues, serial behavior, risks
+- [SERVICE_CHANNEL.md](SERVICE_CHANNEL.md) - private service/driver protocol
+- [SERVICE_BACKEND.md](SERVICE_BACKEND.md) - user-mode backend and acceptance gate
 
-1. Create the KMDF driver project from the Microsoft virtual serial sample baseline.
-2. Replace sample identifiers with `VComTunnel.Serial`.
-3. Add an internal user-mode channel for `VComTunnel.Service`.
-4. Implement read/write queues, cancellation, timeout handling, and line-control IOCTLs.
-5. Generate a test-signed driver package.
-6. Install only after manually enabling test signing and confirming the target machine is disposable or backed up.
+Current status:
 
-The current service reports `kmdf` mappings as `Unsupported` so users get a clear diagnostic instead of a silent failure.
+- The `.NET` service and GUI still treat `kmdf` mappings as unsupported.
+- `VComTunnel.Serial.inf` is a more complete INF skeleton, but it is still a
+  scaffold until a signed `.sys` and `.cat` exist.
+- `install-test-driver.ps1` refuses to install unless those package files exist.
+
+Implementation entry point:
+
+1. Create a WDK KMDF driver project named `VComTunnel.Serial`.
+2. Implement a root-enumerated Ports-class device that publishes one COM name.
+3. Implement the private service channel described in `SERVICE_CHANNEL.md`.
+4. Implement the serial IOCTL/read/write subset from `DESIGN.md`.
+5. Add the service-side backend described in `SERVICE_BACKEND.md`.
+6. Add fake-driver tests before real RFC2217.
+7. Only then generate a test-signed package and install it on a disposable or
+   backed-up Windows 10/11 x64 machine.

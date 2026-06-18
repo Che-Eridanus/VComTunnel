@@ -1,5 +1,6 @@
 ; VComTunnel.Serial KMDF prototype INF skeleton.
-; This file is a scaffold and is not ready for installation.
+; This file is a scaffold and is not ready for installation until a matching
+; VComTunnel.Serial.sys and VComTunnel.Serial.cat are produced by the WDK build.
 
 [Version]
 Signature="$WINDOWS NT$"
@@ -7,7 +8,8 @@ Class=Ports
 ClassGuid={4D36E978-E325-11CE-BFC1-08002BE10318}
 Provider=%ManufacturerName%
 CatalogFile=VComTunnel.Serial.cat
-DriverVer=06/06/2026,0.1.0.0
+DriverVer=06/16/2026,0.2.0.0
+PnpLockdown=1
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64
@@ -15,15 +17,32 @@ DriverVer=06/06/2026,0.1.0.0
 [Standard.NTamd64]
 %DeviceName%=VComTunnelSerial_Install, Root\VComTunnelSerial
 
-[VComTunnelSerial_Install]
+[VComTunnelSerial_Install.NT]
 CopyFiles=DriverCopyFiles
 AddReg=VComTunnelSerial_AddReg
+
+[VComTunnelSerial_Install.NT.Services]
+AddService=%ServiceName%,0x00000002,VComTunnelSerial_Service
+
+[VComTunnelSerial_Install.NT.Wdf]
+KmdfService=%ServiceName%,VComTunnelSerial_Wdf
+
+[VComTunnelSerial_Wdf]
+KmdfLibraryVersion=$KMDFVERSION$
+
+[VComTunnelSerial_Service]
+DisplayName=%ServiceDisplayName%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\VComTunnel.Serial.sys
 
 [DriverCopyFiles]
 VComTunnel.Serial.sys
 
 [VComTunnelSerial_AddReg]
 HKR,,FriendlyName,,%DeviceName%
+HKR,,PortName,,%DefaultPortName%
 
 [DestinationDirs]
 DriverCopyFiles=12
@@ -37,4 +56,7 @@ VComTunnel.Serial.sys=1
 [Strings]
 ManufacturerName="VComTunnel"
 DeviceName="VComTunnel Virtual Serial Port"
+ServiceName="VComTunnel.Serial"
+ServiceDisplayName="VComTunnel Serial KMDF Driver"
+DefaultPortName="COM40"
 DiskName="VComTunnel Serial Driver Disk"
