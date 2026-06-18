@@ -48,6 +48,26 @@ internal static class VComTunnelCtl
         return report.IsReadyForCom0comHub4com ? 0 : 2;
     }
 
+    private static CliOptions ParseOptions(string[] args)
+    {
+        var positionals = new List<string>();
+        string? resultFile = null;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--result-file", StringComparison.OrdinalIgnoreCase)
+                && i + 1 < args.Length)
+            {
+                resultFile = args[++i];
+                continue;
+            }
+
+            positionals.Add(args[i]);
+        }
+
+        return new CliOptions(positionals.ToArray(), resultFile);
+    }
+
     private static async Task<int> InitConfigAsync()
     {
         var store = new ConfigStore();
@@ -157,14 +177,15 @@ internal static class VComTunnelCtl
 
     private static int Kmdf(string[] args)
     {
-        var action = args.FirstOrDefault()?.ToLowerInvariant() ?? "help";
+        var options = ParseOptions(args);
+        var action = options.Positionals.FirstOrDefault()?.ToLowerInvariant() ?? "help";
         var manager = new KmdfDeviceManager();
         return action switch
         {
             "list" => ListKmdfPorts(manager),
-            "add" => AddKmdfPort(manager, args.Skip(1).FirstOrDefault(), args.Skip(2).FirstOrDefault()),
-            "remove" => RemoveKmdfPort(manager, args.Skip(1).FirstOrDefault()),
-            "inf" => PrintKmdfInf(args.Skip(1).FirstOrDefault()),
+            "add" => AddKmdfPort(manager, options.Positionals.Skip(1).FirstOrDefault(), options.Positionals.Skip(2).FirstOrDefault(), options.ResultFile),
+            "remove" => RemoveKmdfPort(manager, options.Positionals.Skip(1).FirstOrDefault(), options.ResultFile),
+            "inf" => PrintKmdfInf(options.Positionals.Skip(1).FirstOrDefault()),
             _ => KmdfHelp()
         };
     }
@@ -194,29 +215,39 @@ internal static class VComTunnelCtl
         }
     }
 
-    private static int AddKmdfPort(KmdfDeviceManager manager, string? portName, string? infPath)
+    private static int AddKmdfPort(KmdfDeviceManager manager, string? portName, string? infPath, string? resultFile)
     {
         if (string.IsNullOrWhiteSpace(portName))
         {
-            Console.WriteLine("Usage: vcomtunnelctl kmdf add COM27 [driver-inf]");
+            const string usage = "Usage: vcomtunnelctl kmdf add COM27 [driver-inf]";
+            Console.WriteLine(usage);
+            WriteKmdfResultFile(resultFile, false, usage);
             return 2;
         }
 
         var result = manager.AddPort(new KmdfPortRequest(portName, InfPath: infPath));
-        PrintKmdfResult(result);
-        return result.Success ? 0 : 2;
+        return CompleteKmdfResult(result, resultFile);
     }
 
-    private static int RemoveKmdfPort(KmdfDeviceManager manager, string? portName)
+    private static int RemoveKmdfPort(KmdfDeviceManager manager, string? portName, string? resultFile)
     {
         if (string.IsNullOrWhiteSpace(portName))
         {
-            Console.WriteLine("Usage: vcomtunnelctl kmdf remove COM27");
+            const string usage = "Usage: vcomtunnelctl kmdf remove COM27";
+            Console.WriteLine(usage);
+            WriteKmdfResultFile(resultFile, false, usage);
             return 2;
         }
 
         var result = manager.RemovePort(new KmdfPortRequest(portName));
-        PrintKmdfResult(result);
+        return CompleteKmdfResult(result, resultFile);
+    }
+
+    private static int CompleteKmdfResult(KmdfPortOperationResult result, string? resultFile)
+    {
+        var text = FormatKmdfResult(result);
+        Console.Write(text);
+        WriteKmdfResultFile(resultFile, result.Success, text);
         return result.Success ? 0 : 2;
     }
 
@@ -235,17 +266,54 @@ internal static class VComTunnelCtl
 
     private static void PrintKmdfResult(KmdfPortOperationResult result)
     {
-        Console.WriteLine($"{(result.Success ? "OK" : "FAIL")} {result.Message}");
+        Console.Write(FormatKmdfResult(result));
+    }
+
+    private static string FormatKmdfResult(KmdfPortOperationResult result)
+    {
+        using var writer = new StringWriter();
+        writer.WriteLine($"{(result.Success ? "OK" : "FAIL")} {result.Message}");
         if (result.Device is not null)
         {
-            Console.WriteLine($"{result.Device.PortName} {result.Device.Status} {result.Device.InstanceId} {result.Device.DriverName}");
+            writer.WriteLine($"{result.Device.PortName} {result.Device.Status} {result.Device.InstanceId} {result.Device.DriverName}");
         }
 
         if (result.RebootRequired)
         {
-            Console.WriteLine("A reboot is required to finish this driver operation.");
+            writer.WriteLine("A reboot is required to finish this driver operation.");
+        }
+
+        return writer.ToString();
+    }
+
+    private static void WriteKmdfResultFile(string? resultFile, bool success, string message)
+    {
+        if (string.IsNullOrWhiteSpace(resultFile))
+        {
+            return;
+        }
+
+        try
+        {
+            var directory = Path.GetDirectoryName(Path.GetFullPath(resultFile));
+            if (!string.IsNullOrWhiteSpace(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            var text = message.StartsWith("OK ", StringComparison.OrdinalIgnoreCase)
+                || message.StartsWith("FAIL ", StringComparison.OrdinalIgnoreCase)
+                    ? message
+                    : $"{(success ? "OK" : "FAIL")} {message}{Environment.NewLine}";
+            File.WriteAllText(resultFile, text);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Could not write result file {resultFile}: {ex.Message}");
         }
     }
+
+    private sealed record CliOptions(string[] Positionals, string? ResultFile);
 
     private static async Task<int> DepsAsync(string[] args)
     {

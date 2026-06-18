@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -56,6 +57,11 @@ public sealed class KmdfDeviceManager
             return new KmdfPortOperationResult(true, $"{portName} already exists.", existingDevice, false);
         }
 
+        if (!IsAdministrator())
+        {
+            return Fail($"Create {portName} requires administrator privileges. Approve the UAC prompt and retry.");
+        }
+
         var registeredPorts = _ports.GetRegisteredPortNames();
         if (registeredPorts.Any(port => PortEquals(port, portName)))
         {
@@ -96,6 +102,11 @@ public sealed class KmdfDeviceManager
         if (!OperatingSystem.IsWindows())
         {
             return Fail("KMDF port management is only available on Windows.");
+        }
+
+        if (!IsAdministrator())
+        {
+            return Fail("Remove KMDF ports requires administrator privileges. Approve the UAC prompt and retry.");
         }
 
         var devices = GetDevices();
@@ -386,6 +397,26 @@ public sealed class KmdfDeviceManager
     private static KmdfPortOperationResult Fail(string message)
     {
         return new KmdfPortOperationResult(false, message, null, false);
+    }
+
+    private static bool IsAdministrator()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        try
+        {
+#pragma warning disable CA1416
+            using var identity = WindowsIdentity.GetCurrent();
+            return new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+#pragma warning restore CA1416
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static IEnumerable<string> CandidateRoots()
