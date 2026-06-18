@@ -7,7 +7,14 @@ using Microsoft.Win32.SafeHandles;
 
 namespace VComTunnel.Core;
 
-public sealed class KmdfTunnelSession : IDisposable
+public interface IKmdfTunnelSession : IDisposable
+{
+    TunnelRunState State { get; }
+    string? LastError { get; }
+    Task StartAsync(CancellationToken cancellationToken);
+}
+
+public sealed class KmdfTunnelSession : IKmdfTunnelSession
 {
     private const uint GenericRead = 0x80000000;
     private const uint GenericWrite = 0x40000000;
@@ -53,7 +60,7 @@ public sealed class KmdfTunnelSession : IDisposable
 
     private readonly TunnelMapping _mapping;
     private readonly InMemoryLog _log;
-    private readonly Action<KmdfTunnelSession, string> _faulted;
+    private readonly Action<IKmdfTunnelSession, string> _faulted;
     private readonly Rfc2217Client _rfc2217 = new();
     private readonly object _ackLock = new();
     private readonly List<Rfc2217ExpectedAck> _pendingAcks = [];
@@ -72,7 +79,7 @@ public sealed class KmdfTunnelSession : IDisposable
     private Task? _keepAliveLoop;
     private int _disposed;
 
-    public KmdfTunnelSession(TunnelMapping mapping, InMemoryLog log, Action<KmdfTunnelSession, string> faulted)
+    public KmdfTunnelSession(TunnelMapping mapping, InMemoryLog log, Action<IKmdfTunnelSession, string> faulted)
     {
         _mapping = mapping;
         _log = log;

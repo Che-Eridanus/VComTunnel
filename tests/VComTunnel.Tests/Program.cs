@@ -25,7 +25,10 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
     ("com0com create and remove plans", Com0comCreateAndRemovePlansAsync),
     ("KMDF mapping reports startup fault", KmdfMappingReportsStartupFaultAsync),
+    ("KMDF session restarts after network fault", KmdfSessionRestartsAfterNetworkFaultAsync),
     ("fake com2tcp process starts and stops", FakeCom2TcpProcessStartsAndStopsAsync),
+    ("fake com2tcp process restarts after exit", FakeCom2TcpProcessRestartsAfterExitAsync),
+    ("manual stop suppresses fake com2tcp restart", ManualStopSuppressesFakeCom2TcpRestartAsync),
     ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync),
     ("dependency installer uses bundled release archives", DependencyInstallerUsesBundledReleaseArchivesAsync)
 };
@@ -624,6 +627,47 @@ static async Task KmdfMappingReportsStartupFaultAsync()
         "Could not connect to RFC2217 endpoint");
 }
 
+static async Task KmdfSessionRestartsAfterNetworkFaultAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Name = "Restarting driver",
+        Backend = TunnelBackend.Kmdf,
+        VisiblePort = "COM47",
+        BackingPort = null,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog();
+    var starts = 0;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        [],
+        (sessionMapping, sessionLog, faulted) =>
+        {
+            var startNumber = Interlocked.Increment(ref starts);
+            return new FakeKmdfTunnelSession(
+                faulted,
+                failAfterStart: startNumber == 1 ? "Remote endpoint closed the TCP connection." : null);
+        },
+        TimeSpan.FromMilliseconds(50));
+
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+    var first = await orchestrator.StartAsync(id);
+    AssertEqual(TunnelRunState.Running.ToString(), first.State.ToString());
+
+    await WaitUntilAsync(() => Volatile.Read(ref starts) >= 2, "KMDF restart did not run.");
+
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
+    AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
+    AssertTrue(
+        log.Snapshot().Any(e => e.Message.Contains("Scheduling KMDF restart", StringComparison.OrdinalIgnoreCase)),
+        "KMDF network fault should schedule a restart.");
+}
+
 static async Task Com0comCreateAndRemovePlansAsync()
 {
     using var temp = new TempDir();
@@ -679,6 +723,84 @@ static async Task FakeCom2TcpProcessStartsAndStopsAsync()
 
     var stopped = orchestrator.Stop(id);
     AssertEqual(TunnelRunState.Stopped.ToString(), stopped.State.ToString());
+}
+
+static async Task FakeCom2TcpProcessRestartsAfterExitAsync()
+{
+    using var temp = new TempDir();
+    CreateFakeDependencies(
+        temp.Path,
+        """
+        @echo off
+        echo fake-com2tcp %*
+        ping -n 2 127.0.0.1 > nul
+        """);
+    var mapping = new TunnelMapping
+    {
+        Name = "Restarting fake bridge",
+        VisiblePort = "COM56",
+        BackingPort = "CNCB56",
+        Host = "127.0.0.1",
+        Port = 2217,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog();
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        [],
+        restartDelay: TimeSpan.FromMilliseconds(50));
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+
+    var started = await orchestrator.StartAsync(id);
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+
+    await WaitUntilAsync(
+        () => log.Snapshot().Count(e => e.Message.Contains("Started hub4com process", StringComparison.OrdinalIgnoreCase)) >= 2,
+        "hub4com process was not restarted after exit.");
+
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
+    AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
+    orchestrator.Stop(id);
+}
+
+static async Task ManualStopSuppressesFakeCom2TcpRestartAsync()
+{
+    using var temp = new TempDir();
+    CreateFakeDependencies(temp.Path);
+    var mapping = new TunnelMapping
+    {
+        Name = "Stopped fake bridge",
+        VisiblePort = "COM57",
+        BackingPort = "CNCB57",
+        Host = "127.0.0.1",
+        Port = 2217,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog();
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        [],
+        restartDelay: TimeSpan.FromMilliseconds(50));
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+
+    var started = await orchestrator.StartAsync(id);
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+
+    var stopped = orchestrator.Stop(id);
+    AssertEqual(TunnelRunState.Stopped.ToString(), stopped.State.ToString());
+    await Task.Delay(300);
+
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
+    AssertEqual(TunnelRunState.Stopped.ToString(), status.State.ToString());
+    AssertEqual(
+        "1",
+        log.Snapshot().Count(e => e.Message.Contains("Started hub4com process", StringComparison.OrdinalIgnoreCase)).ToString());
 }
 
 static async Task DependencyInstallerExtractsToolZipsAsync()
@@ -754,22 +876,51 @@ static TunnelOrchestrator CreateOrchestrator(ConfigStore store, DependencyDetect
     return CreateOrchestratorWithPorts(store, detector, log, []);
 }
 
-static TunnelOrchestrator CreateOrchestratorWithPorts(ConfigStore store, DependencyDetector detector, InMemoryLog log, IReadOnlyList<string>? registeredPorts)
+static TunnelOrchestrator CreateOrchestratorWithPorts(
+    ConfigStore store,
+    DependencyDetector detector,
+    InMemoryLog log,
+    IReadOnlyList<string>? registeredPorts,
+    Func<TunnelMapping, InMemoryLog, Action<IKmdfTunnelSession, string>, IKmdfTunnelSession>? kmdfSessionFactory = null,
+    TimeSpan? restartDelay = null)
 {
-    return new TunnelOrchestrator(store, detector, new Hub4comCommandBuilder(detector), new FakeComPortInventory(registeredPorts), log);
+    return new TunnelOrchestrator(
+        store,
+        detector,
+        new Hub4comCommandBuilder(detector),
+        new FakeComPortInventory(registeredPorts),
+        log,
+        kmdfSessionFactory,
+        restartDelay);
 }
 
-static void CreateFakeDependencies(string root)
+static void CreateFakeDependencies(string root, string? com2tcpBody = null)
 {
     File.WriteAllText(Path.Combine(root, "setupc.exe"), "");
     File.WriteAllText(Path.Combine(root, "hub4com.exe"), "");
     File.WriteAllText(
         Path.Combine(root, "com2tcp-rfc2217.bat"),
-        """
+        com2tcpBody ?? """
         @echo off
         echo fake-com2tcp %*
         ping -n 4 127.0.0.1 > nul
         """);
+}
+
+static async Task WaitUntilAsync(Func<bool> condition, string message, int timeoutMs = 5000)
+{
+    var deadline = DateTimeOffset.UtcNow.AddMilliseconds(timeoutMs);
+    while (DateTimeOffset.UtcNow < deadline)
+    {
+        if (condition())
+        {
+            return;
+        }
+
+        await Task.Delay(25);
+    }
+
+    throw new Exception(message);
 }
 
 static void AssertEmpty(IReadOnlyList<string> errors)
@@ -907,6 +1058,51 @@ internal sealed class ThrowingHandler : HttpMessageHandler
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         throw new InvalidOperationException("Network should not be used when bundled dependency archives are available.");
+    }
+}
+
+internal sealed class FakeKmdfTunnelSession : IKmdfTunnelSession
+{
+    private readonly Action<IKmdfTunnelSession, string> _faulted;
+    private readonly string? _failAfterStart;
+
+    public FakeKmdfTunnelSession(Action<IKmdfTunnelSession, string> faulted, string? failAfterStart)
+    {
+        _faulted = faulted;
+        _failAfterStart = failAfterStart;
+    }
+
+    public TunnelRunState State { get; private set; } = TunnelRunState.Starting;
+    public string? LastError { get; private set; }
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        State = TunnelRunState.Running;
+        if (_failAfterStart is not null)
+        {
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(25, cancellationToken);
+                if (cancellationToken.IsCancellationRequested)
+                {
+                    return;
+                }
+
+                LastError = _failAfterStart;
+                State = TunnelRunState.Faulted;
+                _faulted(this, _failAfterStart);
+            }, cancellationToken);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    public void Dispose()
+    {
+        if (LastError is null)
+        {
+            State = TunnelRunState.Stopped;
+        }
     }
 }
 
