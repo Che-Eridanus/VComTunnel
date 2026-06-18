@@ -29,6 +29,7 @@ typedef struct _DEVICE_CONTEXT {
     BOOLEAN ControlLinkCreated;
     VCOMTUNNEL_CONNECTION_STATE ConnectionState;
     WDFQUEUE DefaultQueue;
+    WDFFILEOBJECT ServiceFileObject;
     WCHAR PortName[32];
     WDFREQUEST PendingRead;
     WDFREQUEST PendingServiceWait;

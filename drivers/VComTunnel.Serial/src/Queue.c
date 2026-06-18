@@ -181,6 +181,7 @@ VctCompleteAttach(
     PVCT_ATTACH_REQUEST attach;
     size_t inputLength;
     VCT_ATTACH_RESPONSE response;
+    WDFFILEOBJECT fileObject;
 
     status = WdfRequestRetrieveInputBuffer(Request, sizeof(*attach), (PVOID*)&attach, &inputLength);
     if (!NT_SUCCESS(status)) {
@@ -191,12 +192,15 @@ VctCompleteAttach(
         return STATUS_REVISION_MISMATCH;
     }
 
+    fileObject = WdfRequestGetFileObject(Request);
+
     WdfSpinLockAcquire(Context->Lock);
     if (Context->ServiceAttached) {
         WdfSpinLockRelease(Context->Lock);
         return STATUS_DEVICE_BUSY;
     }
     Context->ServiceAttached = TRUE;
+    Context->ServiceFileObject = fileObject;
     Context->ConnectionState = VComTunnelConnecting;
     WdfSpinLockRelease(Context->Lock);
 
@@ -217,10 +221,15 @@ VctQueueServiceWait(
     )
 {
     NTSTATUS status = STATUS_SUCCESS;
+    WDFFILEOBJECT fileObject;
+
+    fileObject = WdfRequestGetFileObject(Request);
 
     WdfSpinLockAcquire(Context->Lock);
     if (!Context->ServiceAttached) {
         status = STATUS_DEVICE_NOT_READY;
+    } else if (Context->ServiceFileObject != fileObject) {
+        status = STATUS_ACCESS_DENIED;
     } else if (Context->PendingServiceWait != NULL) {
         status = STATUS_DEVICE_BUSY;
     } else {
@@ -362,12 +371,16 @@ VctCancelPendingRequestsForFile(
         readRequest = context->PendingRead;
         context->PendingRead = NULL;
     }
+    if (context->ServiceAttached &&
+        context->ServiceFileObject == FileObject) {
+        context->ServiceAttached = FALSE;
+        context->ServiceFileObject = NULL;
+        context->ConnectionState = VComTunnelDisconnected;
+    }
     if (context->PendingServiceWait != NULL &&
         WdfRequestGetFileObject(context->PendingServiceWait) == FileObject) {
         serviceWait = context->PendingServiceWait;
         context->PendingServiceWait = NULL;
-        context->ServiceAttached = FALSE;
-        context->ConnectionState = VComTunnelDisconnected;
     }
     WdfSpinLockRelease(context->Lock);
 
@@ -393,12 +406,14 @@ VctEvtIoDeviceControl(
     PDEVICE_CONTEXT context;
     ULONG modemStatus;
     WDFREQUEST serviceWait = NULL;
+    WDFFILEOBJECT fileObject;
 
     UNREFERENCED_PARAMETER(OutputBufferLength);
     UNREFERENCED_PARAMETER(InputBufferLength);
 
     device = WdfIoQueueGetDevice(Queue);
     context = DeviceGetContext(device);
+    fileObject = WdfRequestGetFileObject(Request);
     WdfRequestSetInformation(Request, 0);
 
     switch (IoControlCode) {
@@ -522,10 +537,15 @@ VctEvtIoDeviceControl(
 
     case IOCTL_VCOMTUNNEL_DETACH:
         WdfSpinLockAcquire(context->Lock);
-        serviceWait = context->PendingServiceWait;
-        context->PendingServiceWait = NULL;
-        context->ServiceAttached = FALSE;
-        context->ConnectionState = VComTunnelDisconnected;
+        if (context->ServiceAttached && context->ServiceFileObject == fileObject) {
+            serviceWait = context->PendingServiceWait;
+            context->PendingServiceWait = NULL;
+            context->ServiceAttached = FALSE;
+            context->ServiceFileObject = NULL;
+            context->ConnectionState = VComTunnelDisconnected;
+        } else {
+            status = STATUS_ACCESS_DENIED;
+        }
         WdfSpinLockRelease(context->Lock);
         if (serviceWait != NULL) {
             VctCompleteUnmarkedRequest(serviceWait, STATUS_CANCELLED);
@@ -565,7 +585,6 @@ VctEvtIoRead(
     UCHAR* readBuffer;
     size_t readBufferLength;
     ULONG copied = 0;
-    BOOLEAN pending = FALSE;
 
     device = WdfIoQueueGetDevice(Queue);
     context = DeviceGetContext(device);
@@ -579,22 +598,8 @@ VctEvtIoRead(
     WdfSpinLockAcquire(context->Lock);
     if (context->RxCount > 0) {
         copied = VctRxCopyOutLocked(context, readBuffer, (ULONG)readBufferLength);
-    } else if (context->PendingRead == NULL) {
-        context->PendingRead = Request;
-        status = WdfRequestMarkCancelableEx(Request, VctEvtRequestCancel);
-        if (NT_SUCCESS(status)) {
-            pending = TRUE;
-        } else {
-            context->PendingRead = NULL;
-        }
-    } else {
-        status = STATUS_DEVICE_BUSY;
     }
     WdfSpinLockRelease(context->Lock);
-
-    if (pending) {
-        return;
-    }
 
     WdfRequestCompleteWithInformation(Request, status, copied);
 }

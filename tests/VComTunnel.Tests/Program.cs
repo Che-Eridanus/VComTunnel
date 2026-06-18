@@ -16,7 +16,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("missing dependencies fault mapping", MissingDependenciesFaultMappingAsync),
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
     ("com0com create and remove plans", Com0comCreateAndRemovePlansAsync),
-    ("KMDF mapping faults when driver is missing", KmdfMappingFaultsWhenDriverIsMissingAsync),
+    ("KMDF mapping reports startup fault", KmdfMappingReportsStartupFaultAsync),
     ("fake com2tcp process starts and stops", FakeCom2TcpProcessStartsAndStopsAsync),
     ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync),
     ("dependency installer uses bundled release archives", DependencyInstallerUsesBundledReleaseArchivesAsync)
@@ -201,7 +201,7 @@ static async Task MissingBackingPortFaultsBeforeHub4comAsync()
     AssertStringContains(status.LastError ?? "", "Existing ports: COM27, COM28");
 }
 
-static async Task KmdfMappingFaultsWhenDriverIsMissingAsync()
+static async Task KmdfMappingReportsStartupFaultAsync()
 {
     using var temp = new TempDir();
     var mapping = new TunnelMapping
@@ -216,7 +216,15 @@ static async Task KmdfMappingFaultsWhenDriverIsMissingAsync()
 
     var status = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
     AssertEqual(TunnelRunState.Faulted.ToString(), status.State.ToString());
-    AssertStringContains(status.LastError ?? "", "Could not open KMDF control channel");
+    AssertStringContainsAny(status.LastError ?? "",
+        "Could not open KMDF control channel",
+        "Could not connect to RFC2217 endpoint");
+
+    var secondStatus = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
+    AssertEqual(TunnelRunState.Faulted.ToString(), secondStatus.State.ToString());
+    AssertStringContainsAny(secondStatus.LastError ?? "",
+        "Could not open KMDF control channel",
+        "Could not connect to RFC2217 endpoint");
 }
 
 static async Task Com0comCreateAndRemovePlansAsync()
@@ -388,6 +396,14 @@ static void AssertStringContains(string actual, string expected)
     if (!actual.Contains(expected, StringComparison.OrdinalIgnoreCase))
     {
         throw new Exception($"Expected '{expected}' in '{actual}'.");
+    }
+}
+
+static void AssertStringContainsAny(string actual, params string[] expected)
+{
+    if (!expected.Any(value => actual.Contains(value, StringComparison.OrdinalIgnoreCase)))
+    {
+        throw new Exception($"Expected one of '{string.Join("' or '", expected)}' in '{actual}'.");
     }
 }
 

@@ -28,8 +28,10 @@ public sealed class KmdfTunnelSession : IDisposable
     private readonly TunnelMapping _mapping;
     private readonly InMemoryLog _log;
     private readonly Action<KmdfTunnelSession, string> _faulted;
+    private readonly MinimalRfc2217Filter _rfc2217 = new();
     private readonly CancellationTokenSource _stop = new();
-    private SafeFileHandle? _driver;
+    private SafeFileHandle? _eventDriver;
+    private SafeFileHandle? _commandDriver;
     private TcpClient? _tcp;
     private Task? _eventLoop;
     private Task? _networkLoop;
@@ -53,11 +55,19 @@ public sealed class KmdfTunnelSession : IDisposable
             throw new PlatformNotSupportedException("KMDF backend is only available on Windows.");
         }
 
-        _driver = OpenDriver();
+        _eventDriver = OpenDriver();
+        _commandDriver = OpenDriver();
         Attach();
 
         _tcp = new TcpClient();
-        await _tcp.ConnectAsync(_mapping.Host, _mapping.Port, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await _tcp.ConnectAsync(_mapping.Host, _mapping.Port, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is SocketException or IOException)
+        {
+            throw new IOException($"Could not connect to RFC2217 endpoint {_mapping.Host}:{_mapping.Port}: {ex.Message}", ex);
+        }
 
         SetConnectionState(2);
         State = TunnelRunState.Running;
@@ -77,19 +87,9 @@ public sealed class KmdfTunnelSession : IDisposable
         State = LastError is null ? TunnelRunState.Stopped : TunnelRunState.Faulted;
         _stop.Cancel();
 
-        try
-        {
-            if (_driver is { IsInvalid: false, IsClosed: false })
-            {
-                DeviceIoControl(_driver, IoctlDetach, null, 0, null, 0, out _, IntPtr.Zero);
-            }
-        }
-        catch
-        {
-        }
-
         _tcp?.Dispose();
-        _driver?.Dispose();
+        _eventDriver?.Dispose();
+        _commandDriver?.Dispose();
         _stop.Dispose();
     }
 
@@ -122,7 +122,7 @@ public sealed class KmdfTunnelSession : IDisposable
         Array.Copy(instance, 0, input, 8, Math.Min(instance.Length, 126));
 
         var output = new byte[80];
-        DeviceIoControlChecked(IoctlAttach, input, output);
+        DeviceIoControlChecked(_eventDriver, IoctlAttach, input, output);
     }
 
     private async Task EventLoopAsync()
@@ -134,7 +134,7 @@ public sealed class KmdfTunnelSession : IDisposable
 
             while (!_stop.IsCancellationRequested)
             {
-                var bytes = DeviceIoControlChecked(IoctlWaitEvent, null, output);
+                var bytes = DeviceIoControlChecked(_eventDriver, IoctlWaitEvent, null, output);
                 if (bytes < EventHeaderSize)
                 {
                     throw new InvalidOperationException("KMDF driver returned a truncated event.");
@@ -148,7 +148,9 @@ public sealed class KmdfTunnelSession : IDisposable
                 }
 
                 var payloadBytes = checked((int)size - EventHeaderSize);
-                await stream.WriteAsync(output.AsMemory(EventHeaderSize, payloadBytes), _stop.Token).ConfigureAwait(false);
+                var escaped = MinimalRfc2217Filter.EscapeSerialData(output, EventHeaderSize, payloadBytes);
+                _log.Info(_mapping.Name, $"KMDF TX event {payloadBytes} byte(s).");
+                await stream.WriteAsync(escaped, _stop.Token).ConfigureAwait(false);
             }
         }
         catch (Exception ex) when (!_stop.IsCancellationRequested)
@@ -172,11 +174,24 @@ public sealed class KmdfTunnelSession : IDisposable
                     throw new IOException("Remote endpoint closed the TCP connection.");
                 }
 
-                var push = new byte[8 + read];
+                var frame = _rfc2217.ProcessNetworkBytes(buffer, read);
+                if (frame.Replies.Length > 0)
+                {
+                    await stream.WriteAsync(frame.Replies, _stop.Token).ConfigureAwait(false);
+                }
+
+                if (frame.SerialData.Length == 0)
+                {
+                    continue;
+                }
+
+                var push = new byte[8 + frame.SerialData.Length];
                 WriteUInt32(push, 0, 0);
-                WriteUInt32(push, 4, (uint)read);
-                Buffer.BlockCopy(buffer, 0, push, 8, read);
-                DeviceIoControlChecked(IoctlPushRx, push, null);
+                WriteUInt32(push, 4, (uint)frame.SerialData.Length);
+                Buffer.BlockCopy(frame.SerialData, 0, push, 8, frame.SerialData.Length);
+                _log.Info(_mapping.Name, $"RFC2217 RX serial {frame.SerialData.Length} byte(s).");
+                DeviceIoControlChecked(_commandDriver, IoctlPushRx, push, null);
+                _log.Info(_mapping.Name, $"Driver RX push completed {frame.SerialData.Length} byte(s).");
             }
         }
         catch (Exception ex) when (!_stop.IsCancellationRequested)
@@ -197,25 +212,25 @@ public sealed class KmdfTunnelSession : IDisposable
 
     private void SetConnectionState(uint state)
     {
-        if (_driver is null || _driver.IsInvalid || _driver.IsClosed)
+        if (_commandDriver is null || _commandDriver.IsInvalid || _commandDriver.IsClosed)
         {
             return;
         }
 
         var input = new byte[4];
         WriteUInt32(input, 0, state);
-        DeviceIoControl(_driver, IoctlSetConnectionState, input, input.Length, null, 0, out _, IntPtr.Zero);
+        DeviceIoControl(_commandDriver, IoctlSetConnectionState, input, input.Length, null, 0, out _, IntPtr.Zero);
     }
 
-    private int DeviceIoControlChecked(uint ioctl, byte[]? input, byte[]? output)
+    private static int DeviceIoControlChecked(SafeFileHandle? driver, uint ioctl, byte[]? input, byte[]? output)
     {
-        if (_driver is null)
+        if (driver is null)
         {
             throw new InvalidOperationException("KMDF driver is not open.");
         }
 
         var ok = DeviceIoControl(
-            _driver,
+            driver,
             ioctl,
             input,
             input?.Length ?? 0,
@@ -244,6 +259,131 @@ public sealed class KmdfTunnelSession : IDisposable
     private static uint ReadUInt32(byte[] buffer, int offset) => BitConverter.ToUInt32(buffer, offset);
     private static void WriteUInt16(byte[] buffer, int offset, ushort value) => BitConverter.GetBytes(value).CopyTo(buffer, offset);
     private static void WriteUInt32(byte[] buffer, int offset, uint value) => BitConverter.GetBytes(value).CopyTo(buffer, offset);
+
+    private sealed class MinimalRfc2217Filter
+    {
+        private const byte Iac = 255;
+        private const byte Dont = 254;
+        private const byte Do = 253;
+        private const byte Wont = 252;
+        private const byte Will = 251;
+        private const byte Sb = 250;
+        private const byte Se = 240;
+        private const byte TelnetBinary = 0;
+        private const byte SuppressGoAhead = 3;
+        private const byte ComPortOption = 44;
+
+        private ParserState _state;
+        private byte _command;
+
+        public Rfc2217Frame ProcessNetworkBytes(byte[] buffer, int length)
+        {
+            var serial = new List<byte>(length);
+            var replies = new List<byte>();
+
+            for (var i = 0; i < length; i++)
+            {
+                var value = buffer[i];
+                switch (_state)
+                {
+                    case ParserState.Data:
+                        if (value == Iac)
+                        {
+                            _state = ParserState.Iac;
+                        }
+                        else
+                        {
+                            serial.Add(value);
+                        }
+                        break;
+
+                    case ParserState.Iac:
+                        if (value == Iac)
+                        {
+                            serial.Add(Iac);
+                            _state = ParserState.Data;
+                        }
+                        else if (value is Do or Dont or Will or Wont)
+                        {
+                            _command = value;
+                            _state = ParserState.Option;
+                        }
+                        else if (value == Sb)
+                        {
+                            _state = ParserState.Subnegotiation;
+                        }
+                        else
+                        {
+                            _state = ParserState.Data;
+                        }
+                        break;
+
+                    case ParserState.Option:
+                        AddNegotiationReply(replies, _command, value);
+                        _state = ParserState.Data;
+                        break;
+
+                    case ParserState.Subnegotiation:
+                        if (value == Iac)
+                        {
+                            _state = ParserState.SubnegotiationIac;
+                        }
+                        break;
+
+                    case ParserState.SubnegotiationIac:
+                        _state = value == Se ? ParserState.Data : ParserState.Subnegotiation;
+                        break;
+                }
+            }
+
+            return new Rfc2217Frame(serial.ToArray(), replies.ToArray());
+        }
+
+        public static byte[] EscapeSerialData(byte[] buffer, int offset, int length)
+        {
+            var escaped = new List<byte>(length);
+            for (var i = 0; i < length; i++)
+            {
+                var value = buffer[offset + i];
+                escaped.Add(value);
+                if (value == Iac)
+                {
+                    escaped.Add(Iac);
+                }
+            }
+
+            return escaped.ToArray();
+        }
+
+        private static void AddNegotiationReply(List<byte> replies, byte command, byte option)
+        {
+            var accept = option is TelnetBinary or SuppressGoAhead or ComPortOption;
+            var reply = command switch
+            {
+                Do => accept ? Will : Wont,
+                Will => accept ? Do : Dont,
+                _ => (byte)0
+            };
+
+            if (reply != 0)
+            {
+                replies.Add(Iac);
+                replies.Add(reply);
+                replies.Add(option);
+            }
+        }
+
+        private enum ParserState
+        {
+            Data,
+            Iac,
+            Option,
+            Subnegotiation,
+            SubnegotiationIac
+        }
+    }
+
+    private sealed record Rfc2217Frame(byte[] SerialData, byte[] Replies);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern SafeFileHandle CreateFileW(
