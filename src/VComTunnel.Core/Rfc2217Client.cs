@@ -498,7 +498,9 @@ public sealed class Rfc2217Client
         var reply = command switch
         {
             Do => accept ? Will : Wont,
+            Dont => Wont,
             Will => accept ? Do : Dont,
+            Wont => Dont,
             _ => (byte)0
         };
 

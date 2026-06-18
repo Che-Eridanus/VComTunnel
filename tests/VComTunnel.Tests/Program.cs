@@ -335,6 +335,12 @@ static void Rfc2217TelnetParser()
     AssertBytes([0x41, 0xFF, 0x42], frame.SerialData);
     AssertBytes([0xFF, 0xFD, 0x2C], frame.Replies);
 
+    var closeNegotiation = client.ProcessNetworkBytes([0xFF, 0xFE, 0x2C, 0xFF, 0xFC, 0x2C], 6);
+    AssertBytes([0xFF, 0xFC, 0x2C, 0xFF, 0xFE, 0x2C], closeNegotiation.Replies);
+
+    var unsupportedNegotiation = client.ProcessNetworkBytes([0xFF, 0xFD, 0x55, 0xFF, 0xFB, 0x55], 6);
+    AssertBytes([0xFF, 0xFC, 0x55, 0xFF, 0xFE, 0x55], unsupportedNegotiation.Replies);
+
     var notify = client.ProcessNetworkBytes([0xFF, 0xFA, 0x2C, 0x6B, 0xB0, 0xFF, 0xF0], 7);
     AssertEqual("0", notify.SerialData.Length.ToString());
     AssertEqual(Rfc2217Client.NotifyModemState.ToString(), notify.Notifications.Single().Command.ToString());
