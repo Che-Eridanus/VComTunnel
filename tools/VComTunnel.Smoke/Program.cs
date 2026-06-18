@@ -747,7 +747,15 @@ internal sealed class NativeSerial : IDisposable
 
         while (DateTimeOffset.UtcNow < deadline && received.Count < byteCount)
         {
-            if (!ReadFile(_handle, buffer, (uint)(byteCount - received.Count), out var read, IntPtr.Zero))
+            var available = GetInQueue();
+            if (available == 0)
+            {
+                await Task.Delay(20, cancellationToken);
+                continue;
+            }
+
+            var requested = Math.Min((uint)(byteCount - received.Count), available);
+            if (!ReadFile(_handle, buffer, requested, out var read, IntPtr.Zero))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "ReadFile failed.");
             }
