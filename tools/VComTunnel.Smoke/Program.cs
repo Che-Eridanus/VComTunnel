@@ -129,6 +129,11 @@ static async Task<int> ExerciseControlIoctlsAsync(
     CancellationToken cancellationToken)
 {
     const byte setControl = 5;
+    const byte setBaudRate = 1;
+    const byte setDataSize = 2;
+    const byte setParity = 3;
+    const byte setStopSize = 4;
+    const byte purgeData = 12;
     const byte localFlowControlSuspend = 8;
     const byte localFlowControlResume = 9;
 
@@ -136,20 +141,47 @@ static async Task<int> ExerciseControlIoctlsAsync(
     serial.ValidateCommConfig();
     serial.SetQueueSize(4096, 4096);
 
+    serial.SetBaudRate(115200);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setBaudRate && notification.Payload is [0x00, 0x01, 0xC2, 0x00],
+        "SET-BAUDRATE 115200",
+        readTimeout,
+        cancellationToken);
+
+    serial.SetLineControl(stopBits: 0, parity: 0, wordLength: 8);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setDataSize && notification.Payload is [8],
+        "SET-DATASIZE 8",
+        readTimeout,
+        cancellationToken);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setParity && notification.Payload is [1],
+        "SET-PARITY none",
+        readTimeout,
+        cancellationToken);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setStopSize && notification.Payload is [1],
+        "SET-STOPSIZE 1",
+        readTimeout,
+        cancellationToken);
+
     serial.SetRawModemControl(NativeSerial.McrDtr | NativeSerial.McrRts | NativeSerial.McrLoop);
-    if (probe is not null)
-    {
-        await probe.WaitForAsync(
-            notification => notification.Command == setControl && notification.Payload is [8],
-            "SET-CONTROL DTR on",
-            readTimeout,
-            cancellationToken);
-        await probe.WaitForAsync(
-            notification => notification.Command == setControl && notification.Payload is [11],
-            "SET-CONTROL RTS on",
-            readTimeout,
-            cancellationToken);
-    }
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [8],
+        "SET-CONTROL DTR on",
+        readTimeout,
+        cancellationToken);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [11],
+        "SET-CONTROL RTS on",
+        readTimeout,
+        cancellationToken);
 
     var rawModemControl = serial.GetRawModemControl();
     var expectedModemControl = NativeSerial.McrDtr | NativeSerial.McrRts | NativeSerial.McrLoop;
@@ -158,25 +190,58 @@ static async Task<int> ExerciseControlIoctlsAsync(
         throw new InvalidOperationException($"Raw modem control mismatch: 0x{rawModemControl:X8}.");
     }
 
+    serial.SetHandflow(controlHandshake: 0x20, flowReplace: 0x80);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [17],
+        "SET-CONTROL outbound DCD flow",
+        readTimeout,
+        cancellationToken);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [16],
+        "SET-CONTROL inbound RTS flow",
+        readTimeout,
+        cancellationToken);
+
+    serial.SetBreak(enabled: true);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [5],
+        "SET-CONTROL BREAK on",
+        readTimeout,
+        cancellationToken);
+    serial.SetBreak(enabled: false);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [6],
+        "SET-CONTROL BREAK off",
+        readTimeout,
+        cancellationToken);
+
+    serial.Purge(NativeSerial.PurgeTxClear | NativeSerial.PurgeRxClear);
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == purgeData && notification.Payload is [3],
+        "PURGE-DATA rx+tx",
+        readTimeout,
+        cancellationToken);
+
     serial.SetXoff();
-    if (probe is not null)
-    {
-        await probe.WaitForAsync(
-            notification => notification.Command == localFlowControlSuspend && notification.Payload.Length == 0,
-            "FLOWCONTROL-SUSPEND",
-            readTimeout,
-            cancellationToken);
-    }
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == localFlowControlSuspend && notification.Payload.Length == 0,
+        "FLOWCONTROL-SUSPEND",
+        readTimeout,
+        cancellationToken);
 
     serial.SetXon();
-    if (probe is not null)
-    {
-        await probe.WaitForAsync(
-            notification => notification.Command == localFlowControlResume && notification.Payload.Length == 0,
-            "FLOWCONTROL-RESUME",
-            readTimeout,
-            cancellationToken);
-    }
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == localFlowControlResume && notification.Payload.Length == 0,
+        "FLOWCONTROL-RESUME",
+        readTimeout,
+        cancellationToken);
 
     if (!expectEcho)
     {
@@ -194,6 +259,18 @@ static async Task<int> ExerciseControlIoctlsAsync(
 
     Console.WriteLine("control ioctls: passed.");
     return 1;
+}
+
+static Task WaitForRfc2217Async(
+    FakeRfc2217Probe? probe,
+    Func<Rfc2217Notification, bool> predicate,
+    string description,
+    TimeSpan timeout,
+    CancellationToken cancellationToken)
+{
+    return probe is null
+        ? Task.CompletedTask
+        : probe.WaitForAsync(predicate, description, timeout, cancellationToken);
 }
 
 static void DumpLogEntries(IReadOnlyList<LogEntry> entries)
@@ -264,6 +341,8 @@ internal sealed class NativeSerial : IDisposable
     public const uint McrDtr = 0x00000001;
     public const uint McrRts = 0x00000002;
     public const uint McrLoop = 0x00000010;
+    public const uint PurgeTxClear = 0x00000004;
+    public const uint PurgeRxClear = 0x00000008;
 
     private readonly SafeFileHandle _handle;
 
@@ -364,6 +443,24 @@ internal sealed class NativeSerial : IDisposable
         DeviceIoControlChecked(IoctlSerialSetQueueSize, input, null, "IOCTL_SERIAL_SET_QUEUE_SIZE");
     }
 
+    public void SetBaudRate(uint baudRate)
+    {
+        DeviceIoControlChecked(IoctlSerialSetBaudRate, BitConverter.GetBytes(baudRate), null, "IOCTL_SERIAL_SET_BAUD_RATE");
+    }
+
+    public void SetLineControl(byte stopBits, byte parity, byte wordLength)
+    {
+        DeviceIoControlChecked(IoctlSerialSetLineControl, [stopBits, parity, wordLength], null, "IOCTL_SERIAL_SET_LINE_CONTROL");
+    }
+
+    public void SetHandflow(uint controlHandshake, uint flowReplace)
+    {
+        var input = new byte[16];
+        BitConverter.GetBytes(controlHandshake).CopyTo(input, 0);
+        BitConverter.GetBytes(flowReplace).CopyTo(input, 4);
+        DeviceIoControlChecked(IoctlSerialSetHandflow, input, null, "IOCTL_SERIAL_SET_HANDFLOW");
+    }
+
     public void ClearStats()
     {
         DeviceIoControlChecked(IoctlSerialClearStats, null, null, "IOCTL_SERIAL_CLEAR_STATS");
@@ -404,6 +501,16 @@ internal sealed class NativeSerial : IDisposable
         DeviceIoControlChecked(IoctlSerialSetXon, null, null, "IOCTL_SERIAL_SET_XON");
     }
 
+    public void SetBreak(bool enabled)
+    {
+        DeviceIoControlChecked(enabled ? IoctlSerialSetBreakOn : IoctlSerialSetBreakOff, null, null, enabled ? "IOCTL_SERIAL_SET_BREAK_ON" : "IOCTL_SERIAL_SET_BREAK_OFF");
+    }
+
+    public void Purge(uint purgeMask)
+    {
+        DeviceIoControlChecked(IoctlSerialPurge, BitConverter.GetBytes(purgeMask), null, "IOCTL_SERIAL_PURGE");
+    }
+
     public void SendImmediate(byte value)
     {
         DeviceIoControlChecked(IoctlSerialImmediateChar, [value], null, "IOCTL_SERIAL_IMMEDIATE_CHAR");
@@ -440,10 +547,16 @@ internal sealed class NativeSerial : IDisposable
         out uint bytesWritten,
         IntPtr overlapped);
 
+    private const uint IoctlSerialSetBaudRate = (0x1Bu << 16) | (1u << 2);
     private const uint IoctlSerialSetQueueSize = (0x1Bu << 16) | (2u << 2);
+    private const uint IoctlSerialSetLineControl = (0x1Bu << 16) | (3u << 2);
+    private const uint IoctlSerialSetBreakOn = (0x1Bu << 16) | (4u << 2);
+    private const uint IoctlSerialSetBreakOff = (0x1Bu << 16) | (5u << 2);
     private const uint IoctlSerialImmediateChar = (0x1Bu << 16) | (6u << 2);
     private const uint IoctlSerialSetXoff = (0x1Bu << 16) | (14u << 2);
     private const uint IoctlSerialSetXon = (0x1Bu << 16) | (15u << 2);
+    private const uint IoctlSerialPurge = (0x1Bu << 16) | (19u << 2);
+    private const uint IoctlSerialSetHandflow = (0x1Bu << 16) | (25u << 2);
     private const uint IoctlSerialGetCommStatus = (0x1Bu << 16) | (27u << 2);
     private const uint IoctlSerialConfigSize = (0x1Bu << 16) | (32u << 2);
     private const uint IoctlSerialGetCommConfig = (0x1Bu << 16) | (33u << 2);
