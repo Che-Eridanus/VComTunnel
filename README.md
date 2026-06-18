@@ -187,6 +187,8 @@ keep-alive, modem/line notification handling, and basic wait-mask notifications
 for RX, RXFLAG/EventChar, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events,
 plus serial RX/TX/error statistics through `IOCTL_SERIAL_GET_STATS` and
 `IOCTL_SERIAL_CLEAR_STATS`, and immediate-character transmit through
-`IOCTL_SERIAL_IMMEDIATE_CHAR`.
+`IOCTL_SERIAL_IMMEDIATE_CHAR`. Windows serial configuration probes
+(`CONFIG_SIZE`, `GET_COMMCONFIG`, and `SET_COMMCONFIG`) return a minimal RS232
+configuration with no provider-specific data.
 Remaining hardening work is broader serial compatibility coverage and live ESP-DAP
 compatibility validation against real tools.

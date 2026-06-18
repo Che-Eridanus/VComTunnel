@@ -101,6 +101,61 @@ VctCompleteCommProperties(
     return VctCopyOutputBuffer(Request, &properties, sizeof(properties));
 }
 
+static ULONG
+VctSerialConfigSize(
+    VOID
+    )
+{
+    return FIELD_OFFSET(SERIALCONFIG, ProviderData);
+}
+
+static NTSTATUS
+VctCompleteConfigSize(
+    _In_ WDFREQUEST Request
+    )
+{
+    ULONG configSize;
+
+    configSize = VctSerialConfigSize();
+    return VctCopyOutputBuffer(Request, &configSize, sizeof(configSize));
+}
+
+static NTSTATUS
+VctCompleteCommConfig(
+    _In_ WDFREQUEST Request
+    )
+{
+    NTSTATUS status;
+    PSERIALCONFIG config;
+    ULONG configSize;
+
+    configSize = VctSerialConfigSize();
+    status = WdfRequestRetrieveOutputBuffer(Request, configSize, (PVOID*)&config, NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlZeroMemory(config, configSize);
+    config->Size = configSize;
+    config->Version = 1;
+    config->SubType = SERIAL_SP_RS232;
+    config->ProvOffset = 0;
+    config->ProviderSize = 0;
+    WdfRequestSetInformation(Request, configSize);
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+VctAcceptCommConfig(
+    _In_ WDFREQUEST Request
+    )
+{
+    PVOID inputBuffer;
+
+    return WdfRequestRetrieveInputBuffer(Request, VctSerialConfigSize(), &inputBuffer, NULL);
+}
+
 static NTSTATUS
 VctCompleteCommStatus(
     _In_ WDFREQUEST Request,
@@ -1037,6 +1092,18 @@ VctEvtIoDeviceControl(
 
     case IOCTL_SERIAL_GET_PROPERTIES:
         status = VctCompleteCommProperties(Request);
+        break;
+
+    case IOCTL_SERIAL_CONFIG_SIZE:
+        status = VctCompleteConfigSize(Request);
+        break;
+
+    case IOCTL_SERIAL_GET_COMMCONFIG:
+        status = VctCompleteCommConfig(Request);
+        break;
+
+    case IOCTL_SERIAL_SET_COMMCONFIG:
+        status = VctAcceptCommConfig(Request);
         break;
 
     case IOCTL_SERIAL_GET_STATS:

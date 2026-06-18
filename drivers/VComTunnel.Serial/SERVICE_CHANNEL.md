@@ -263,6 +263,16 @@ service consumption. RFC2217 line-state notifications update framing, serial
 overrun, queue overrun, and parity counters when the corresponding Windows
 serial error bits are reported.
 
+## Serial Configuration
+
+The driver supports the Windows serial configuration probe IOCTLs:
+`IOCTL_SERIAL_CONFIG_SIZE`, `IOCTL_SERIAL_GET_COMMCONFIG`, and
+`IOCTL_SERIAL_SET_COMMCONFIG`. The returned `SERIALCONFIG` advertises an RS232
+subtype with no provider-specific data. `SET_COMMCONFIG` accepts the same
+minimal shape and leaves baud-rate, line-control, and handflow state to their
+dedicated serial IOCTLs so those changes continue to generate RFC2217 control
+events.
+
 ## Immediate Transmit
 
 `IOCTL_SERIAL_IMMEDIATE_CHAR` accepts one byte from the serial client and
