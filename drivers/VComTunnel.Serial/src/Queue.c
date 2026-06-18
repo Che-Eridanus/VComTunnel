@@ -399,6 +399,8 @@ VctCompleteControlEventFromQueue(
     VCOMTUNNEL_QUEUED_EVENT event;
     PVCT_EVENT_HEADER header;
     ULONG eventSize;
+    BOOLEAN signalTxEmpty = FALSE;
+    BOOLEAN completed = FALSE;
 
     status = WdfRequestRetrieveOutputBuffer(
         Request,
@@ -432,6 +434,7 @@ VctCompleteControlEventFromQueue(
     event = Context->EventQueue[Context->EventTail];
     Context->EventTail = (Context->EventTail + 1) % VCOMTUNNEL_EVENT_QUEUE_SIZE;
     Context->EventCount--;
+    signalTxEmpty = event.Type == VComTunnelEventTxData;
 
     header = (PVCT_EVENT_HEADER)eventBuffer;
     RtlZeroMemory(header, sizeof(*header));
@@ -448,11 +451,17 @@ VctCompleteControlEventFromQueue(
     if (UnmarkCancelable) {
         if (WdfRequestUnmarkCancelable(Request) != STATUS_CANCELLED) {
             WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, eventSize);
+            completed = TRUE;
         }
-        return STATUS_PENDING;
+    } else {
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, eventSize);
+        completed = TRUE;
     }
 
-    WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, eventSize);
+    if (completed && signalTxEmpty) {
+        VctSignalWaitMaskEvent(Context, SERIAL_EV_TXEMPTY);
+    }
+
     return STATUS_PENDING;
 }
 
@@ -479,6 +488,39 @@ VctQueueControlEvent(
     if (serviceWait != NULL) {
         VctCompleteControlEventFromQueue(serviceWait, Context, TRUE);
     }
+}
+
+static NTSTATUS
+VctQueueImmediateChar(
+    _Inout_ PDEVICE_CONTEXT Context,
+    _In_ UCHAR ImmediateChar
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    WDFREQUEST serviceWait = NULL;
+
+    WdfSpinLockAcquire(Context->Lock);
+    if (!Context->ServiceAttached) {
+        status = STATUS_DEVICE_NOT_READY;
+    } else {
+        VctEnqueueControlEventLocked(
+            Context,
+            VComTunnelEventTxData,
+            &ImmediateChar,
+            sizeof(ImmediateChar));
+        Context->Stats.TransmittedCount++;
+        if (Context->PendingServiceWait != NULL) {
+            serviceWait = Context->PendingServiceWait;
+            Context->PendingServiceWait = NULL;
+        }
+    }
+    WdfSpinLockRelease(Context->Lock);
+
+    if (serviceWait != NULL) {
+        VctCompleteControlEventFromQueue(serviceWait, Context, TRUE);
+    }
+
+    return status;
 }
 
 static VOID
@@ -1003,6 +1045,17 @@ VctEvtIoDeviceControl(
 
     case IOCTL_SERIAL_CLEAR_STATS:
         VctClearSerialStats(context);
+        break;
+
+    case IOCTL_SERIAL_IMMEDIATE_CHAR:
+        {
+            UCHAR immediateChar;
+
+            status = VctCopyInputBuffer(Request, &immediateChar, sizeof(immediateChar));
+            if (NT_SUCCESS(status)) {
+                status = VctQueueImmediateChar(context, immediateChar);
+            }
+        }
         break;
 
     case IOCTL_SERIAL_GET_COMMSTATUS:

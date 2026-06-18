@@ -263,10 +263,20 @@ service consumption. RFC2217 line-state notifications update framing, serial
 overrun, queue overrun, and parity counters when the corresponding Windows
 serial error bits are reported.
 
+## Immediate Transmit
+
+`IOCTL_SERIAL_IMMEDIATE_CHAR` accepts one byte from the serial client and
+queues it as a `TxData` service event ahead of the normal TX ring buffer. The
+service sends it through the existing RFC2217 serial-data path, including IAC
+escaping and remote flow-control gating. If the service is not attached, the
+IOCTL fails with `STATUS_DEVICE_NOT_READY`.
+
 ## Ordering Rules
 
 - Preserve TxData order per serial handle.
 - Preserve RX byte order.
+- Immediate transmit bytes are delivered before already queued TX ring-buffer
+  bytes that have not yet been handed to the service.
 - Control events are sequenced relative to TxData by the driver's event
   sequence number.
 - Service should process events serially for the first prototype.

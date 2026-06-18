@@ -118,6 +118,9 @@ Current implementation note:
 - The driver reports `IOCTL_SERIAL_GET_STATS` counters for accepted RX/TX bytes
   and RFC2217 line-state error categories, and supports
   `IOCTL_SERIAL_CLEAR_STATS`.
+- `IOCTL_SERIAL_IMMEDIATE_CHAR` is delivered as a one-byte TxData event ahead
+  of queued TX ring-buffer bytes, using the same RFC2217 serial-data path and
+  IAC escaping as normal writes.
 - Remaining hardening: additional serial events beyond the current wait-mask
   subset and live hardware/tool compatibility validation.
 
