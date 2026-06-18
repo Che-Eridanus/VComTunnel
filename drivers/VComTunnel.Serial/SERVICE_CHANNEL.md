@@ -174,6 +174,9 @@ Driver behavior:
 - Validate `ByteCount <= MaxRxBytes`.
 - If the full frame fits, copy it into the RX ring buffer.
 - Complete pending reads in FIFO order.
+- Signal `SERIAL_EV_RXCHAR` for pushed RX bytes, and also signal
+  `SERIAL_EV_RXFLAG` when the frame contains the current
+  `SERIAL_CHARS.EventChar`.
 - Serial reads with an empty RX queue are held as one cancelable pending read
   while the service is connecting/online, and completed when the next `PUSH_RX`
   frame arrives.

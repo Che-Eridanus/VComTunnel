@@ -184,6 +184,6 @@ startup line/modem mask ACK validation, remote flow-control suspend/resume
 handling, local RX backpressure through RFC2217 FLOWCONTROL-SUSPEND/RESUME,
 SIGNATURE request response, serialized Telnet/RFC2217 writes with idle NOP
 keep-alive, modem/line notification handling, and basic wait-mask notifications
-for RX, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events.
+for RX, RXFLAG/EventChar, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events.
 Remaining hardening work is broader serial compatibility coverage and live ESP-DAP
 compatibility validation against real tools.

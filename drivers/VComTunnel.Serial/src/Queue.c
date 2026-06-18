@@ -254,6 +254,24 @@ VctRxCopyInLocked(
     return copied;
 }
 
+static BOOLEAN
+VctBufferContainsByte(
+    _In_reads_bytes_(Length) const UCHAR* Buffer,
+    _In_ ULONG Length,
+    _In_ UCHAR Value
+    )
+{
+    ULONG index;
+
+    for (index = 0; index < Length; index++) {
+        if (Buffer[index] == Value) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 static ULONG
 VctTxCopyOutLocked(
     _Inout_ PDEVICE_CONTEXT Context,
@@ -607,6 +625,7 @@ VctPushRx(
     size_t inputLength;
     WDFREQUEST readRequest = NULL;
     ULONG pushed = 0;
+    ULONG eventMask = 0;
     ULONG readBytes = 0;
     UCHAR* readBuffer = NULL;
     size_t readBufferLength = 0;
@@ -626,6 +645,12 @@ VctPushRx(
         status = STATUS_BUFFER_OVERFLOW;
     } else {
         pushed = VctRxCopyInLocked(Context, push->Bytes, push->ByteCount);
+        if (pushed > 0) {
+            eventMask = SERIAL_EV_RXCHAR;
+            if (VctBufferContainsByte(push->Bytes, pushed, Context->Chars.EventChar)) {
+                eventMask |= SERIAL_EV_RXFLAG;
+            }
+        }
         if (pushed == push->ByteCount && Context->PendingRead != NULL) {
             readRequest = Context->PendingRead;
             Context->PendingRead = NULL;
@@ -637,8 +662,8 @@ VctPushRx(
         return status;
     }
 
-    if (pushed > 0) {
-        VctSignalWaitMaskEvent(Context, SERIAL_EV_RXCHAR);
+    if (eventMask != 0) {
+        VctSignalWaitMaskEvent(Context, eventMask);
     }
 
     if (readRequest != NULL) {
