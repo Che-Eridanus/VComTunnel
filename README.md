@@ -181,7 +181,8 @@ Current status is still experimental: the WDK project produces a test-signed
 negotiation plus baud-rate, line-control, DTR/RTS, BREAK, flow-control, purge,
 command ACK correlation with accepted-value validation and timeout retry,
 startup line/modem mask ACK validation, remote flow-control suspend/resume
-handling, local RX backpressure through RFC2217 FLOWCONTROL-SUSPEND/RESUME,
+handling, local XOFF/XON and RX backpressure through RFC2217
+FLOWCONTROL-SUSPEND/RESUME,
 SIGNATURE request response, serialized Telnet/RFC2217 writes with idle NOP
 keep-alive, modem/line notification handling, and basic wait-mask notifications
 for RX, RXFLAG/EventChar, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events,

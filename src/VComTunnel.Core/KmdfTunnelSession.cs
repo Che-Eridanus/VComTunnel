@@ -26,6 +26,7 @@ public sealed class KmdfTunnelSession : IDisposable
     private const ushort EventTypeSetHandflow = 5;
     private const ushort EventTypeSetBreak = 6;
     private const ushort EventTypePurge = 7;
+    private const ushort EventTypeLocalFlowControl = 8;
     private const uint ModemControlDtr = 0x00000001;
     private const uint ModemControlRts = 0x00000002;
     private const uint RemoteBaudRate = 0x00000001;
@@ -727,6 +728,15 @@ public sealed class KmdfTunnelSession : IDisposable
                     purgeFrame,
                     purgeFrame.Length == 0 ? [] : [new Rfc2217ExpectedAck(Rfc2217Client.AckPurgeData, [Rfc2217Client.MapPurge(purgeMask)])],
                     "purge");
+
+            case EventTypeLocalFlowControl:
+                EnsurePayload(type, length, 4);
+                var suspend = buffer[offset] != 0;
+                _log.Info(_mapping.Name, $"RFC2217 local flow-control {(suspend ? "suspend" : "resume")}.");
+                return new Rfc2217OutboundFrame(
+                    suspend ? Rfc2217Client.BuildLocalFlowControlSuspend() : Rfc2217Client.BuildLocalFlowControlResume(),
+                    [],
+                    suspend ? "local-flow-control-suspend" : "local-flow-control-resume");
 
             default:
                 throw new InvalidOperationException($"KMDF driver returned unsupported event type {type}.");

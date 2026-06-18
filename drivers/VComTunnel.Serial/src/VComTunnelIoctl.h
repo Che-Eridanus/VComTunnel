@@ -30,7 +30,8 @@ typedef enum _VCOMTUNNEL_EVENT_TYPE {
     VComTunnelEventSetModemControl = 4,
     VComTunnelEventSetHandflow = 5,
     VComTunnelEventSetBreak = 6,
-    VComTunnelEventPurge = 7
+    VComTunnelEventPurge = 7,
+    VComTunnelEventLocalFlowControl = 8
 } VCOMTUNNEL_EVENT_TYPE;
 
 typedef struct _VCT_ATTACH_REQUEST {
@@ -97,6 +98,11 @@ typedef struct _VCT_BREAK_EVENT {
 typedef struct _VCT_PURGE_EVENT {
     ULONG Mask;
 } VCT_PURGE_EVENT, *PVCT_PURGE_EVENT;
+
+typedef struct _VCT_LOCAL_FLOW_CONTROL_EVENT {
+    UCHAR Suspend;
+    UCHAR Reserved[3];
+} VCT_LOCAL_FLOW_CONTROL_EVENT, *PVCT_LOCAL_FLOW_CONTROL_EVENT;
 
 typedef struct _VCT_MODEM_STATE {
     ULONG ModemStatus;

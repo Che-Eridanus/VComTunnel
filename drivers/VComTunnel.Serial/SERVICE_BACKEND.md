@@ -102,6 +102,8 @@ Current implementation note:
   pending ACK wait follows the existing timeout/retry policy.
 - RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and control commands
   until FLOWCONTROL-RESUME is received.
+- Local `IOCTL_SERIAL_SET_XOFF` and `IOCTL_SERIAL_SET_XON` requests are sent to
+  the RFC2217 endpoint as FLOWCONTROL-SUSPEND and FLOWCONTROL-RESUME.
 - If the driver's RX queue is full while network bytes arrive, the service sends
   RFC2217 FLOWCONTROL-SUSPEND, retries the same RX frame without duplicating
   bytes, then sends FLOWCONTROL-RESUME once the driver accepts it.

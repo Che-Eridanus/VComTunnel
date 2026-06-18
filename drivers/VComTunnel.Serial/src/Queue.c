@@ -578,6 +578,42 @@ VctQueueImmediateChar(
     return status;
 }
 
+static NTSTATUS
+VctQueueLocalFlowControl(
+    _Inout_ PDEVICE_CONTEXT Context,
+    _In_ BOOLEAN Suspend
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    WDFREQUEST serviceWait = NULL;
+    VCT_LOCAL_FLOW_CONTROL_EVENT event;
+
+    RtlZeroMemory(&event, sizeof(event));
+    event.Suspend = Suspend;
+
+    WdfSpinLockAcquire(Context->Lock);
+    if (!Context->ServiceAttached) {
+        status = STATUS_DEVICE_NOT_READY;
+    } else {
+        VctEnqueueControlEventLocked(
+            Context,
+            VComTunnelEventLocalFlowControl,
+            &event,
+            sizeof(event));
+        if (Context->PendingServiceWait != NULL) {
+            serviceWait = Context->PendingServiceWait;
+            Context->PendingServiceWait = NULL;
+        }
+    }
+    WdfSpinLockRelease(Context->Lock);
+
+    if (serviceWait != NULL) {
+        VctCompleteControlEventFromQueue(serviceWait, Context, TRUE);
+    }
+
+    return status;
+}
+
 static VOID
 VctEnqueueCurrentStateLocked(
     _Inout_ PDEVICE_CONTEXT Context
@@ -1123,6 +1159,14 @@ VctEvtIoDeviceControl(
                 status = VctQueueImmediateChar(context, immediateChar);
             }
         }
+        break;
+
+    case IOCTL_SERIAL_SET_XOFF:
+        status = VctQueueLocalFlowControl(context, TRUE);
+        break;
+
+    case IOCTL_SERIAL_SET_XON:
+        status = VctQueueLocalFlowControl(context, FALSE);
         break;
 
     case IOCTL_SERIAL_GET_COMMSTATUS:

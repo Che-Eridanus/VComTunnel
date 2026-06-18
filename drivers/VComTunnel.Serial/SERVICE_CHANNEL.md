@@ -281,6 +281,14 @@ service sends it through the existing RFC2217 serial-data path, including IAC
 escaping and remote flow-control gating. If the service is not attached, the
 IOCTL fails with `STATUS_DEVICE_NOT_READY`.
 
+## Manual Flow Control
+
+`IOCTL_SERIAL_SET_XOFF` and `IOCTL_SERIAL_SET_XON` queue a local flow-control
+event for the service. The service translates those events to RFC2217
+`FLOWCONTROL-SUSPEND` and `FLOWCONTROL-RESUME` respectively, asking the remote
+endpoint to pause or resume data sent toward the local COM port. If the service
+is not attached, the IOCTL fails with `STATUS_DEVICE_NOT_READY`.
+
 ## Ordering Rules
 
 - Preserve TxData order per serial handle.
