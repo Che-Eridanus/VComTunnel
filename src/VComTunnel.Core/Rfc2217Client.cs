@@ -495,6 +495,34 @@ public sealed class Rfc2217Client
         };
     }
 
+    public static string DescribeSetControlValue(byte value)
+    {
+        return value switch
+        {
+            0 => "outbound-flow query",
+            1 => "outbound-flow none",
+            2 => "outbound-flow xon-xoff",
+            3 => "outbound-flow cts",
+            4 => "break query",
+            5 => "break on",
+            6 => "break off",
+            7 => "dtr query",
+            8 => "dtr on",
+            9 => "dtr off",
+            10 => "rts query",
+            11 => "rts on",
+            12 => "rts off",
+            13 => "inbound-flow query",
+            14 => "inbound-flow none",
+            15 => "inbound-flow xon-xoff",
+            16 => "inbound-flow rts",
+            17 => "outbound-flow dcd",
+            18 => "inbound-flow dtr",
+            19 => "outbound-flow dsr",
+            _ => $"unknown {value}"
+        };
+    }
+
     public static byte MapPurge(uint purgeMask)
     {
         var purge = 0;

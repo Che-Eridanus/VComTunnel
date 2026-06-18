@@ -349,7 +349,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
 
             if (pendingAck == PendingAckResult.CompletedWithAcceptedSetControl)
             {
-                _log.Warn(_mapping.Name, $"RFC2217 peer accepted SET-CONTROL value {notification.Payload[0]}.");
+                _log.Warn(_mapping.Name, $"RFC2217 peer accepted SET-CONTROL {DescribeSetControlNotification(notification)}.");
                 return;
             }
 
@@ -359,6 +359,11 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             }
 
             if (ApplyRemoteSerialSetting(notification))
+            {
+                return;
+            }
+
+            if (ApplyRemoteControlState(notification))
             {
                 return;
             }
@@ -467,6 +472,24 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
 
         DeviceIoControlChecked(_commandDriver, IoctlSetRemoteSettings, lineInput, null);
         return true;
+    }
+
+    private bool ApplyRemoteControlState(Rfc2217Notification notification)
+    {
+        if (notification.Command != Rfc2217Client.AckSetControl || notification.Payload.Length != 1)
+        {
+            return false;
+        }
+
+        _log.Info(_mapping.Name, $"RFC2217 remote control state {DescribeSetControlNotification(notification)}.");
+        return true;
+    }
+
+    private static string DescribeSetControlNotification(Rfc2217Notification notification)
+    {
+        return notification.Payload.Length == 1
+            ? $"{notification.Payload[0]} ({Rfc2217Client.DescribeSetControlValue(notification.Payload[0])})"
+            : $"{notification.Payload.Length} byte(s)";
     }
 
     private async Task SendFrameWithAckAsync(NetworkStream stream, Rfc2217OutboundFrame frame)

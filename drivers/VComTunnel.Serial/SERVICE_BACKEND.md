@@ -106,7 +106,9 @@ Current implementation note:
   may be subsets of the requested masks, matching hub4com/RFC2217 server
   behavior. Startup then sends non-blocking serial/control status queries;
   serial-setting responses update the driver's remote-settings cache when the
-  peer returns accepted values.
+  peer returns accepted values. SET-CONTROL status responses are decoded and
+  logged as remote accepted control state; they are not reflected into local
+  Windows DTR/RTS state because that state belongs to the serial client side.
 - RFC2217 SIGNATURE requests are answered with the VComTunnel client signature.
 - Known RFC2217 subnegotiations are validated for their expected payload length
   before service-side handling; malformed known commands are ignored and any

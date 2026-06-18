@@ -542,6 +542,12 @@ static void Rfc2217AckSemantics()
         !new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [7], AllowAcceptedValue: true)
             .MatchesAcceptedSetControlValue(new Rfc2217Notification(Rfc2217Client.AckSetControl, [11])),
         "DTR query must not match an RTS response.");
+    AssertEqual("outbound-flow cts", Rfc2217Client.DescribeSetControlValue(3));
+    AssertEqual("break on", Rfc2217Client.DescribeSetControlValue(5));
+    AssertEqual("dtr on", Rfc2217Client.DescribeSetControlValue(8));
+    AssertEqual("rts off", Rfc2217Client.DescribeSetControlValue(12));
+    AssertEqual("inbound-flow rts", Rfc2217Client.DescribeSetControlValue(16));
+    AssertEqual("outbound-flow dcd", Rfc2217Client.DescribeSetControlValue(17));
     AssertEqual("17", Rfc2217Client.MapOutboundFlowControl(0x20, 0).ToString());
     AssertEqual("18", Rfc2217Client.MapInboundFlowControl(0x02, 0).ToString());
     AssertEqual("16", Rfc2217Client.MapInboundFlowControl(0, 0x80).ToString());
