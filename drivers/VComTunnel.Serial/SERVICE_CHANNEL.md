@@ -253,6 +253,16 @@ The service maps RFC2217 `NOTIFY-MODEMSTATE` current-state bits to Windows
 state changes. It maps RFC2217 `NOTIFY-LINESTATE` error bits to Windows serial
 error bits surfaced through `IOCTL_SERIAL_GET_COMMSTATUS`.
 
+## Serial Statistics
+
+The driver supports `IOCTL_SERIAL_GET_STATS` and `IOCTL_SERIAL_CLEAR_STATS`.
+`ReceivedCount` tracks service `PUSH_RX` bytes accepted into the RX queue.
+`TransmittedCount` tracks bytes accepted from serial client writes, whether
+they are delivered directly to a waiting service request or queued for later
+service consumption. RFC2217 line-state notifications update framing, serial
+overrun, queue overrun, and parity counters when the corresponding Windows
+serial error bits are reported.
+
 ## Ordering Rules
 
 - Preserve TxData order per serial handle.

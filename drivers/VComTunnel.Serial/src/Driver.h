@@ -30,6 +30,7 @@ typedef struct _DEVICE_CONTEXT {
     SERIAL_TIMEOUTS Timeouts;
     SERIAL_CHARS Chars;
     SERIAL_HANDFLOW Handflow;
+    SERIALPERF_STATS Stats;
     ULONG WaitMask;
     ULONG ModemStatus;
     ULONG LineErrors;

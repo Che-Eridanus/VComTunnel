@@ -120,6 +120,51 @@ VctCompleteCommStatus(
     return VctCopyOutputBuffer(Request, &status, sizeof(status));
 }
 
+static NTSTATUS
+VctCompleteSerialStats(
+    _In_ WDFREQUEST Request,
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    SERIALPERF_STATS stats;
+
+    WdfSpinLockAcquire(Context->Lock);
+    stats = Context->Stats;
+    WdfSpinLockRelease(Context->Lock);
+
+    return VctCopyOutputBuffer(Request, &stats, sizeof(stats));
+}
+
+static VOID
+VctClearSerialStats(
+    _Inout_ PDEVICE_CONTEXT Context
+    )
+{
+    WdfSpinLockAcquire(Context->Lock);
+    RtlZeroMemory(&Context->Stats, sizeof(Context->Stats));
+    WdfSpinLockRelease(Context->Lock);
+}
+
+static VOID
+VctAccumulateLineStatsLocked(
+    _Inout_ PDEVICE_CONTEXT Context,
+    _In_ ULONG Errors
+    )
+{
+    if ((Errors & SERIAL_ERROR_FRAMING) != 0) {
+        Context->Stats.FrameErrorCount++;
+    }
+    if ((Errors & SERIAL_ERROR_OVERRUN) != 0) {
+        Context->Stats.SerialOverrunErrorCount++;
+    }
+    if ((Errors & SERIAL_ERROR_QUEUEOVERRUN) != 0) {
+        Context->Stats.BufferOverrunErrorCount++;
+    }
+    if ((Errors & SERIAL_ERROR_PARITY) != 0) {
+        Context->Stats.ParityErrorCount++;
+    }
+}
+
 static VOID
 VctCompleteUnmarkedRequest(
     _In_ WDFREQUEST Request,
@@ -646,6 +691,7 @@ VctPushRx(
     } else {
         pushed = VctRxCopyInLocked(Context, push->Bytes, push->ByteCount);
         if (pushed > 0) {
+            Context->Stats.ReceivedCount += pushed;
             eventMask = SERIAL_EV_RXCHAR;
             if (VctBufferContainsByte(push->Bytes, pushed, Context->Chars.EventChar)) {
                 eventMask |= SERIAL_EV_RXFLAG;
@@ -951,6 +997,14 @@ VctEvtIoDeviceControl(
         status = VctCompleteCommProperties(Request);
         break;
 
+    case IOCTL_SERIAL_GET_STATS:
+        status = VctCompleteSerialStats(Request, context);
+        break;
+
+    case IOCTL_SERIAL_CLEAR_STATS:
+        VctClearSerialStats(context);
+        break;
+
     case IOCTL_SERIAL_GET_COMMSTATUS:
         WdfSpinLockAcquire(context->Lock);
         status = VctCompleteCommStatus(Request, context);
@@ -1139,13 +1193,16 @@ VctEvtIoDeviceControl(
 
             status = VctCopyInputBuffer(Request, &lineState, sizeof(lineState));
             if (NT_SUCCESS(status)) {
+                WdfSpinLockAcquire(context->Lock);
                 context->LineErrors = lineState.Errors;
+                VctAccumulateLineStatsLocked(context, lineState.Errors);
                 if (lineState.Errors != 0) {
                     eventMask |= SERIAL_EV_ERR;
                 }
                 if ((lineState.Errors & SERIAL_ERROR_BREAK) != 0) {
                     eventMask |= SERIAL_EV_BREAK;
                 }
+                WdfSpinLockRelease(context->Lock);
                 if (eventMask != 0) {
                     VctSignalWaitMaskEvent(context, eventMask);
                 }
@@ -1312,7 +1369,12 @@ VctEvtIoWrite(
             status = STATUS_BUFFER_OVERFLOW;
         } else {
             copied = VctTxCopyInLocked(context, inputBuffer, (ULONG)inputLength);
-            status = copied == inputLength ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+            if (copied == inputLength) {
+                context->Stats.TransmittedCount += copied;
+                status = STATUS_SUCCESS;
+            } else {
+                status = STATUS_BUFFER_OVERFLOW;
+            }
         }
     }
     WdfSpinLockRelease(context->Lock);
@@ -1339,6 +1401,7 @@ VctEvtIoWrite(
 
         WdfSpinLockAcquire(context->Lock);
         header->Sequence = ++context->NextSequence;
+        context->Stats.TransmittedCount += (ULONG)inputLength;
         WdfSpinLockRelease(context->Lock);
 
         RtlCopyMemory(eventBuffer + sizeof(VCT_EVENT_HEADER), inputBuffer, inputLength);
