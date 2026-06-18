@@ -9,6 +9,11 @@ namespace VComTunnel.Core;
 public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 {
     private const int MaxFrameBytes = 4096;
+    private const uint StartupBaudRate = 115200;
+    private const byte StartupByteSize = 8;
+    private const byte StartupParity = 0;
+    private const byte StartupStopBits = 0;
+    private static readonly TimeSpan SerialStatePollInterval = TimeSpan.FromMilliseconds(10);
     private static readonly TimeSpan CommandAckTimeout = Rfc2217Client.RecommendedCommandAckTimeout;
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan KeepAlivePollInterval = TimeSpan.FromSeconds(5);
@@ -18,6 +23,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private readonly Action<IManagedTunnelSession, string> _faulted;
     private readonly ISerialPortEndpointFactory _serialPorts;
     private readonly Rfc2217Client _rfc2217 = new();
+    private readonly EspToolBaudRateMonitor _espToolBaudRate = new();
     private readonly object _ackLock = new();
     private readonly List<Rfc2217ExpectedAck> _pendingAcks = [];
     private readonly object _flowLock = new();
@@ -30,6 +36,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private ISerialPortEndpoint? _serial;
     private TcpClient? _tcp;
     private Task? _serialLoop;
+    private Task? _serialStateLoop;
     private Task? _networkLoop;
     private Task? _keepAliveLoop;
     private int _disposed;
@@ -89,6 +96,18 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         await SendFrameWithAckAsync(
             stream,
             new Rfc2217OutboundFrame(
+                Rfc2217Client.BuildSetBaudRate(StartupBaudRate),
+                [],
+                $"startup-baud-rate {StartupBaudRate}")).ConfigureAwait(false);
+        await SendFrameWithAckAsync(
+            stream,
+            new Rfc2217OutboundFrame(
+                Rfc2217Client.BuildSetLineControl(StartupStopBits, StartupParity, StartupByteSize),
+                [],
+                "startup-line-control 8N1")).ConfigureAwait(false);
+        await SendFrameWithAckAsync(
+            stream,
+            new Rfc2217OutboundFrame(
                 Rfc2217Client.BuildStartupStatusQuery(),
                 [],
                 "startup-status-query")).ConfigureAwait(false);
@@ -97,6 +116,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         _log.Info(_mapping.Name, $"Started com0com service tunnel {_mapping.BackingPort} -> {_mapping.Host}:{_mapping.Port}.");
 
         _serialLoop = Task.Run(SerialLoopAsync);
+        _serialStateLoop = Task.Run(SerialStateLoopAsync);
         _keepAliveLoop = Task.Run(KeepAliveLoopAsync);
     }
 
@@ -128,6 +148,12 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                     continue;
                 }
 
+                var requestedBaudRate = _espToolBaudRate.ObserveOutbound(buffer, 0, read);
+                if (requestedBaudRate is not null)
+                {
+                    _log.Info(_mapping.Name, $"Detected esptool baud-rate change request {requestedBaudRate.Value}.");
+                }
+
                 await WaitForRemoteFlowAsync().ConfigureAwait(false);
                 await WriteNetworkAsync(stream, Rfc2217Client.EscapeSerialData(buffer, 0, read)).ConfigureAwait(false);
                 _log.Info(_mapping.Name, $"Serial TX {read} byte(s) from {_mapping.BackingPort}.");
@@ -138,6 +164,82 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             Fault(ex);
         }
     }
+
+    private async Task SerialStateLoopAsync()
+    {
+        try
+        {
+            var stream = _tcp!.GetStream();
+            SerialPortSnapshot? previous = null;
+            while (!_stop.IsCancellationRequested)
+            {
+                var current = _serial!.GetSnapshot();
+                if (previous is not null)
+                {
+                    var frame = BuildStateChangeFrame(previous.Value, current);
+                    if (frame.Bytes.Length > 0)
+                    {
+                        await WriteNetworkAsync(stream, frame.Bytes).ConfigureAwait(false);
+                        _log.Info(_mapping.Name, frame.Description);
+                    }
+                    else if (previous.Value.ModemStatus != current.ModemStatus)
+                    {
+                        _log.Info(_mapping.Name, $"Serial modem state raw 0x{previous.Value.ModemStatus:X8} -> 0x{current.ModemStatus:X8} without RFC2217 mapping.");
+                    }
+                }
+
+                previous = current;
+                await Task.Delay(SerialStatePollInterval, _stop.Token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (!_stop.IsCancellationRequested)
+        {
+            Fault(ex);
+        }
+    }
+
+    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current)
+    {
+        var frames = new List<byte[]>();
+        var descriptions = new List<string>();
+
+        if (previous.BaudRate != current.BaudRate && current.BaudRate > 0)
+        {
+            frames.Add(Rfc2217Client.BuildSetBaudRate(current.BaudRate));
+            descriptions.Add($"baud={current.BaudRate}");
+        }
+
+        if (previous.ByteSize != current.ByteSize
+            || previous.Parity != current.Parity
+            || previous.StopBits != current.StopBits)
+        {
+            frames.Add(Rfc2217Client.BuildSetLineControl(current.StopBits, current.Parity, current.ByteSize));
+            descriptions.Add($"line data={current.ByteSize}, parity={current.Parity}, stop={current.StopBits}");
+        }
+
+        var previousDtr = MapCom0comPeerDtr(previous.ModemStatus);
+        var currentDtr = MapCom0comPeerDtr(current.ModemStatus);
+        var previousRts = MapCom0comPeerRts(previous.ModemStatus);
+        var currentRts = MapCom0comPeerRts(current.ModemStatus);
+        bool? dtr = previousDtr != currentDtr ? currentDtr : null;
+        bool? rts = previousRts != currentRts ? currentRts : null;
+        if (dtr is not null || rts is not null)
+        {
+            frames.Add(Rfc2217Client.BuildSetModemControl(dtr, rts));
+            descriptions.Add($"modem raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}, dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}");
+        }
+
+        return frames.Count == 0
+            ? new Rfc2217OutboundFrame([], [], "serial state unchanged")
+            : new Rfc2217OutboundFrame(
+                frames.SelectMany(frame => frame).ToArray(),
+                [],
+                $"RFC2217 serial state {string.Join("; ", descriptions)} sent without ACK wait.");
+    }
+
+    public static bool MapCom0comPeerDtr(uint modemStatus) => (modemStatus & SerialPortSnapshot.Dsr) != 0;
+
+    public static bool MapCom0comPeerRts(uint modemStatus) => (modemStatus & SerialPortSnapshot.Cts) != 0;
 
     private async Task NetworkLoopAsync()
     {
@@ -172,8 +274,27 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
                 if (frame.SerialData.Length > 0)
                 {
-                    await _serial!.WriteAsync(frame.SerialData, _stop.Token).ConfigureAwait(false);
-                    _log.Info(_mapping.Name, $"RFC2217 RX serial {frame.SerialData.Length} byte(s) to {_mapping.BackingPort}.");
+                    var confirmedBaudRate = _espToolBaudRate.ObserveInbound(frame.SerialData, 0, frame.SerialData.Length);
+                    if (confirmedBaudRate is not null)
+                    {
+                        await SendFrameWithAckAsync(
+                            stream,
+                            new Rfc2217OutboundFrame(
+                                Rfc2217Client.BuildSetBaudRate(confirmedBaudRate.Value),
+                                [],
+                                $"esptool baud-rate {confirmedBaudRate.Value}")).ConfigureAwait(false);
+                        _log.Info(_mapping.Name, $"RFC2217 esptool baud-rate {confirmedBaudRate.Value} sent after target response.");
+                    }
+
+                    try
+                    {
+                        await _serial!.WriteAsync(frame.SerialData, _stop.Token).ConfigureAwait(false);
+                        _log.Info(_mapping.Name, $"RFC2217 RX serial {frame.SerialData.Length} byte(s) to {_mapping.BackingPort}.");
+                    }
+                    catch (SerialPortWriteTimeoutException ex)
+                    {
+                        _log.Warn(_mapping.Name, $"{ex.Message} Dropped {frame.SerialData.Length} RFC2217 RX byte(s) for {_mapping.BackingPort}.");
+                    }
                 }
             }
         }
@@ -493,6 +614,20 @@ public interface ISerialPortEndpoint : IDisposable
 {
     Task<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
     Task WriteAsync(byte[] bytes, CancellationToken cancellationToken);
+    SerialPortSnapshot GetSnapshot();
+}
+
+public readonly record struct SerialPortSnapshot(
+    uint ModemStatus,
+    uint BaudRate,
+    byte ByteSize,
+    byte Parity,
+    byte StopBits)
+{
+    public const uint Cts = 0x00000010;
+    public const uint Dsr = 0x00000020;
+    public const uint Ring = 0x00000040;
+    public const uint Rlsd = 0x00000080;
 }
 
 public interface ISerialPortEndpointFactory
@@ -521,6 +656,161 @@ public sealed class SerialPortOpenException : IOException
     }
 }
 
+public sealed class SerialPortWriteTimeoutException : IOException
+{
+    public SerialPortWriteTimeoutException(string message)
+        : base(message)
+    {
+    }
+}
+
+public sealed class EspToolBaudRateMonitor
+{
+    private const byte SlipEnd = 0xC0;
+    private const byte SlipEsc = 0xDB;
+    private const byte SlipEscEnd = 0xDC;
+    private const byte SlipEscEsc = 0xDD;
+    private const byte EspDirectionRequest = 0x00;
+    private const byte EspDirectionResponse = 0x01;
+    private const byte EspCommandChangeBaudRate = 0x0F;
+    private const int EspPacketHeaderBytes = 8;
+    private const int MaxSlipFrameBytes = 65536;
+
+    private readonly object _lock = new();
+    private readonly SlipDecodeState _outbound = new();
+    private readonly SlipDecodeState _inbound = new();
+    private uint? _pendingBaudRate;
+
+    public uint? ObserveOutbound(byte[] buffer, int offset, int length)
+    {
+        lock (_lock)
+        {
+            uint? observed = null;
+            foreach (var frame in Decode(_outbound, buffer, offset, length))
+            {
+                if (TryReadChangeBaudRequest(frame, out var baudRate))
+                {
+                    _pendingBaudRate = baudRate;
+                    observed = baudRate;
+                }
+            }
+
+            return observed;
+        }
+    }
+
+    public uint? ObserveInbound(byte[] buffer, int offset, int length)
+    {
+        lock (_lock)
+        {
+            foreach (var frame in Decode(_inbound, buffer, offset, length))
+            {
+                if (IsChangeBaudResponse(frame) && _pendingBaudRate is not null)
+                {
+                    var baudRate = _pendingBaudRate.Value;
+                    _pendingBaudRate = null;
+                    return baudRate;
+                }
+            }
+
+            return null;
+        }
+    }
+
+    public static bool TryReadChangeBaudRequest(IReadOnlyList<byte> frame, out uint baudRate)
+    {
+        baudRate = 0;
+        if (frame.Count < EspPacketHeaderBytes + sizeof(uint)
+            || frame[0] != EspDirectionRequest
+            || frame[1] != EspCommandChangeBaudRate)
+        {
+            return false;
+        }
+
+        var dataSize = frame[2] | (frame[3] << 8);
+        if (dataSize < sizeof(uint) || frame.Count < EspPacketHeaderBytes + dataSize)
+        {
+            return false;
+        }
+
+        baudRate = ReadUInt32(frame, EspPacketHeaderBytes);
+        return baudRate > 0;
+    }
+
+    private static bool IsChangeBaudResponse(IReadOnlyList<byte> frame)
+    {
+        return frame.Count >= 2
+            && frame[0] == EspDirectionResponse
+            && frame[1] == EspCommandChangeBaudRate;
+    }
+
+    private static uint ReadUInt32(IReadOnlyList<byte> bytes, int offset)
+    {
+        return (uint)(bytes[offset]
+            | (bytes[offset + 1] << 8)
+            | (bytes[offset + 2] << 16)
+            | (bytes[offset + 3] << 24));
+    }
+
+    private static IEnumerable<byte[]> Decode(SlipDecodeState state, byte[] buffer, int offset, int length)
+    {
+        var end = offset + length;
+        for (var i = offset; i < end; i++)
+        {
+            var value = buffer[i];
+            if (value == SlipEnd)
+            {
+                if (state.Frame.Count > 0)
+                {
+                    var completed = state.Frame.ToArray();
+                    state.Reset();
+                    yield return completed;
+                }
+                else
+                {
+                    state.Reset();
+                }
+
+                continue;
+            }
+
+            if (state.Escaped)
+            {
+                state.Escaped = false;
+                value = value switch
+                {
+                    SlipEscEnd => SlipEnd,
+                    SlipEscEsc => SlipEsc,
+                    _ => value
+                };
+            }
+            else if (value == SlipEsc)
+            {
+                state.Escaped = true;
+                continue;
+            }
+
+            state.Frame.Add(value);
+            if (state.Frame.Count > MaxSlipFrameBytes)
+            {
+                state.Reset();
+            }
+        }
+    }
+
+    private sealed class SlipDecodeState
+    {
+        public List<byte> Frame { get; } = [];
+        public bool Escaped { get; set; }
+
+        public void Reset()
+        {
+            Frame.Clear();
+            Escaped = false;
+        }
+    }
+}
+
 public sealed class Win32SerialPortEndpointFactory : ISerialPortEndpointFactory
 {
     public ISerialPortEndpoint Open(string portName) => Win32SerialPortEndpoint.Open(portName);
@@ -534,6 +824,9 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     private const uint FileShareWrite = 0x00000002;
     private const uint OpenExisting = 3;
     private const uint FileAttributeNormal = 0x00000080;
+    private const uint SerialReadPollTimeoutMs = 10;
+    private static readonly TimeSpan ZeroWriteRetryInterval = TimeSpan.FromMilliseconds(10);
+    private static readonly TimeSpan ZeroWriteTimeout = TimeSpan.FromMilliseconds(500);
 
     private readonly SafeFileHandle _handle;
 
@@ -572,7 +865,7 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         {
             ReadIntervalTimeout = uint.MaxValue,
             ReadTotalTimeoutMultiplier = 0,
-            ReadTotalTimeoutConstant = 200,
+            ReadTotalTimeoutConstant = SerialReadPollTimeoutMs,
             WriteTotalTimeoutMultiplier = 0,
             WriteTotalTimeoutConstant = 2000
         };
@@ -606,6 +899,7 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         {
             cancellationToken.ThrowIfCancellationRequested();
             var offset = 0;
+            long? zeroWriteDeadline = null;
             while (offset < bytes.Length)
             {
                 var remaining = bytes.Length - offset;
@@ -618,12 +912,45 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
 
                 if (written <= 0)
                 {
-                    throw new IOException("Serial port write completed with zero bytes.");
+                    zeroWriteDeadline ??= Stopwatch.GetTimestamp() + (long)(ZeroWriteTimeout.TotalSeconds * Stopwatch.Frequency);
+                    if (Stopwatch.GetTimestamp() >= zeroWriteDeadline)
+                    {
+                        throw new SerialPortWriteTimeoutException("Serial port write completed with zero bytes.");
+                    }
+
+                    SleepBeforeRetry(cancellationToken);
+                    continue;
                 }
 
                 offset += written;
+                zeroWriteDeadline = null;
             }
         }, cancellationToken);
+    }
+
+    private static void SleepBeforeRetry(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (cancellationToken.WaitHandle.WaitOne(ZeroWriteRetryInterval))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+    }
+
+    public SerialPortSnapshot GetSnapshot()
+    {
+        if (!GetCommModemStatus(_handle, out var modemStatus))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        var dcb = new Dcb { DCBlength = (uint)Marshal.SizeOf<Dcb>() };
+        if (!GetCommState(_handle, ref dcb))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        return new SerialPortSnapshot(modemStatus, dcb.BaudRate, dcb.ByteSize, dcb.Parity, dcb.StopBits);
     }
 
     public void Dispose()
@@ -641,6 +968,26 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         public uint WriteTotalTimeoutConstant;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Dcb
+    {
+        public uint DCBlength;
+        public uint BaudRate;
+        public uint Flags;
+        public ushort WReserved;
+        public ushort XonLim;
+        public ushort XoffLim;
+        public byte ByteSize;
+        public byte Parity;
+        public byte StopBits;
+        public sbyte XonChar;
+        public sbyte XoffChar;
+        public sbyte ErrorChar;
+        public sbyte EofChar;
+        public sbyte EvtChar;
+        public ushort WReserved1;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern SafeFileHandle CreateFileW(
         string lpFileName,
@@ -653,6 +1000,12 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetCommTimeouts(SafeFileHandle hFile, ref CommTimeouts lpCommTimeouts);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetCommState(SafeFileHandle hFile, ref Dcb lpDCB);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetCommModemStatus(SafeFileHandle hFile, out uint lpModemStat);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(

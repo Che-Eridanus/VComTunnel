@@ -12,6 +12,8 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("COM backing port is accepted", () => Task.Run(ComBackingPortIsAccepted)),
     ("config round trip", ConfigRoundTripAsync),
     ("com0com create hints", () => Task.Run(Com0comCreateHints)),
+    ("com0com service maps peer modem signals", () => Task.Run(Com0comServiceMapsPeerModemSignals)),
+    ("esptool baud monitor waits for response", () => Task.Run(EspToolBaudMonitorWaitsForResponse)),
     ("KMDF control path uses visible COM", () => Task.Run(KmdfControlPathUsesVisibleCom)),
     ("KMDF pnputil CSV parser finds VComTunnel ports", () => Task.Run(KmdfPnpUtilCsvParserFindsPorts)),
     ("RFC2217 command encoding", () => Task.Run(Rfc2217CommandEncoding)),
@@ -166,6 +168,39 @@ static void Com0comCreateHints()
 
     var serviceHint = builder.BuildCom0comCreateHint(mapping with { Backend = TunnelBackend.Com0comService });
     AssertEqual("setupc.exe install PortName=COM12 PortName=CNCB12", serviceHint);
+}
+
+static void Com0comServiceMapsPeerModemSignals()
+{
+    AssertTrue(!Com0comServiceTunnelSession.MapCom0comPeerDtr(0), "No DSR should map to peer DTR off.");
+    AssertTrue(!Com0comServiceTunnelSession.MapCom0comPeerRts(0), "No CTS should map to peer RTS off.");
+    AssertTrue(
+        Com0comServiceTunnelSession.MapCom0comPeerDtr(SerialPortSnapshot.Dsr),
+        "Backing DSR should map to visible-side DTR on.");
+    AssertTrue(
+        Com0comServiceTunnelSession.MapCom0comPeerRts(SerialPortSnapshot.Cts),
+        "Backing CTS should map to visible-side RTS on.");
+}
+
+static void EspToolBaudMonitorWaitsForResponse()
+{
+    var monitor = new EspToolBaudRateMonitor();
+    var request = SlipFrame(
+        0x00, 0x0F,
+        0x08, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x08, 0x07, 0x00,
+        0x00, 0xC2, 0x01, 0x00);
+    var response = SlipFrame(
+        0x01, 0x0F,
+        0x02, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00);
+
+    AssertEqual("460800", monitor.ObserveOutbound(request, 0, request.Length)?.ToString() ?? "");
+    AssertTrue(monitor.ObserveInbound([0x55, 0xAA], 0, 2) is null, "Non-SLIP data must not confirm a baud change.");
+    AssertEqual("460800", monitor.ObserveInbound(response, 0, response.Length)?.ToString() ?? "");
+    AssertTrue(monitor.ObserveInbound(response, 0, response.Length) is null, "Response without a pending request must be ignored.");
 }
 
 static void KmdfControlPathUsesVisibleCom()
@@ -1177,6 +1212,31 @@ static void AssertBytes(byte[] expected, byte[] actual)
     {
         throw new Exception($"Expected {Convert.ToHexString(expected)}, got {Convert.ToHexString(actual)}.");
     }
+}
+
+static byte[] SlipFrame(params byte[] payload)
+{
+    var bytes = new List<byte> { 0xC0 };
+    foreach (var value in payload)
+    {
+        if (value == 0xC0)
+        {
+            bytes.Add(0xDB);
+            bytes.Add(0xDC);
+        }
+        else if (value == 0xDB)
+        {
+            bytes.Add(0xDB);
+            bytes.Add(0xDD);
+        }
+        else
+        {
+            bytes.Add(value);
+        }
+    }
+
+    bytes.Add(0xC0);
+    return bytes.ToArray();
 }
 
 static void AssertRfc2217Notifications(byte[] frame, params Rfc2217Notification[] expected)

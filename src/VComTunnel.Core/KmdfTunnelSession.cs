@@ -734,7 +734,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 _log.Info(_mapping.Name, $"RFC2217 set baud {baudRate}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetBaudRate(baudRate),
-                    [new Rfc2217ExpectedAck(Rfc2217Client.AckSetBaudRate, Rfc2217Client.BuildUInt32Payload(baudRate), AllowAcceptedValue: true)],
+                    [],
                     "baud-rate");
 
             case EventTypeSetLineControl:
@@ -745,11 +745,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 _log.Info(_mapping.Name, $"RFC2217 set line data={wordLength}, parity={parity}, stop={stopBits}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetLineControl(stopBits, parity, wordLength),
-                    [
-                        new Rfc2217ExpectedAck(Rfc2217Client.AckSetDataSize, [wordLength], AllowAcceptedValue: true),
-                        new Rfc2217ExpectedAck(Rfc2217Client.AckSetParity, [Rfc2217Client.MapWindowsParityToRfc2217(parity)], AllowAcceptedValue: true),
-                        new Rfc2217ExpectedAck(Rfc2217Client.AckSetStopSize, [Rfc2217Client.MapWindowsStopBitsToRfc2217(stopBits)], AllowAcceptedValue: true)
-                    ],
+                    [],
                     "line-control");
 
             case EventTypeSetModemControl:
@@ -760,9 +756,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 _log.Info(_mapping.Name, $"RFC2217 set modem dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetModemControl(dtr, rts),
-                    BuildSetControlAcks(
-                        dtr is null ? null : dtr.Value ? (byte)8 : (byte)9,
-                        rts is null ? null : rts.Value ? (byte)11 : (byte)12),
+                    [],
                     "modem-control");
 
             case EventTypeSetHandflow:
@@ -772,10 +766,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 _log.Info(_mapping.Name, $"RFC2217 set handflow control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetHandflow(controlHandshake, flowReplace),
-                    BuildSetControlAcks(
-                        true,
-                        Rfc2217Client.MapOutboundFlowControl(controlHandshake, flowReplace),
-                        Rfc2217Client.MapInboundFlowControl(controlHandshake, flowReplace)),
+                    [],
                     "handflow");
 
             case EventTypeSetBreak:
@@ -784,7 +775,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 _log.Info(_mapping.Name, $"RFC2217 set break {breakEnabled}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetBreak(breakEnabled),
-                    [new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [breakEnabled ? (byte)5 : (byte)6])],
+                    [],
                     "break");
 
             case EventTypePurge:
@@ -794,7 +785,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 var purgeFrame = Rfc2217Client.BuildPurge(purgeMask);
                 return new Rfc2217OutboundFrame(
                     purgeFrame,
-                    purgeFrame.Length == 0 ? [] : [new Rfc2217ExpectedAck(Rfc2217Client.AckPurgeData, [Rfc2217Client.MapPurge(purgeMask)])],
+                    [],
                     "purge");
 
             case EventTypeLocalFlowControl:
@@ -820,19 +811,6 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             default:
                 throw new InvalidOperationException($"KMDF driver returned unsupported event type {type}.");
         }
-    }
-
-    private static Rfc2217ExpectedAck[] BuildSetControlAcks(params byte?[] values)
-    {
-        return BuildSetControlAcks(allowAcceptedFlowControl: false, values);
-    }
-
-    private static Rfc2217ExpectedAck[] BuildSetControlAcks(bool allowAcceptedFlowControl, params byte?[] values)
-    {
-        return values
-            .Where(value => value is not null)
-            .Select(value => new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [value!.Value], AllowAcceptedValue: allowAcceptedFlowControl))
-            .ToArray();
     }
 
     private static void EnsurePayload(ushort type, int actualLength, int minimumLength)
