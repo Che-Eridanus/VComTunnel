@@ -368,6 +368,14 @@ static void Rfc2217TelnetParser()
     AssertEqual("2", unsupportedNegotiation.TelnetOptions.Count.ToString());
     AssertTrue(unsupportedNegotiation.TelnetOptions.All(option => option.Rejected), "Unsupported Telnet options should be reported as rejected.");
 
+    var echoClient = new Rfc2217Client();
+    var remoteEcho = echoClient.ProcessNetworkBytes([0xFF, 0xFB, 0x01], 3);
+    AssertBytes([0xFF, 0xFD, 0x01], remoteEcho.Replies);
+    AssertEqual("WILL ECHO accepted", remoteEcho.TelnetOptions.Single().Describe());
+    var localEcho = echoClient.ProcessNetworkBytes([0xFF, 0xFD, 0x01], 3);
+    AssertBytes([0xFF, 0xFC, 0x01], localEcho.Replies);
+    AssertEqual("DO ECHO rejected", localEcho.TelnetOptions.Single().Describe());
+
     var repeatClient = new Rfc2217Client();
     AssertBytes([0xFF, 0xFD, 0x2C], repeatClient.ProcessNetworkBytes([0xFF, 0xFB, 0x2C], 3).Replies);
     AssertBytes([], repeatClient.ProcessNetworkBytes([0xFF, 0xFB, 0x2C], 3).Replies);

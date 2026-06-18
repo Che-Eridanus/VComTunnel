@@ -76,10 +76,10 @@ Current implementation note:
 - It opens the private control channel, sends `ATTACH`, waits for driver events,
   writes serial bytes and RFC2217 control frames to the TCP stream, reads TCP
   bytes, and sends `PUSH_RX` or modem/line-state updates back to the driver.
-- RFC2217/Telnet support covers the hub4com client-mode baseline: binary and
-  COM-PORT-OPTION negotiation, IAC escaping, baud-rate, data-size, parity,
-  stop-size, DTR/RTS, BREAK, flow-control, purge, NOTIFY-LINESTATE, and
-  NOTIFY-MODEMSTATE.
+- RFC2217/Telnet support covers the hub4com client-mode baseline: binary,
+  remote ECHO acceptance, COM-PORT-OPTION negotiation, IAC escaping,
+  baud-rate, data-size, parity, stop-size, DTR/RTS, BREAK, flow-control, purge,
+  NOTIFY-LINESTATE, and NOTIFY-MODEMSTATE.
 - RFC2217 command ACK correlation is implemented for outbound serial controls.
   The service waits up to 2 seconds for the expected ACK command, retries once
   on timeout, and faults the tunnel if the peer rejects strict control/purge

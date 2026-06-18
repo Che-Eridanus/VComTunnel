@@ -1187,7 +1187,7 @@ internal static class FakeRfc2217EchoServer
         {
             using var client = await listener.AcceptTcpClientAsync(cancellationToken);
             await using var stream = client.GetStream();
-            var negotiation = new byte[] { 255, 251, 44, 255, 253, 0, 255, 251, 0 };
+            var negotiation = new byte[] { 255, 251, 44, 255, 251, 1, 255, 253, 0, 255, 251, 0 };
             await stream.WriteAsync(negotiation, cancellationToken);
             await stream.FlushAsync(cancellationToken);
 
@@ -1203,9 +1203,10 @@ internal static class FakeRfc2217EchoServer
                 }
 
                 var frame = parser.ProcessNetworkBytes(buffer, read);
-                if (frame.Replies.Length > 0)
+                var replies = FilterFakeServerReplies(frame.Replies);
+                if (replies.Length > 0)
                 {
-                    await stream.WriteAsync(frame.Replies, cancellationToken);
+                    await stream.WriteAsync(replies, cancellationToken);
                 }
 
                 foreach (var notification in frame.Notifications)
@@ -1262,6 +1263,26 @@ internal static class FakeRfc2217EchoServer
         }
 
         return BuildServerFrame(command, payload);
+    }
+
+    private static byte[] FilterFakeServerReplies(byte[] replies)
+    {
+        var filtered = new List<byte>(replies.Length);
+        for (var i = 0; i < replies.Length; i++)
+        {
+            if (i + 2 < replies.Length &&
+                replies[i] == 255 &&
+                replies[i + 1] == Rfc2217Client.TelnetCommandWont &&
+                replies[i + 2] == Rfc2217Client.TelnetOptionEcho)
+            {
+                i += 2;
+                continue;
+            }
+
+            filtered.Add(replies[i]);
+        }
+
+        return filtered.ToArray();
     }
 
     private static byte[] BuildServerAckPayload(Rfc2217Notification notification)
