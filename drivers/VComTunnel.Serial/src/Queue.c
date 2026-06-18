@@ -955,7 +955,7 @@ VctPushRx(
     UCHAR* readBuffer = NULL;
     size_t readBufferLength = 0;
 
-    status = WdfRequestRetrieveInputBuffer(Request, sizeof(*push), (PVOID*)&push, &inputLength);
+    status = WdfRequestRetrieveInputBuffer(Request, FIELD_OFFSET(VCT_PUSH_RX, Bytes), (PVOID*)&push, &inputLength);
     if (!NT_SUCCESS(status)) {
         return status;
     }

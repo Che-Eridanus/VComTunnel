@@ -74,7 +74,15 @@ using var serial = NativeSerial.Open(options.PortName);
 var controlTxBytes = 0;
 if (options.ControlIoctls)
 {
-    controlTxBytes = await ExerciseControlIoctlsAsync(serial, probe, options.ExpectEcho, TimeSpan.FromSeconds(options.ReadSeconds), cts.Token);
+    try
+    {
+        controlTxBytes = await ExerciseControlIoctlsAsync(serial, probe, options.ExpectEcho, TimeSpan.FromSeconds(options.ReadSeconds), cts.Token);
+    }
+    catch
+    {
+        DumpLogs(log);
+        throw;
+    }
 }
 
 try
@@ -93,7 +101,7 @@ Console.WriteLine($"inQueue after read: {serial.GetInQueue()}");
 
 Console.WriteLine($"tx: {Convert.ToHexString(payload)}");
 Console.WriteLine($"rx: {Convert.ToHexString(received)}");
-var entries = log.Snapshot(20);
+var entries = log.Snapshot(80);
 DumpLogEntries(entries);
 
 var hasTx = entries.Any(entry => entry.Message.Contains("KMDF TX event", StringComparison.OrdinalIgnoreCase));
@@ -425,7 +433,7 @@ static void DumpProbeExchange(Rfc2217ProbeExchange exchange)
     }
 }
 
-static void DumpLogs(InMemoryLog log) => DumpLogEntries(log.Snapshot(20));
+static void DumpLogs(InMemoryLog log) => DumpLogEntries(log.Snapshot(80));
 
 static async Task<int> ExerciseControlIoctlsAsync(
     NativeSerial serial,
@@ -497,6 +505,41 @@ static async Task<int> ExerciseControlIoctlsAsync(
         throw new InvalidOperationException($"Raw modem control mismatch: 0x{rawModemControl:X8}.");
     }
 
+    var dtrRts = serial.GetDtrRts();
+    if ((dtrRts & (NativeSerial.DtrState | NativeSerial.RtsState)) != (NativeSerial.DtrState | NativeSerial.RtsState))
+    {
+        throw new InvalidOperationException($"DTR/RTS state mismatch after raw modem control: 0x{dtrRts:X8}.");
+    }
+
+    serial.ClearDtr();
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [9],
+        "SET-CONTROL DTR off",
+        readTimeout,
+        cancellationToken);
+    serial.SetDtr();
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [8],
+        "SET-CONTROL DTR on",
+        readTimeout,
+        cancellationToken);
+    serial.ClearRts();
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [12],
+        "SET-CONTROL RTS off",
+        readTimeout,
+        cancellationToken);
+    serial.SetRts();
+    await WaitForRfc2217Async(
+        probe,
+        notification => notification.Command == setControl && notification.Payload is [11],
+        "SET-CONTROL RTS on",
+        readTimeout,
+        cancellationToken);
+
     serial.SetHandflow(controlHandshake: 0x20, flowReplace: 0x80);
     await WaitForRfc2217Async(
         probe,
@@ -540,7 +583,7 @@ static async Task<int> ExerciseControlIoctlsAsync(
     {
         throw new InvalidOperationException($"Expected immediate empty read after purge, got {Convert.ToHexString(emptyRead)}.");
     }
-    Console.WriteLine("read timeout: immediate empty read returned 0 byte(s).");
+    Console.WriteLine($"read timeout: immediate empty read returned 0 byte(s), inQueue={serial.GetInQueue()}.");
 
     serial.SetXoff();
     await WaitForRfc2217Async(
@@ -706,6 +749,8 @@ internal sealed class NativeSerial : IDisposable
     public const uint McrDtr = 0x00000001;
     public const uint McrRts = 0x00000002;
     public const uint McrLoop = 0x00000010;
+    public const uint DtrState = 0x00000001;
+    public const uint RtsState = 0x00000002;
     public const uint PurgeTxClear = 0x00000004;
     public const uint PurgeRxClear = 0x00000008;
     public const uint ExpectedRemoteModemStatus = 0x000000F0;
@@ -904,9 +949,36 @@ internal sealed class NativeSerial : IDisposable
         return BitConverter.ToUInt32(output);
     }
 
+    public uint GetDtrRts()
+    {
+        var output = new byte[4];
+        DeviceIoControlChecked(IoctlSerialGetDtrRts, null, output, "IOCTL_SERIAL_GET_DTRRTS");
+        return BitConverter.ToUInt32(output);
+    }
+
     public void SetRawModemControl(uint modemControl)
     {
         DeviceIoControlChecked(IoctlSerialSetModemControl, BitConverter.GetBytes(modemControl), null, "IOCTL_SERIAL_SET_MODEM_CONTROL");
+    }
+
+    public void SetDtr()
+    {
+        DeviceIoControlChecked(IoctlSerialSetDtr, null, null, "IOCTL_SERIAL_SET_DTR");
+    }
+
+    public void ClearDtr()
+    {
+        DeviceIoControlChecked(IoctlSerialClrDtr, null, null, "IOCTL_SERIAL_CLR_DTR");
+    }
+
+    public void SetRts()
+    {
+        DeviceIoControlChecked(IoctlSerialSetRts, null, null, "IOCTL_SERIAL_SET_RTS");
+    }
+
+    public void ClearRts()
+    {
+        DeviceIoControlChecked(IoctlSerialClrRts, null, null, "IOCTL_SERIAL_CLR_RTS");
     }
 
     public void SetXoff()
@@ -990,10 +1062,15 @@ internal sealed class NativeSerial : IDisposable
     private const uint IoctlSerialSetBreakOff = (0x1Bu << 16) | (5u << 2);
     private const uint IoctlSerialImmediateChar = (0x1Bu << 16) | (6u << 2);
     private const uint IoctlSerialSetTimeouts = (0x1Bu << 16) | (7u << 2);
+    private const uint IoctlSerialSetDtr = (0x1Bu << 16) | (9u << 2);
+    private const uint IoctlSerialClrDtr = (0x1Bu << 16) | (10u << 2);
+    private const uint IoctlSerialSetRts = (0x1Bu << 16) | (12u << 2);
+    private const uint IoctlSerialClrRts = (0x1Bu << 16) | (13u << 2);
     private const uint IoctlSerialSetXoff = (0x1Bu << 16) | (14u << 2);
     private const uint IoctlSerialSetXon = (0x1Bu << 16) | (15u << 2);
     private const uint IoctlSerialPurge = (0x1Bu << 16) | (19u << 2);
     private const uint IoctlSerialSetHandflow = (0x1Bu << 16) | (25u << 2);
+    private const uint IoctlSerialGetDtrRts = (0x1Bu << 16) | (30u << 2);
     private const uint IoctlSerialGetModemStatus = (0x1Bu << 16) | (26u << 2);
     private const uint IoctlSerialGetCommStatus = (0x1Bu << 16) | (27u << 2);
     private const uint IoctlSerialConfigSize = (0x1Bu << 16) | (32u << 2);

@@ -526,7 +526,7 @@ public sealed class KmdfTunnelSession : IDisposable
                 {
                     await WriteNetworkAsync(stream, Rfc2217Client.BuildLocalFlowControlSuspend()).ConfigureAwait(false);
                     suspended = true;
-                    _log.Warn(_mapping.Name, "Driver RX buffer full; sent RFC2217 FLOWCONTROL-SUSPEND.");
+                    _log.Warn(_mapping.Name, $"Driver RX push returned backpressure error {error}; sent RFC2217 FLOWCONTROL-SUSPEND.");
                 }
 
                 await Task.Delay(RxBackpressureRetryInterval, _stop.Token).ConfigureAwait(false);
