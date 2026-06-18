@@ -1240,8 +1240,12 @@ VctEvtIoWrite(
         serviceWait = context->PendingServiceWait;
         context->PendingServiceWait = NULL;
     } else if (context->ServiceAttached) {
-        copied = VctTxCopyInLocked(context, inputBuffer, (ULONG)inputLength);
-        status = copied == inputLength ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL;
+        if (inputLength > (VCOMTUNNEL_TX_QUEUE_SIZE - context->TxCount)) {
+            status = STATUS_BUFFER_OVERFLOW;
+        } else {
+            copied = VctTxCopyInLocked(context, inputBuffer, (ULONG)inputLength);
+            status = copied == inputLength ? STATUS_SUCCESS : STATUS_BUFFER_OVERFLOW;
+        }
     }
     WdfSpinLockRelease(context->Lock);
 

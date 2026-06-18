@@ -151,6 +151,9 @@ Current M2 behavior:
 
 - `TxData` writes complete when the driver has copied bytes into a pending
   service `WAIT_EVENT` output buffer.
+- If no service wait is pending, serial writes are queued only when the complete
+  write fits in the TX ring; a full queue fails without copying a partial frame
+  so user-mode retries cannot duplicate bytes.
 - `COMPLETE_EVENT` is reserved for the next step where write completion waits
   for user-mode RFC2217 acceptance.
 
