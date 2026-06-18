@@ -149,9 +149,10 @@ com2tcp-rfc2217.bat \\.\CNCB12 192.168.1.50 5000
 
 This mirrors the known hub4com RFC2217 client pattern and keeps baud-rate and line-control negotiation inside the wrapper.
 
-## Real device bring-up
+## Phase 1 real device bring-up
 
-After installing external dependencies and creating the com0com pair:
+For a `com0comHub4com` mapping, install external dependencies and create the
+com0com pair first:
 
 1. Run `vcomtunnelctl diagnose` until `com0com/hub4com ready` is `True`.
 2. Start `VComTunnel.Service`.
@@ -159,7 +160,8 @@ After installing external dependencies and creating the com0com pair:
 4. Start the mapping from GUI or `vcomtunnelctl start <mappingId>`.
 5. Open the visible `COMx` with a serial terminal or flashing tool and verify data, baud-rate changes, DTR/RTS, and reconnect behavior.
 
-Current stopping point without external integration: this repo can build, validate configs, run the service API, manage mappings, diagnose missing dependencies, and start/stop a fake `com2tcp-rfc2217` process. A real end-to-end serial session requires externally installed com0com/hub4com plus an RFC2217 endpoint.
+This path intentionally still depends on externally installed com0com/hub4com
+or the bundled dependency archive plus an interactive elevated driver install.
 
 ## Phase 2 KMDF backend
 
@@ -179,8 +181,9 @@ Current status is still experimental: the WDK project produces a test-signed
 negotiation plus baud-rate, line-control, DTR/RTS, BREAK, flow-control, purge,
 command ACK correlation with accepted-value validation and timeout retry,
 startup line/modem mask ACK validation, remote flow-control suspend/resume
-handling, SIGNATURE request response, serialized Telnet/RFC2217 writes with idle
-NOP keep-alive, modem/line notification handling, and basic wait-mask
-notifications for RX, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events.
+handling, local RX backpressure through RFC2217 FLOWCONTROL-SUSPEND/RESUME,
+SIGNATURE request response, serialized Telnet/RFC2217 writes with idle NOP
+keep-alive, modem/line notification handling, and basic wait-mask notifications
+for RX, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and ERR events.
 Remaining hardening work is broader serial compatibility coverage and live ESP-DAP
 compatibility validation against real tools.
