@@ -97,8 +97,8 @@ public sealed class Rfc2217Client
     {
         return
         [
-            new(AckSetLineStateMask, [LineStateErrorMask]),
-            new(AckSetModemStateMask, [ModemStateMask])
+            new(AckSetLineStateMask, [LineStateErrorMask], AllowPayloadBitSubset: true),
+            new(AckSetModemStateMask, [ModemStateMask], AllowPayloadBitSubset: true)
         ];
     }
 
@@ -497,11 +497,23 @@ public sealed record Rfc2217Frame(byte[] SerialData, byte[] Replies, IReadOnlyLi
 
 public sealed record Rfc2217Notification(byte Command, byte[] Payload);
 
-public sealed record Rfc2217ExpectedAck(byte Command, byte[] Payload)
+public sealed record Rfc2217ExpectedAck(byte Command, byte[] Payload, bool AllowPayloadBitSubset = false)
 {
     public bool Matches(Rfc2217Notification notification)
     {
-        return notification.Command == Command && Payload.SequenceEqual(notification.Payload);
+        if (notification.Command != Command)
+        {
+            return false;
+        }
+
+        if (Payload.SequenceEqual(notification.Payload))
+        {
+            return true;
+        }
+
+        return AllowPayloadBitSubset &&
+            notification.Payload.Length == Payload.Length &&
+            Payload.Zip(notification.Payload).All(pair => (pair.Second & ~pair.First) == 0);
     }
 
     public bool IsSameCommand(Rfc2217Notification notification)

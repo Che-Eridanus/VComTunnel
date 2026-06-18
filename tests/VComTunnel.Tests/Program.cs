@@ -197,6 +197,12 @@ static void Rfc2217CommandEncoding()
     AssertTrue(
         initialAcks[1].Matches(new Rfc2217Notification(Rfc2217Client.AckSetModemStateMask, [0xFF])),
         "Initial modem-state mask ACK should require the configured modem mask.");
+    AssertTrue(
+        initialAcks[0].Matches(new Rfc2217Notification(Rfc2217Client.AckSetLineStateMask, [0x0E])),
+        "Initial line-state mask ACK may be a subset of the requested events.");
+    AssertTrue(
+        !initialAcks[0].Matches(new Rfc2217Notification(Rfc2217Client.AckSetLineStateMask, [0x20])),
+        "Initial line-state mask ACK must not accept bits that were not requested.");
 
     AssertBytes(
         [0xFF, 0xFA, 0x2C, 0x01, 0x00, 0x01, 0xC2, 0x00, 0xFF, 0xF0],

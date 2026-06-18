@@ -90,7 +90,8 @@ Current implementation note:
 - The service requires driver protocol 1.1 so remote accepted settings can use
   `IOCTL_VCOMTUNNEL_SET_REMOTE_SETTINGS`.
 - Startup sends the initial line-state and modem-state masks and waits for
-  their ACKs before the mapping is reported as running.
+  their ACKs before the mapping is reported as running. Accepted mask ACKs may
+  be subsets of the requested masks, matching hub4com/RFC2217 server behavior.
 - RFC2217 SIGNATURE requests are answered with the VComTunnel client signature.
 - RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and control commands
   until FLOWCONTROL-RESUME is received.
