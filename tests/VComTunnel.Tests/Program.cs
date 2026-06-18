@@ -275,6 +275,18 @@ static void Rfc2217CommandEncoding()
         new Rfc2217Notification(5, [7]),
         new Rfc2217Notification(5, [10]),
         new Rfc2217Notification(5, [13]));
+
+    AssertRfc2217Notifications(
+        Rfc2217Client.BuildStartupStatusQuery(),
+        new Rfc2217Notification(1, [0x00, 0x00, 0x00, 0x00]),
+        new Rfc2217Notification(2, [0]),
+        new Rfc2217Notification(3, [0]),
+        new Rfc2217Notification(4, [0]),
+        new Rfc2217Notification(5, [0]),
+        new Rfc2217Notification(5, [4]),
+        new Rfc2217Notification(5, [7]),
+        new Rfc2217Notification(5, [10]),
+        new Rfc2217Notification(5, [13]));
 }
 
 static void Hub4comRfc2217ClientBaseline()

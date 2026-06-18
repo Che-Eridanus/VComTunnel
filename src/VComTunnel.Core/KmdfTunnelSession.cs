@@ -122,6 +122,12 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 Rfc2217Client.BuildInitialExpectedAcks(),
                 "initial-negotiation",
                 ContinueOnAckTimeout: true)).ConfigureAwait(false);
+        await SendFrameWithAckAsync(
+            stream,
+            new Rfc2217OutboundFrame(
+                Rfc2217Client.BuildStartupStatusQuery(),
+                [],
+                "startup-status-query")).ConfigureAwait(false);
 
         SetConnectionState(2);
         State = TunnelRunState.Running;

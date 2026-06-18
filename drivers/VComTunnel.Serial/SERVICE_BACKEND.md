@@ -104,7 +104,9 @@ Current implementation note:
 - Startup sends hub4com-style full line-state and modem-state masks and waits
   for their ACKs before the mapping is reported as running. Accepted mask ACKs
   may be subsets of the requested masks, matching hub4com/RFC2217 server
-  behavior.
+  behavior. Startup then sends non-blocking serial/control status queries;
+  serial-setting responses update the driver's remote-settings cache when the
+  peer returns accepted values.
 - RFC2217 SIGNATURE requests are answered with the VComTunnel client signature.
 - Known RFC2217 subnegotiations are validated for their expected payload length
   before service-side handling; malformed known commands are ignored and any

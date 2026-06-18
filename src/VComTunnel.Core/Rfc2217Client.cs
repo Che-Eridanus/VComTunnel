@@ -272,6 +272,13 @@ public sealed class Rfc2217Client
             BuildSetControl(13));
     }
 
+    public static byte[] BuildStartupStatusQuery()
+    {
+        return Combine(
+            BuildQuerySerialSettings(),
+            BuildQueryControlState());
+    }
+
     public static byte[] BuildSetModemControl(bool? dtr, bool? rts)
     {
         var frames = new List<byte[]>();
