@@ -188,6 +188,14 @@ static void Rfc2217CommandEncoding()
             0xFF, 0xFA, 0x2C, 0x0B, 0xFF, 0xFF, 0xFF, 0xF0
         ],
         new Rfc2217Client().BuildInitialNegotiation());
+    var initialAcks = Rfc2217Client.BuildInitialExpectedAcks();
+    AssertEqual("2", initialAcks.Length.ToString());
+    AssertTrue(
+        initialAcks[0].Matches(new Rfc2217Notification(Rfc2217Client.AckSetLineStateMask, [0x1E])),
+        "Initial line-state mask ACK should require the configured error mask.");
+    AssertTrue(
+        initialAcks[1].Matches(new Rfc2217Notification(Rfc2217Client.AckSetModemStateMask, [0xFF])),
+        "Initial modem-state mask ACK should require the configured modem mask.");
 
     AssertBytes(
         [0xFF, 0xFA, 0x2C, 0x01, 0x00, 0x01, 0xC2, 0x00, 0xFF, 0xF0],

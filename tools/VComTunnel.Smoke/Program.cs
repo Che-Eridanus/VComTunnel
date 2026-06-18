@@ -283,6 +283,7 @@ internal static class FakeRfc2217EchoServer
             await stream.WriteAsync(negotiation, cancellationToken);
             await stream.FlushAsync(cancellationToken);
 
+            var parser = new Rfc2217Client();
             var buffer = new byte[4096];
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -292,7 +293,27 @@ internal static class FakeRfc2217EchoServer
                     return;
                 }
 
-                await stream.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                var frame = parser.ProcessNetworkBytes(buffer, read);
+                if (frame.Replies.Length > 0)
+                {
+                    await stream.WriteAsync(frame.Replies, cancellationToken);
+                }
+
+                foreach (var notification in frame.Notifications)
+                {
+                    var ack = BuildServerAck(notification);
+                    if (ack.Length > 0)
+                    {
+                        await stream.WriteAsync(ack, cancellationToken);
+                    }
+                }
+
+                if (frame.SerialData.Length > 0)
+                {
+                    var echo = Rfc2217Client.EscapeSerialData(frame.SerialData, 0, frame.SerialData.Length);
+                    await stream.WriteAsync(echo, cancellationToken);
+                }
+
                 await stream.FlushAsync(cancellationToken);
             }
         }
@@ -300,5 +321,46 @@ internal static class FakeRfc2217EchoServer
         {
             listener.Stop();
         }
+    }
+
+    private static byte[] BuildServerAck(Rfc2217Notification notification)
+    {
+        var command = notification.Command switch
+        {
+            1 => Rfc2217Client.AckSetBaudRate,
+            2 => Rfc2217Client.AckSetDataSize,
+            3 => Rfc2217Client.AckSetParity,
+            4 => Rfc2217Client.AckSetStopSize,
+            5 => Rfc2217Client.AckSetControl,
+            10 => Rfc2217Client.AckSetLineStateMask,
+            11 => Rfc2217Client.AckSetModemStateMask,
+            12 => Rfc2217Client.AckPurgeData,
+            _ => (byte)0
+        };
+
+        if (command == 0)
+        {
+            return [];
+        }
+
+        var frame = new List<byte>(notification.Payload.Length + 5)
+        {
+            255,
+            250,
+            44,
+            command
+        };
+        foreach (var value in notification.Payload)
+        {
+            frame.Add(value);
+            if (value == 255)
+            {
+                frame.Add(255);
+            }
+        }
+
+        frame.Add(255);
+        frame.Add(240);
+        return frame.ToArray();
     }
 }

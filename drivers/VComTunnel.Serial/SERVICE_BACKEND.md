@@ -84,6 +84,8 @@ Current implementation note:
   The service waits for the expected ACK command and accepted value, retries
   once on timeout, and faults the tunnel if the peer rejects the value or does
   not acknowledge after retry.
+- Startup sends the initial line-state and modem-state masks and waits for
+  their ACKs before the mapping is reported as running.
 - RFC2217 FLOWCONTROL-SUSPEND pauses outbound serial data and control commands
   until FLOWCONTROL-RESUME is received.
 - Wait-mask notifications currently cover RXCHAR, CTS, DSR, RLSD, RING, BREAK,
@@ -101,6 +103,7 @@ POST /api/mappings/{id}/start
   -> send ATTACH
   -> verify returned PortName == mapping.visiblePort
   -> connect RFC2217 host:port
+  -> negotiate Telnet/RFC2217 and verify line/modem mask ACKs
   -> set driver connection state Online
   -> begin driver event loop
   -> return TunnelStatus.Running

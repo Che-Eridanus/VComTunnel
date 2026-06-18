@@ -86,14 +86,20 @@ public sealed class KmdfTunnelSession : IDisposable
             throw new IOException($"Could not connect to RFC2217 endpoint {_mapping.Host}:{_mapping.Port}: {ex.Message}", ex);
         }
 
-        await _tcp.GetStream().WriteAsync(_rfc2217.BuildInitialNegotiation(), cancellationToken).ConfigureAwait(false);
+        var stream = _tcp.GetStream();
+        _networkLoop = Task.Run(NetworkLoopAsync);
+        await SendFrameWithAckAsync(
+            stream,
+            new Rfc2217OutboundFrame(
+                _rfc2217.BuildInitialNegotiation(),
+                Rfc2217Client.BuildInitialExpectedAcks(),
+                "initial-negotiation")).ConfigureAwait(false);
 
         SetConnectionState(2);
         State = TunnelRunState.Running;
         _log.Info(_mapping.Name, $"Started KMDF tunnel {_mapping.VisiblePort} -> {_mapping.Host}:{_mapping.Port}.");
 
         _eventLoop = Task.Run(EventLoopAsync);
-        _networkLoop = Task.Run(NetworkLoopAsync);
     }
 
     public void Dispose()
@@ -350,6 +356,7 @@ public sealed class KmdfTunnelSession : IDisposable
     private void CompletePendingAck(Rfc2217Notification notification)
     {
         TaskCompletionSource? completion = null;
+        Exception? failure = null;
         lock (_ackLock)
         {
             var index = _pendingAcks.FindIndex(expected => expected.Matches(notification));
@@ -365,11 +372,21 @@ public sealed class KmdfTunnelSession : IDisposable
             else if (_pendingAcks.Any(expected => expected.IsSameCommand(notification)))
             {
                 var expected = string.Join(", ", _pendingAcks.Select(ack => ack.Describe()));
-                throw new IOException($"RFC2217 ack returned unexpected value {Rfc2217ExpectedAck.Describe(notification)}; expected {expected}.");
+                failure = new IOException($"RFC2217 ack returned unexpected value {Rfc2217ExpectedAck.Describe(notification)}; expected {expected}.");
+                completion = _pendingAckCompletion;
+                _pendingAcks.Clear();
+                _pendingAckCompletion = null;
             }
         }
 
-        completion?.TrySetResult();
+        if (failure is not null)
+        {
+            completion?.TrySetException(failure);
+        }
+        else
+        {
+            completion?.TrySetResult();
+        }
     }
 
     private Task WaitForRemoteFlowAsync()

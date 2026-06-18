@@ -34,6 +34,8 @@ public sealed class Rfc2217Client
     private const byte SetLineStateMask = 10;
     private const byte SetModemStateMask = 11;
     private const byte PurgeData = 12;
+    private const byte LineStateErrorMask = 0x1E;
+    private const byte ModemStateMask = 0xFF;
 
     private const uint SerialDtrHandshake = 0x02;
     private const uint SerialCtsHandshake = 0x08;
@@ -59,8 +61,17 @@ public sealed class Rfc2217Client
             Iac, Do, TelnetBinary,
             Iac, Will, SuppressGoAhead,
             Iac, Do, SuppressGoAhead,
-            .. BuildSetLineStateMask(0x1E),
-            .. BuildSetModemStateMask(255)
+            .. BuildSetLineStateMask(LineStateErrorMask),
+            .. BuildSetModemStateMask(ModemStateMask)
+        ];
+    }
+
+    public static Rfc2217ExpectedAck[] BuildInitialExpectedAcks()
+    {
+        return
+        [
+            new(AckSetLineStateMask, [LineStateErrorMask]),
+            new(AckSetModemStateMask, [ModemStateMask])
         ];
     }
 
