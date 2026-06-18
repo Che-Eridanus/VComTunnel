@@ -7,6 +7,12 @@ using VComTunnel.Core;
 
 var options = SmokeOptions.Parse(args);
 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(options.TimeoutSeconds));
+if (options.ProbeOnly)
+{
+    await ProbeRfc2217EndpointAsync(options, cts.Token);
+    return;
+}
+
 Task? server = null;
 FakeRfc2217Probe? probe = null;
 if (!options.Remote)
@@ -117,6 +123,102 @@ else if (options.Remote)
 else
 {
     throw new InvalidOperationException("RFC2217 smoke echo mismatch.");
+}
+
+static async Task ProbeRfc2217EndpointAsync(SmokeOptions options, CancellationToken cancellationToken)
+{
+    using var tcp = new TcpClient();
+    await tcp.ConnectAsync(options.Host, options.Port, cancellationToken);
+    using var stream = tcp.GetStream();
+
+    var client = new Rfc2217Client();
+    var initial = client.BuildInitialNegotiation();
+    var expectedAcks = Rfc2217Client.BuildInitialExpectedAcks().ToList();
+    var notifications = new List<Rfc2217Notification>();
+    var buffer = new byte[4096];
+    var receivedBytes = 0;
+    var replyBytes = 0;
+    var serialBytes = 0;
+
+    await stream.WriteAsync(initial, cancellationToken);
+    await stream.FlushAsync(cancellationToken);
+
+    var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(options.ReadSeconds);
+    while (DateTimeOffset.UtcNow < deadline && !cancellationToken.IsCancellationRequested)
+    {
+        var remaining = deadline - DateTimeOffset.UtcNow;
+        if (remaining <= TimeSpan.Zero)
+        {
+            break;
+        }
+
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        readCts.CancelAfter(remaining < TimeSpan.FromMilliseconds(250) ? remaining : TimeSpan.FromMilliseconds(250));
+
+        int read;
+        try
+        {
+            read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), readCts.Token);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            continue;
+        }
+
+        if (read == 0)
+        {
+            break;
+        }
+
+        receivedBytes += read;
+        var frame = client.ProcessNetworkBytes(buffer, read);
+        serialBytes += frame.SerialData.Length;
+
+        if (frame.Replies.Length > 0)
+        {
+            await stream.WriteAsync(frame.Replies, cancellationToken);
+            replyBytes += frame.Replies.Length;
+        }
+
+        foreach (var notification in frame.Notifications)
+        {
+            notifications.Add(notification);
+            var index = expectedAcks.FindIndex(expected => expected.Matches(notification));
+            if (index >= 0)
+            {
+                expectedAcks.RemoveAt(index);
+            }
+        }
+
+        if (expectedAcks.Count == 0)
+        {
+            break;
+        }
+    }
+
+    Console.WriteLine($"RFC2217 probe {options.Host}:{options.Port}");
+    Console.WriteLine($"sent initial negotiation: {initial.Length} byte(s)");
+    Console.WriteLine($"received: {receivedBytes} byte(s), telnet replies: {replyBytes} byte(s), serial data: {serialBytes} byte(s)");
+    Console.WriteLine("notifications:");
+    if (notifications.Count == 0)
+    {
+        Console.WriteLine("  none");
+    }
+    else
+    {
+        foreach (var notification in notifications)
+        {
+            Console.WriteLine($"  {Rfc2217ExpectedAck.Describe(notification)}");
+        }
+    }
+
+    if (expectedAcks.Count != 0)
+    {
+        var missing = string.Join(", ", expectedAcks.Select(ack => ack.Describe()));
+        throw new InvalidOperationException($"RFC2217 probe did not observe initial mask ACK(s): {missing}.");
+    }
+
+    Console.WriteLine("RFC2217 probe passed.");
 }
 
 static void DumpLogs(InMemoryLog log) => DumpLogEntries(log.Snapshot(20));
@@ -305,11 +407,13 @@ internal sealed record SmokeOptions(
     bool Remote,
     bool ExpectEcho,
     bool ControlIoctls,
+    bool ProbeOnly,
     int TimeoutSeconds,
     int ReadSeconds)
 {
     public static SmokeOptions Parse(string[] args)
     {
+        var probeOnly = args.Any(arg => string.Equals(arg, "--probe-rfc2217", StringComparison.OrdinalIgnoreCase));
         var remote = args.Any(arg => string.Equals(arg, "--remote", StringComparison.OrdinalIgnoreCase));
         var expectEcho = args.Any(arg => string.Equals(arg, "--expect-echo", StringComparison.OrdinalIgnoreCase)) || !remote;
         var skipControlIoctls = args.Any(arg => string.Equals(arg, "--no-control-ioctls", StringComparison.OrdinalIgnoreCase));
@@ -319,6 +423,19 @@ internal sealed record SmokeOptions(
             .Where(arg => !arg.StartsWith("--", StringComparison.Ordinal))
             .ToArray();
 
+        if (probeOnly)
+        {
+            if (values.Length < 2 || !int.TryParse(values[1], out var probePort) || probePort <= 0)
+            {
+                throw new ArgumentException("Usage: VComTunnel.Smoke --probe-rfc2217 10.0.2.196 5000 [seconds]");
+            }
+
+            var seconds = values.Length >= 3 && int.TryParse(values[2], out var parsedSeconds) && parsedSeconds > 0
+                ? parsedSeconds
+                : 5;
+            return new SmokeOptions("", values[0], probePort, true, false, false, true, seconds + 3, seconds);
+        }
+
         if (remote)
         {
             if (values.Length < 3 || !int.TryParse(values[2], out var remotePort) || remotePort <= 0)
@@ -326,7 +443,7 @@ internal sealed record SmokeOptions(
                 throw new ArgumentException("Usage: VComTunnel.Smoke --remote COM27 10.0.2.196 5000 [--expect-echo] [--control-ioctls]");
             }
 
-            return new SmokeOptions(values[0], values[1], remotePort, true, expectEcho, controlIoctls, 10, 2);
+            return new SmokeOptions(values[0], values[1], remotePort, true, expectEcho, controlIoctls, false, 10, 2);
         }
 
         var portName = values.FirstOrDefault() ?? "COM27";
@@ -336,7 +453,7 @@ internal sealed record SmokeOptions(
             tcpPort = 44000;
         }
 
-        return new SmokeOptions(portName, "127.0.0.1", tcpPort, false, expectEcho, controlIoctls, 10, 3);
+        return new SmokeOptions(portName, "127.0.0.1", tcpPort, false, expectEcho, controlIoctls, false, 10, 3);
     }
 }
 

@@ -35,6 +35,12 @@ XOFF/XON, immediate-char echo, and the RFC2217 frames emitted by those controls.
 The local fake server also injects RFC2217 modem/line-state notifications and
 checks that they appear through local serial status IOCTLs.
 Remote smoke skips those extra probes unless `--control-ioctls` is passed.
+When the KMDF driver is not installed or needs a protocol update, probe an
+RFC2217 endpoint directly without opening a COM port:
+
+```powershell
+dotnet run -c Release --project tools\VComTunnel.Smoke\VComTunnel.Smoke.csproj -- --probe-rfc2217 10.0.2.196 5000
+```
 
 ## Run
 
