@@ -20,6 +20,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("RFC2217 stream fragmentation", () => Task.Run(Rfc2217StreamFragmentation)),
     ("RFC2217 ack semantics", () => Task.Run(Rfc2217AckSemantics)),
     ("RFC2217 notification mappings", () => Task.Run(Rfc2217NotificationMappings)),
+    ("RFC2217 local flow-control depth", () => Task.Run(Rfc2217LocalFlowControlDepth)),
     ("com2tcp command uses batch wrapper", () => Task.Run(Com2TcpCommandUsesBatchWrapper)),
     ("missing dependencies fault mapping", MissingDependenciesFaultMappingAsync),
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
@@ -550,6 +551,22 @@ static void Rfc2217NotificationMappings()
     AssertEqual("192", Rfc2217Client.MapNotifyLineStateToWindowsEvents(0x1E).ToString());
     AssertEqual("5", Rfc2217Client.MapNotifyLineStateToWindowsEvents(0x61).ToString());
     AssertEqual("133", Rfc2217Client.MapNotifyLineStateToWindowsEvents(0xE1).ToString());
+}
+
+static void Rfc2217LocalFlowControlDepth()
+{
+    var state = new Rfc2217LocalFlowControlState();
+
+    AssertEqual(Rfc2217LocalFlowControlAction.Suspend.ToString(), state.Apply(suspend: true).ToString());
+    AssertEqual("1", state.SuspendDepth.ToString());
+    AssertEqual(Rfc2217LocalFlowControlAction.None.ToString(), state.Apply(suspend: true).ToString());
+    AssertEqual("2", state.SuspendDepth.ToString());
+    AssertEqual(Rfc2217LocalFlowControlAction.None.ToString(), state.Apply(suspend: false).ToString());
+    AssertEqual("1", state.SuspendDepth.ToString());
+    AssertEqual(Rfc2217LocalFlowControlAction.Resume.ToString(), state.Apply(suspend: false).ToString());
+    AssertEqual("0", state.SuspendDepth.ToString());
+    AssertEqual(Rfc2217LocalFlowControlAction.None.ToString(), state.Apply(suspend: false).ToString());
+    AssertEqual("0", state.SuspendDepth.ToString());
 }
 
 static void Com2TcpCommandUsesBatchWrapper()

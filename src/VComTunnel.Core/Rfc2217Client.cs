@@ -710,6 +710,45 @@ public sealed record Rfc2217Frame(
     IReadOnlyList<Rfc2217Notification> Notifications,
     IReadOnlyList<Rfc2217TelnetOptionEvent> TelnetOptions);
 
+public sealed class Rfc2217LocalFlowControlState
+{
+    private int _suspendDepth;
+
+    public int SuspendDepth => _suspendDepth;
+
+    public Rfc2217LocalFlowControlAction Apply(bool suspend)
+    {
+        if (suspend)
+        {
+            if (_suspendDepth < int.MaxValue)
+            {
+                _suspendDepth++;
+            }
+
+            return _suspendDepth == 1
+                ? Rfc2217LocalFlowControlAction.Suspend
+                : Rfc2217LocalFlowControlAction.None;
+        }
+
+        if (_suspendDepth == 0)
+        {
+            return Rfc2217LocalFlowControlAction.None;
+        }
+
+        _suspendDepth--;
+        return _suspendDepth == 0
+            ? Rfc2217LocalFlowControlAction.Resume
+            : Rfc2217LocalFlowControlAction.None;
+    }
+}
+
+public enum Rfc2217LocalFlowControlAction
+{
+    None,
+    Suspend,
+    Resume
+}
+
 public sealed record Rfc2217Notification(byte Command, byte[] Payload);
 
 public sealed record Rfc2217TelnetOptionEvent(byte Command, byte Option, bool Accepted)

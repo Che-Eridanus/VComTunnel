@@ -62,6 +62,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
     private readonly InMemoryLog _log;
     private readonly Action<IKmdfTunnelSession, string> _faulted;
     private readonly Rfc2217Client _rfc2217 = new();
+    private readonly Rfc2217LocalFlowControlState _localFlowControl = new();
     private readonly object _ackLock = new();
     private readonly List<Rfc2217ExpectedAck> _pendingAcks = [];
     private readonly object _flowLock = new();
@@ -773,11 +774,22 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             case EventTypeLocalFlowControl:
                 EnsurePayload(type, length, 4);
                 var suspend = buffer[offset] != 0;
-                _log.Info(_mapping.Name, $"RFC2217 local flow-control {(suspend ? "suspend" : "resume")}.");
+                var flowAction = _localFlowControl.Apply(suspend);
+                _log.Info(_mapping.Name, $"RFC2217 local flow-control {(suspend ? "suspend" : "resume")} depth={_localFlowControl.SuspendDepth}.");
                 return new Rfc2217OutboundFrame(
-                    suspend ? Rfc2217Client.BuildLocalFlowControlSuspend() : Rfc2217Client.BuildLocalFlowControlResume(),
+                    flowAction switch
+                    {
+                        Rfc2217LocalFlowControlAction.Suspend => Rfc2217Client.BuildLocalFlowControlSuspend(),
+                        Rfc2217LocalFlowControlAction.Resume => Rfc2217Client.BuildLocalFlowControlResume(),
+                        _ => []
+                    },
                     [],
-                    suspend ? "local-flow-control-suspend" : "local-flow-control-resume");
+                    flowAction switch
+                    {
+                        Rfc2217LocalFlowControlAction.Suspend => "local-flow-control-suspend",
+                        Rfc2217LocalFlowControlAction.Resume => "local-flow-control-resume",
+                        _ => "local-flow-control-coalesced"
+                    });
 
             default:
                 throw new InvalidOperationException($"KMDF driver returned unsupported event type {type}.");

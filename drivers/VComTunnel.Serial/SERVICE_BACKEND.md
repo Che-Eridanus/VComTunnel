@@ -113,8 +113,10 @@ Current implementation note:
   commands until FLOWCONTROL-RESUME is received. Telnet negotiation replies,
   RX-backpressure FLOWCONTROL frames, and idle NOP keep-alives are still allowed
   so the TCP/Telnet session can stay healthy while serial data is paused.
-- Local `IOCTL_SERIAL_SET_XOFF` and `IOCTL_SERIAL_SET_XON` requests are sent to
-  the RFC2217 endpoint as FLOWCONTROL-SUSPEND and FLOWCONTROL-RESUME.
+- Local `IOCTL_SERIAL_SET_XOFF` and `IOCTL_SERIAL_SET_XON` requests follow the
+  hub4com reference behavior: XOFF/XON are counted, only the first XOFF sends
+  RFC2217 FLOWCONTROL-SUSPEND, and only the XON that returns the depth to zero
+  sends FLOWCONTROL-RESUME.
 - If the driver's RX queue is full while network bytes arrive, the service sends
   RFC2217 FLOWCONTROL-SUSPEND, retries the same RX frame without duplicating
   bytes, then sends FLOWCONTROL-RESUME once the driver accepts it.
