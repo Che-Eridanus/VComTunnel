@@ -291,6 +291,12 @@ public sealed class Rfc2217Client
         return command is FlowControlSuspend or FlowControlResume;
     }
 
+    public static bool IsCompatibleSetControlAcceptedValue(byte requested, byte accepted)
+    {
+        return IsOutboundFlowControlValue(requested) && IsOutboundFlowControlValue(accepted)
+            || IsInboundFlowControlValue(requested) && IsInboundFlowControlValue(accepted);
+    }
+
     public static byte MapWindowsParityToRfc2217(byte windowsParity)
     {
         return windowsParity switch
@@ -383,6 +389,16 @@ public sealed class Rfc2217Client
             : (flowReplace & SerialAutoReceive) != 0
                 ? (byte)15
                 : (byte)14;
+    }
+
+    public static bool IsOutboundFlowControlValue(byte value)
+    {
+        return value is 1 or 2 or 3 or 17 or 19;
+    }
+
+    public static bool IsInboundFlowControlValue(byte value)
+    {
+        return value is 14 or 15 or 16 or 18;
     }
 
     public static byte MapPurge(uint purgeMask)
@@ -588,6 +604,16 @@ public sealed record Rfc2217ExpectedAck(
         return AllowAcceptedValue
             && notification.Command == Command
             && Rfc2217Client.IsAcceptedSerialSetting(notification);
+    }
+
+    public bool MatchesAcceptedSetControlValue(Rfc2217Notification notification)
+    {
+        return AllowAcceptedValue
+            && Command == Rfc2217Client.AckSetControl
+            && notification.Command == Command
+            && Payload.Length == 1
+            && notification.Payload.Length == 1
+            && Rfc2217Client.IsCompatibleSetControlAcceptedValue(Payload[0], notification.Payload[0]);
     }
 
     public string Describe()

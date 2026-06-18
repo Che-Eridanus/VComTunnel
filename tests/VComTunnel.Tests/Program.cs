@@ -308,8 +308,20 @@ static void Rfc2217AckSemantics()
         "Line-control ACK can carry the remote accepted value.");
     AssertTrue(
         !new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [8], AllowAcceptedValue: true)
-            .MatchesAcceptedValue(new Rfc2217Notification(Rfc2217Client.AckSetControl, [9])),
+            .MatchesAcceptedSetControlValue(new Rfc2217Notification(Rfc2217Client.AckSetControl, [9])),
         "SET-CONTROL is not relaxed as a remote serial setting.");
+    AssertTrue(
+        new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [17], AllowAcceptedValue: true)
+            .MatchesAcceptedSetControlValue(new Rfc2217Notification(Rfc2217Client.AckSetControl, [1])),
+        "Outbound flow-control ACK can carry the peer accepted value.");
+    AssertTrue(
+        new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [18], AllowAcceptedValue: true)
+            .MatchesAcceptedSetControlValue(new Rfc2217Notification(Rfc2217Client.AckSetControl, [14])),
+        "Inbound flow-control ACK can carry the peer accepted value.");
+    AssertTrue(
+        !new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [17], AllowAcceptedValue: true)
+            .MatchesAcceptedSetControlValue(new Rfc2217Notification(Rfc2217Client.AckSetControl, [14])),
+        "Outbound flow-control ACK must not match an inbound accepted value.");
     AssertEqual("17", Rfc2217Client.MapOutboundFlowControl(0x20, 0).ToString());
     AssertEqual("18", Rfc2217Client.MapInboundFlowControl(0x02, 0).ToString());
     AssertEqual("3", Rfc2217Client.MapPurge(0x0C).ToString());

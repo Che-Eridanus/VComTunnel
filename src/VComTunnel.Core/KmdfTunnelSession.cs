@@ -328,6 +328,12 @@ public sealed class KmdfTunnelSession : IDisposable
                 return;
             }
 
+            if (pendingAck == PendingAckResult.CompletedWithAcceptedSetControl)
+            {
+                _log.Warn(_mapping.Name, $"RFC2217 peer accepted SET-CONTROL value {notification.Payload[0]}.");
+                return;
+            }
+
             if (pendingAck != PendingAckResult.NotPending)
             {
                 return;
@@ -511,6 +517,16 @@ public sealed class KmdfTunnelSession : IDisposable
                     _pendingAckCompletion = null;
                 }
             }
+            else if ((index = _pendingAcks.FindIndex(expected => expected.MatchesAcceptedSetControlValue(notification))) >= 0)
+            {
+                result = PendingAckResult.CompletedWithAcceptedSetControl;
+                _pendingAcks.RemoveAt(index);
+                if (_pendingAcks.Count == 0)
+                {
+                    completion = _pendingAckCompletion;
+                    _pendingAckCompletion = null;
+                }
+            }
             else if (_pendingAcks.Any(expected => expected.IsSameCommand(notification)))
             {
                 result = PendingAckResult.Failed;
@@ -647,6 +663,7 @@ public sealed class KmdfTunnelSession : IDisposable
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetHandflow(controlHandshake, flowReplace),
                     BuildSetControlAcks(
+                        true,
                         Rfc2217Client.MapOutboundFlowControl(controlHandshake, flowReplace),
                         Rfc2217Client.MapInboundFlowControl(controlHandshake, flowReplace)),
                     "handflow");
@@ -677,9 +694,14 @@ public sealed class KmdfTunnelSession : IDisposable
 
     private static Rfc2217ExpectedAck[] BuildSetControlAcks(params byte?[] values)
     {
+        return BuildSetControlAcks(allowAcceptedFlowControl: false, values);
+    }
+
+    private static Rfc2217ExpectedAck[] BuildSetControlAcks(bool allowAcceptedFlowControl, params byte?[] values)
+    {
         return values
             .Where(value => value is not null)
-            .Select(value => new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [value!.Value]))
+            .Select(value => new Rfc2217ExpectedAck(Rfc2217Client.AckSetControl, [value!.Value], AllowAcceptedValue: allowAcceptedFlowControl))
             .ToArray();
     }
 
@@ -734,6 +756,7 @@ public sealed class KmdfTunnelSession : IDisposable
         NotPending,
         Completed,
         CompletedWithAcceptedSerialSetting,
+        CompletedWithAcceptedSetControl,
         Failed
     }
 
