@@ -228,7 +228,9 @@ for RX, RXFLAG/EventChar, RX80FULL, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and
 ERR events,
 plus serial RX/TX/error statistics through `IOCTL_SERIAL_GET_STATS` and
 `IOCTL_SERIAL_CLEAR_STATS`, and immediate-character transmit through
-`IOCTL_SERIAL_IMMEDIATE_CHAR`. Basic read timeout behavior from
+`IOCTL_SERIAL_IMMEDIATE_CHAR`. Zero-length serial writes are accepted as
+successful no-op writes for compatibility with user-mode serial libraries.
+Basic read timeout behavior from
 `IOCTL_SERIAL_SET_TIMEOUTS` is honored for immediate empty reads and total read
 timeouts, so synchronous readers can fail/return predictably when no RX data is
 available. Windows serial configuration probes

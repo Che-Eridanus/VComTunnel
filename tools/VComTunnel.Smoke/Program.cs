@@ -452,6 +452,14 @@ static async Task<int> ExerciseControlIoctlsAsync(
     const byte localFlowControlResume = 9;
 
     serial.ClearStats();
+    serial.Write([]);
+    var emptyWriteStats = serial.GetStats();
+    if (emptyWriteStats.TransmittedCount != 0)
+    {
+        throw new InvalidOperationException($"Zero-length write changed TX stats: {emptyWriteStats.TransmittedCount}.");
+    }
+
+    Console.WriteLine("write: zero-length write completed with 0 byte(s).");
     serial.ValidateCommConfig();
     serial.SetQueueSize(4096, 4096);
     await WaitForRemoteNotificationsAsync(serial, probe, readTimeout, cancellationToken);

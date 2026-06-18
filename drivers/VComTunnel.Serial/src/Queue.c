@@ -1725,7 +1725,12 @@ VctEvtIoWrite(
     device = WdfIoQueueGetDevice(Queue);
     context = DeviceGetContext(device);
 
-    status = WdfRequestRetrieveInputBuffer(Request, Length == 0 ? 1 : Length, (PVOID*)&inputBuffer, &inputLength);
+    if (Length == 0) {
+        WdfRequestCompleteWithInformation(Request, STATUS_SUCCESS, 0);
+        return;
+    }
+
+    status = WdfRequestRetrieveInputBuffer(Request, Length, (PVOID*)&inputBuffer, &inputLength);
     if (!NT_SUCCESS(status)) {
         WdfRequestComplete(Request, status);
         return;
