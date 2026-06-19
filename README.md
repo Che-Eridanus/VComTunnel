@@ -1,18 +1,62 @@
 # VComTunnel
 
-VComTunnel is a Windows virtual COM to RFC2217 bridge manager.
+VComTunnel is a Windows virtual COM to RFC2217 bridge manager. It lets
+existing serial tools open a local COM port while a local service forwards data
+and serial-control changes to a remote RFC2217 endpoint.
 
-The current implementation delivers the phase 1 baseline:
+The project is aimed at embedded development, remote device access, firmware
+flashing, serial logging, and lab workflows where existing Windows tools still
+expect a normal `COMx` device.
 
-- Multi-mapping configuration in `%ProgramData%\VComTunnel\config.json`
-- Local loopback HTTP API on `http://127.0.0.1:44817`
-- WPF GUI for mappings, dependencies, start/stop, and logs
-- CLI helper `vcomtunnelctl`
-- External dependency detection for `com0com`, `hub4com.exe`, and `com2tcp-rfc2217.bat`
-- Release-package bundled setup for com0com and hub4com, with download fallback for development builds
-- Experimental KMDF backend with a buildable driver and RFC2217 service path
+## Highlights
 
-Flutter was checked first, but `flutter --version` timed out repeatedly in this environment. The GUI therefore uses the planned `.NET WPF` fallback.
+- WPF GUI for mapping management, dependency setup, service control, and logs
+- Local Windows service/API for long-running tunnel lifecycle management
+- CLI helper `vcomtunnelctl` for diagnostics, setup, status, and automation
+- Multiple mappings stored in `%ProgramData%\VComTunnel\config.json`
+- Baseline bridge path through `com0com` and `hub4com`/`com2tcp-rfc2217`
+- Transitional `com0comService` backend that removes the hub4com process from
+  the data path
+- Experimental native KMDF virtual serial backend for future dependency-free
+  virtual COM tunneling
+- Release packaging script with bundled third-party dependency archives,
+  notices, and SHA-256 manifest generation
+
+## Status
+
+The current implementation is a practical phase 1/phase 2 workbench:
+
+- The `com0comHub4com` path is the baseline integration path.
+- The `com0comService` path is a service-managed bridge that still uses
+  com0com for the visible virtual port.
+- The `kmdf` path is experimental prototype work. It is useful for validation,
+  but it is not yet a production-ready signed driver release.
+
+Driver installation, COM port allocation, DTR/RTS behavior, and RFC2217
+control negotiation can affect attached hardware. Review the backend status and
+test with a safe target before using a new release in a production lab.
+
+## Architecture
+
+```text
+serial tool -> visible COMx -> backend -> VComTunnel.Service -> RFC2217 host:port
+```
+
+Supported backend shapes:
+
+```text
+com0comHub4com:
+serial tool -> COMx -> com0com -> CNCBx -> hub4com/com2tcp-rfc2217 -> RFC2217
+
+com0comService:
+serial tool -> COMx -> com0com -> CNCBx -> VComTunnel.Service -> RFC2217
+
+kmdf experimental:
+serial tool -> COMx -> VComTunnel.Serial.sys -> VComTunnel.Service -> RFC2217
+```
+
+The GUI is a controller for the local service. Closing the GUI does not stop
+running tunnels; stop mappings from the GUI or with `vcomtunnelctl stop`.
 
 ## Build
 
@@ -67,7 +111,8 @@ dotnet run -c Release --project tools\VComTunnel.Smoke\VComTunnel.Smoke.csproj -
 
 ## Run
 
-Open the GUI. It will check `127.0.0.1:44817` and try to start the local service automatically if it is offline:
+Open the GUI. It will check `127.0.0.1:44817` and try to start the local service
+automatically if it is offline:
 
 ```powershell
 dotnet run --project src\VComTunnel.Gui\VComTunnel.Gui.csproj
@@ -114,12 +159,10 @@ For published builds, pass the explicit service executable if auto-discovery doe
 vcomtunnelctl service install C:\Tools\VComTunnel\VComTunnel.Service.exe
 ```
 
-The GUI is only a controller. When it needs the local API, it first connects to
-an installed `VComTunnel` Windows service; if that is not installed, it starts
-`VComTunnel.Service.exe --console` as a hidden background process. Closing the
-GUI does not stop running tunnels. Use the GUI Stop action or `vcomtunnelctl
-stop <mappingId>` to stop a tunnel, and `vcomtunnelctl service stop` when using
-an installed Windows service.
+When the GUI needs the local API, it first connects to an installed
+`VComTunnel` Windows service; if that is not installed, it starts
+`VComTunnel.Service.exe --console` as a hidden background process. Use
+`vcomtunnelctl service stop` when using an installed Windows service.
 
 ## Phase 1 dependency model
 
@@ -249,3 +292,27 @@ against the fixed virtual queues, and FIFO/default-configuration UART requests
 are accepted as no-op compatibility calls.
 Remaining hardening work is broader serial compatibility coverage and live ESP-DAP
 compatibility validation against real tools.
+
+## Safety and Security
+
+- The local API is intended for loopback use at `127.0.0.1:44817`.
+- Treat RFC2217 endpoints as trusted lab infrastructure. RFC2217 itself does
+  not provide encryption or authentication.
+- Do not expose VComTunnel service ports directly to untrusted networks.
+- The KMDF backend is test-signed prototype work. Install it only on a
+  disposable, backed-up, or otherwise recoverable Windows test machine.
+- Some DTR/RTS/BREAK/purge tests can reset or disturb attached boards. Use the
+  safer RFC2217 probe modes first when working against real hardware.
+
+See [SECURITY.md](SECURITY.md) for reporting and deployment guidance.
+
+## Contributing
+
+Contributions are welcome, especially around serial-client compatibility,
+RFC2217 interoperability, diagnostics, packaging, and documentation. Please
+read [CONTRIBUTING.md](CONTRIBUTING.md) before sending changes.
+
+## License
+
+A repository license has not been selected yet. Choose and add a `LICENSE` file
+before treating a public package as an open-source release.
