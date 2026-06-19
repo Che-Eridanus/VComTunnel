@@ -40,6 +40,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("KMDF permanent driver faults do not restart", KmdfPermanentDriverFaultDoesNotRestartAsync),
     ("fake com2tcp process starts and stops", FakeCom2TcpProcessStartsAndStopsAsync),
     ("fake com2tcp process restarts after exit", FakeCom2TcpProcessRestartsAfterExitAsync),
+    ("fake com2tcp access denied does not restart", FakeCom2TcpAccessDeniedDoesNotRestartAsync),
     ("manual stop suppresses fake com2tcp restart", ManualStopSuppressesFakeCom2TcpRestartAsync),
     ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync),
     ("dependency installer uses bundled release archives", DependencyInstallerUsesBundledReleaseArchivesAsync),
@@ -1193,6 +1194,50 @@ static async Task FakeCom2TcpProcessRestartsAfterExitAsync()
     var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
     AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
     orchestrator.Stop(id);
+}
+
+static async Task FakeCom2TcpAccessDeniedDoesNotRestartAsync()
+{
+    using var temp = new TempDir();
+    CreateFakeDependencies(
+        temp.Path,
+        """
+        @echo off
+        echo ComIo::OpenPath(): CreateFile("\\.\CNCB58") ERROR 5 - Access is denied. 1>&2
+        exit /b 0
+        """);
+    var mapping = new TunnelMapping
+    {
+        Name = "Busy fake bridge",
+        VisiblePort = "COM58",
+        BackingPort = "CNCB58",
+        Host = "127.0.0.1",
+        Port = 2217,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog();
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        [],
+        restartDelay: TimeSpan.FromMilliseconds(50));
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+
+    var started = await orchestrator.StartAsync(id);
+    AssertEqual(TunnelRunState.Faulted.ToString(), started.State.ToString());
+    AssertStringContains(started.LastError ?? "", "ERROR 5");
+    AssertStringContains(started.LastError ?? "", "already open");
+    await Task.Delay(300);
+
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
+    AssertEqual(TunnelRunState.Faulted.ToString(), status.State.ToString());
+    AssertStringContains(status.LastError ?? "", "ERROR 5");
+    AssertStringContains(status.LastError ?? "", "already open");
+    AssertEqual(
+        "1",
+        log.Snapshot().Count(e => e.Message.Contains("Started hub4com process", StringComparison.OrdinalIgnoreCase)).ToString());
 }
 
 static async Task ManualStopSuppressesFakeCom2TcpRestartAsync()

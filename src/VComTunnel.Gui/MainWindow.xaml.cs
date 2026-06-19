@@ -129,6 +129,7 @@ public partial class MainWindow : Window
         AutoColumn.Header = T("Column.Auto");
         RestartColumn.Header = T("Column.Restart");
         MappingStateColumn.Header = T("Column.State");
+        ServiceColumn.Header = T("Column.Service");
         PairNumberColumn.Header = T("Column.PortType");
         PairPortAColumn.Header = T("Column.PortA");
         PairPortBColumn.Header = T("Column.PortB");
@@ -170,6 +171,7 @@ public partial class MainWindow : Window
         foreach (var row in _mappings)
         {
             row.StateLabel = GuiText.State(_language, row.RunState);
+            row.RefreshServiceLabel(_language);
         }
 
         MappingsGrid.Items.Refresh();
@@ -441,7 +443,7 @@ public partial class MainWindow : Window
                 _suppressAutoSave = false;
             }
 
-            await RefreshMappingStatesAsync();
+            var serviceStatus = await RefreshMappingStatesAsync();
             var dependencies = await _client.GetFromJsonAsync<SystemDependencyReport>("/api/dependencies", JsonOptions);
             DependenciesText.Text = FormatDependencies(dependencies);
             var localDependencies = new DependencyDetector().Detect();
@@ -457,7 +459,7 @@ public partial class MainWindow : Window
             await RefreshLogsAsync();
             if (!dependencyStale)
             {
-                ServiceStateText.Text = TF("Status.ServiceConnected", _mappings.Count);
+                ServiceStateText.Text = FormatServiceSummary(serviceStatus, _mappings.Count);
             }
         }
         catch (Exception ex)
@@ -1226,20 +1228,35 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task RefreshMappingStatesAsync()
+    private async Task<ServiceStatus?> RefreshMappingStatesAsync()
     {
         var status = await _client.GetFromJsonAsync<ServiceStatus>("/api/status", JsonOptions);
         var stateById = status?.Tunnels.ToDictionary(t => t.Id, StringComparer.OrdinalIgnoreCase)
             ?? new Dictionary<string, TunnelStatus>(StringComparer.OrdinalIgnoreCase);
         foreach (var row in _mappings)
         {
-            row.RunState = stateById.TryGetValue(row.Id, out var tunnel)
-                ? tunnel.State
-                : TunnelRunState.Stopped;
-            row.StateLabel = GuiText.State(_language, row.RunState);
+            row.ApplyServiceStatus(
+                stateById.TryGetValue(row.Id, out var tunnel) ? tunnel : null,
+                _language);
         }
 
         MappingsGrid.Items.Refresh();
+        UpdateMappingCommandState();
+        return status;
+    }
+
+    private string FormatServiceSummary(ServiceStatus? status, int mappingCount)
+    {
+        if (status is null)
+        {
+            return TF("Status.ServiceConnected", mappingCount);
+        }
+
+        var running = status.Tunnels.Count(t => t.State is TunnelRunState.Starting or TunnelRunState.Running);
+        var faulted = status.Tunnels.Count(t => t.State is TunnelRunState.Faulted);
+        return running > 0 || faulted > 0
+            ? TF("Status.ServiceConnectedDetailed", mappingCount, running, faulted)
+            : TF("Status.ServiceConnected", mappingCount);
     }
 
     private static string? ResolveServicePath()
@@ -2897,6 +2914,7 @@ public sealed class MappingRow : INotifyPropertyChanged
     private bool _autoStart;
     private TunnelRunState _runState = TunnelRunState.Stopped;
     private string _stateLabel = "";
+    private string _serviceLabel = "";
 
     public event PropertyChangedEventHandler? PropertyChanged;
     public event EventHandler? AutoStartEnabledRequested;
@@ -2964,6 +2982,9 @@ public sealed class MappingRow : INotifyPropertyChanged
         }
     }
     public bool RestartOnFailure { get; set; } = true;
+    public int? ProcessId { get; private set; }
+    public DateTimeOffset? StartedAt { get; private set; }
+    public string? LastError { get; private set; }
 
     public TunnelRunState RunState
     {
@@ -2997,6 +3018,21 @@ public sealed class MappingRow : INotifyPropertyChanged
         }
     }
 
+    public string ServiceLabel
+    {
+        get => _serviceLabel;
+        private set
+        {
+            if (string.Equals(_serviceLabel, value, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _serviceLabel = value;
+            OnPropertyChanged(nameof(ServiceLabel));
+        }
+    }
+
     public bool IsKmdf => string.Equals(Backend, "kmdf", StringComparison.OrdinalIgnoreCase);
     public bool CanStart => RunState is not TunnelRunState.Running and not TunnelRunState.Starting and not TunnelRunState.Unsupported;
     public bool CanStop => RunState is TunnelRunState.Running or TunnelRunState.Starting;
@@ -3020,6 +3056,30 @@ public sealed class MappingRow : INotifyPropertyChanged
             AutoStart = mapping.AutoStart,
             RestartOnFailure = mapping.RestartOnFailure,
             RunState = TunnelRunState.Stopped
+        };
+    }
+
+    public void ApplyServiceStatus(TunnelStatus? status, UiLanguage language)
+    {
+        ProcessId = status?.ProcessId;
+        StartedAt = status?.StartedAt;
+        LastError = status?.LastError;
+        RunState = status?.State ?? TunnelRunState.Stopped;
+        StateLabel = GuiText.State(language, RunState);
+        RefreshServiceLabel(language);
+    }
+
+    public void RefreshServiceLabel(UiLanguage language)
+    {
+        ServiceLabel = RunState switch
+        {
+            TunnelRunState.Running when ProcessId is not null => GuiText.Format(language, "Mapping.ServiceRunningPid", ProcessId),
+            TunnelRunState.Running => GuiText.Get(language, "Mapping.ServiceRunning"),
+            TunnelRunState.Starting => GuiText.Get(language, "Mapping.ServiceStarting"),
+            TunnelRunState.Faulted when !string.IsNullOrWhiteSpace(LastError) => GuiText.Format(language, "Mapping.ServiceFaulted", Shorten(CollapseWhitespace(LastError!), 160)),
+            TunnelRunState.Faulted => GuiText.Get(language, "Mapping.ServiceFaultedUnknown"),
+            TunnelRunState.Unsupported => GuiText.Get(language, "Mapping.ServiceUnsupported"),
+            _ => ""
         };
     }
 
@@ -3061,6 +3121,12 @@ public sealed class MappingRow : INotifyPropertyChanged
         OnPropertyChanged(nameof(BackingPort));
         return true;
     }
+
+    private static string CollapseWhitespace(string text) =>
+        string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    private static string Shorten(string text, int maxLength) =>
+        text.Length <= maxLength ? text : text[..Math.Max(0, maxLength - 3)] + "...";
 }
 
 internal sealed record KmdfCtlLaunch(string ResultFile);
