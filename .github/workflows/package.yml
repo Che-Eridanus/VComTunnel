@@ -119,13 +119,28 @@ jobs:
         shell: pwsh
         run: |
           $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "${{ steps.meta.outputs.tag }}" }
+          $assetPaths = @(
+            Get-ChildItem -LiteralPath "artifacts\github-release\${{ env.PACKAGE_RUNTIME }}" -File
+            Get-ChildItem -LiteralPath "artifacts\github-release\staging" -Filter "*.zip" -File
+          )
+
+          if ($assetPaths.Count -eq 0) {
+            throw "No release assets were produced."
+          }
+          $assetArguments = @($assetPaths | ForEach-Object { $_.FullName })
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "VComTunnel ${{ steps.meta.outputs.version }}" --notes "Automated VComTunnel packaging artifacts."
+            gh release create $tag @assetArguments --verify-tag --title "VComTunnel ${{ steps.meta.outputs.version }}" --notes "Automated VComTunnel packaging artifacts."
+          } else {
+            gh release upload $tag @assetArguments --clobber
           }
 
-          gh release upload $tag `
-            artifacts\github-release\${{ env.PACKAGE_RUNTIME }}\* `
-            artifacts\github-release\staging\*.zip `
-            --clobber
+          $uploadedCount = gh release view $tag --json assets --jq ".assets | length"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not verify GitHub Release assets for $tag."
+          }
+
+          if ([int]$uploadedCount -lt $assetPaths.Count) {
+            throw "GitHub Release $tag has $uploadedCount asset(s), expected at least $($assetPaths.Count)."
+          }
