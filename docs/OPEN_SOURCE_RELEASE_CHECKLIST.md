@@ -66,6 +66,8 @@ windows, serial-port, virtual-com-port, rfc2217, dotnet, wpf, kmdf, com0com, hub
 - Confirm the public artifact name includes `portable` for the default
   self-contained user download.
 - Confirm `README-FIRST.txt` and `README-FIRST.zh-CN.txt` are generated.
+- Confirm user-facing release notes state Windows 10/11 x64 support and do not
+  imply Windows 7, Windows 8, or Windows 8.1 compatibility.
 - Confirm README screenshots and runtime descriptions match the current GUI
   behavior.
 - Confirm `Start-VComTunnel-Portable.cmd` launches the GUI from an extracted

@@ -10,6 +10,18 @@ The project is aimed at embedded development, remote device access, firmware
 flashing, serial logging, and lab workflows where existing Windows tools still
 expect a normal `COMx` device.
 
+## Supported Windows Versions
+
+The current release line targets Windows 10 and Windows 11 on x64. Windows 7,
+Windows 8, and Windows 8.1 are not supported targets for this .NET 8 / WPF /
+Windows Service implementation.
+
+The default release package is self-contained, which means users do not need to
+install a separate .NET runtime. It does not extend the supported OS range. The
+bundled com0com archive may contain upstream installer names with `W7`, but
+that is a third-party driver package detail, not a VComTunnel Windows 7 support
+statement.
+
 ## Highlights
 
 - WPF GUI for mapping management, dependency setup, service control, and logs

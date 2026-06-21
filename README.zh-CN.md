@@ -10,6 +10,16 @@ Windows 上的串口终端、烧录工具、调试工具继续打开本地 `COMx
 但上位机工具仍然只认识本地 COM 口。VComTunnel 负责把这两边接起来，并把
 映射配置、后台服务、日志、依赖诊断和 COM 口管理做成一个可操作的桌面工具。
 
+## 支持的 Windows 版本
+
+当前发布线明确面向 Windows 10 和 Windows 11 x64。Win7、Win8、Win8.1 不作为
+当前 .NET 8 / WPF / Windows Service 实现的支持目标。
+
+默认发布包是 self-contained，含义只是目标机器不需要单独安装 .NET 运行时，
+不代表扩大了操作系统支持范围。发布包内 com0com 归档里可能出现带 `W7` 的
+上游安装器文件名，那只是第三方驱动包自己的命名，不能理解为 VComTunnel 当前
+应用支持 Windows 7。
+
 ## 当前状态
 
 这个项目目前有三条后端路径：
