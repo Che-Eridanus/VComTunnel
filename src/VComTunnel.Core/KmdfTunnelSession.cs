@@ -31,6 +31,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
     private const ushort EventTypeSetBreak = 6;
     private const ushort EventTypePurge = 7;
     private const ushort EventTypeLocalFlowControl = 8;
+    private const ushort EventFlagInitialSync = 0x0001;
     private const uint ModemControlDtr = 0x00000001;
     private const uint ModemControlRts = 0x00000002;
     private const uint RemoteBaudRate = 0x00000001;
@@ -38,7 +39,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
     private const uint RemoteParity = 0x00000004;
     private const uint RemoteStopBits = 0x00000008;
     private const ushort ProtocolMajor = 1;
-    private const ushort ProtocolMinor = 2;
+    private const ushort ProtocolMinor = 3;
     private const int MaxEventBytes = 4096;
     private const int MaxRxBytes = 4096;
     private static readonly TimeSpan CommandAckTimeout = Rfc2217Client.RecommendedCommandAckTimeout;
@@ -76,7 +77,6 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
     private Task? _eventLoop;
     private Task? _networkLoop;
     private Task? _keepAliveLoop;
-    private bool _initialControlLineSyncHandled;
     private int _disposed;
 
     public KmdfTunnelSession(TunnelMapping mapping, InMemoryLog log, Action<IKmdfTunnelSession, string> faulted)
@@ -221,13 +221,14 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
 
                 var size = ReadUInt32(output, 0);
                 var type = ReadUInt16(output, 8);
+                var flags = ReadUInt16(output, 10);
                 if (size < EventHeaderSize || size > bytes)
                 {
                     throw new InvalidOperationException($"KMDF driver returned an invalid event frame type={type}, size={size}, bytes={bytes}.");
                 }
 
                 var payloadBytes = checked((int)size - EventHeaderSize);
-                var frame = BuildNetworkFrame(type, output, EventHeaderSize, payloadBytes);
+                var frame = BuildNetworkFrame(type, flags, output, EventHeaderSize, payloadBytes);
                 if (frame.Bytes.Length > 0)
                 {
                     await SendFrameWithAckAsync(stream, frame).ConfigureAwait(false);
@@ -720,7 +721,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         Interlocked.Exchange(ref _lastNetworkActivityTicks, Stopwatch.GetTimestamp());
     }
 
-    private Rfc2217OutboundFrame BuildNetworkFrame(ushort type, byte[] buffer, int offset, int length)
+    private Rfc2217OutboundFrame BuildNetworkFrame(ushort type, ushort flags, byte[] buffer, int offset, int length)
     {
         switch (type)
         {
@@ -756,14 +757,12 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 var mask = ReadUInt32(buffer, offset);
                 bool? dtr = (mask & ModemControlDtr) != 0 ? buffer[offset + 4] != 0 : null;
                 bool? rts = (mask & ModemControlRts) != 0 ? buffer[offset + 5] != 0 : null;
-                if (_suppressInitialControlLineSync && !_initialControlLineSyncHandled)
+                if (ShouldSuppressInitialControlLineSync(_suppressInitialControlLineSync, type, flags))
                 {
-                    _initialControlLineSyncHandled = true;
-                    _log.Info(_mapping.Name, $"Suppressed initial modem-control sync dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
+                    _log.Info(_mapping.Name, $"Suppressed replayed modem-control during restart protection dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
                     return new Rfc2217OutboundFrame([], [], "initial modem-control sync suppressed");
                 }
 
-                _initialControlLineSyncHandled = true;
                 _log.Info(_mapping.Name, $"RFC2217 set modem dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetModemControl(dtr, rts),
@@ -774,6 +773,12 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 EnsurePayload(type, length, 8);
                 var controlHandshake = ReadUInt32(buffer, offset);
                 var flowReplace = ReadUInt32(buffer, offset + 4);
+                if (ShouldSuppressInitialControlLineSync(_suppressInitialControlLineSync, type, flags))
+                {
+                    _log.Info(_mapping.Name, $"Suppressed replayed handflow during restart protection control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
+                    return new Rfc2217OutboundFrame([], [], "initial handflow sync suppressed");
+                }
+
                 _log.Info(_mapping.Name, $"RFC2217 set handflow control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetHandflow(controlHandshake, flowReplace),
@@ -822,6 +827,20 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             default:
                 throw new InvalidOperationException($"KMDF driver returned unsupported event type {type}.");
         }
+    }
+
+    // Restart protection: the driver flags the control-state snapshot it replays
+    // on each (re)attach with EventFlagInitialSync. Suppress replaying DTR/RTS and
+    // handflow to the remote so a restart cannot disturb or reset the target. Real
+    // application changes arrive without the flag and always pass through.
+    public static bool ShouldSuppressInitialControlLineSync(bool suppressEnabled, ushort eventType, ushort eventFlags)
+    {
+        if (!suppressEnabled || (eventFlags & EventFlagInitialSync) == 0)
+        {
+            return false;
+        }
+
+        return eventType is EventTypeSetModemControl or EventTypeSetHandflow;
     }
 
     private static void EnsurePayload(ushort type, int actualLength, int minimumLength)

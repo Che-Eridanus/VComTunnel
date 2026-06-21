@@ -570,6 +570,7 @@ static VOID
 VctEnqueueControlEventLocked(
     _Inout_ PDEVICE_CONTEXT Context,
     _In_ USHORT Type,
+    _In_ USHORT Flags,
     _In_reads_bytes_opt_(PayloadSize) const VOID* Payload,
     _In_ ULONG PayloadSize
     )
@@ -588,6 +589,7 @@ VctEnqueueControlEventLocked(
     event = &Context->EventQueue[Context->EventHead];
     RtlZeroMemory(event, sizeof(*event));
     event->Type = Type;
+    event->Flags = Flags;
     event->PayloadSize = PayloadSize;
     if (Payload != NULL && PayloadSize > 0) {
         RtlCopyMemory(event->Payload, Payload, PayloadSize);
@@ -688,7 +690,7 @@ VctQueueControlEvent(
 
     WdfSpinLockAcquire(Context->Lock);
     if (Context->ServiceAttached && VctIsConnectionActiveLocked(Context)) {
-        VctEnqueueControlEventLocked(Context, Type, Payload, PayloadSize);
+        VctEnqueueControlEventLocked(Context, Type, 0, Payload, PayloadSize);
         if (Context->PendingServiceWait != NULL) {
             serviceWait = Context->PendingServiceWait;
             Context->PendingServiceWait = NULL;
@@ -717,6 +719,7 @@ VctQueueImmediateChar(
         VctEnqueueControlEventLocked(
             Context,
             VComTunnelEventTxData,
+            0,
             &ImmediateChar,
             sizeof(ImmediateChar));
         Context->Stats.TransmittedCount++;
@@ -754,6 +757,7 @@ VctQueueLocalFlowControl(
         VctEnqueueControlEventLocked(
             Context,
             VComTunnelEventLocalFlowControl,
+            0,
             &event,
             sizeof(event));
         if (Context->PendingServiceWait != NULL) {
@@ -784,6 +788,7 @@ VctEnqueueCurrentStateLocked(
     VctEnqueueControlEventLocked(
         Context,
         VComTunnelEventSetBaudRate,
+        VCOMTUNNEL_EVENT_FLAG_INITIAL_SYNC,
         &baudRateEvent,
         sizeof(baudRateEvent));
 
@@ -794,6 +799,7 @@ VctEnqueueCurrentStateLocked(
     VctEnqueueControlEventLocked(
         Context,
         VComTunnelEventSetLineControl,
+        VCOMTUNNEL_EVENT_FLAG_INITIAL_SYNC,
         &lineControlEvent,
         sizeof(lineControlEvent));
 
@@ -802,6 +808,7 @@ VctEnqueueCurrentStateLocked(
     VctEnqueueControlEventLocked(
         Context,
         VComTunnelEventSetHandflow,
+        VCOMTUNNEL_EVENT_FLAG_INITIAL_SYNC,
         &handflowEvent,
         sizeof(handflowEvent));
 
@@ -812,6 +819,7 @@ VctEnqueueCurrentStateLocked(
     VctEnqueueControlEventLocked(
         Context,
         VComTunnelEventSetModemControl,
+        VCOMTUNNEL_EVENT_FLAG_INITIAL_SYNC,
         &modemControlEvent,
         sizeof(modemControlEvent));
 }

@@ -2,7 +2,7 @@
 
 #define VCOMTUNNEL_DEVICE_TYPE 0x8000
 #define VCOMTUNNEL_PROTOCOL_MAJOR 1
-#define VCOMTUNNEL_PROTOCOL_MINOR 2
+#define VCOMTUNNEL_PROTOCOL_MINOR 3
 #define VCOMTUNNEL_MAX_EVENT_BYTES 4096
 #define VCOMTUNNEL_MAX_RX_BYTES 4096
 
@@ -33,6 +33,17 @@ typedef enum _VCOMTUNNEL_EVENT_TYPE {
     VComTunnelEventPurge = 7,
     VComTunnelEventLocalFlowControl = 8
 } VCOMTUNNEL_EVENT_TYPE;
+
+//
+// Event flags carried in VCT_EVENT_HEADER.Flags / VCOMTUNNEL_QUEUED_EVENT.Flags.
+//
+// INITIAL_SYNC marks the control-state snapshot the driver replays to a freshly
+// attached service (see VctEnqueueCurrentStateLocked). The service uses it to
+// suppress replaying DTR/RTS and handflow to the remote on (re)connect so a
+// restart cannot disturb or reset the target; real application changes are
+// unflagged and always pass through.
+//
+#define VCOMTUNNEL_EVENT_FLAG_INITIAL_SYNC 0x0001
 
 typedef struct _VCT_ATTACH_REQUEST {
     USHORT ProtocolMajor;
