@@ -17,6 +17,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("service endpoint rejects non-loopback override", () => Task.Run(ServiceEndpointRejectsNonLoopbackOverride)),
     ("com0com create hints", () => Task.Run(Com0comCreateHints)),
     ("com0com service maps peer modem signals", () => Task.Run(Com0comServiceMapsPeerModemSignals)),
+    ("com0com service reconstructs fast RTS pulse", () => Task.Run(Com0comServiceReconstructsFastRtsPulse)),
     ("esptool baud monitor waits for response", () => Task.Run(EspToolBaudMonitorWaitsForResponse)),
     ("KMDF control path uses visible COM", () => Task.Run(KmdfControlPathUsesVisibleCom)),
     ("KMDF pnputil CSV parser finds VComTunnel ports", () => Task.Run(KmdfPnpUtilCsvParserFindsPorts)),
@@ -27,22 +28,25 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("RFC2217 ack semantics", () => Task.Run(Rfc2217AckSemantics)),
     ("RFC2217 notification mappings", () => Task.Run(Rfc2217NotificationMappings)),
     ("RFC2217 local flow-control depth", () => Task.Run(Rfc2217LocalFlowControlDepth)),
-    ("com2tcp command uses batch wrapper", () => Task.Run(Com2TcpCommandUsesBatchWrapper)),
+    ("hub4com default command avoids control filters", () => Task.Run(Hub4comDefaultCommandAvoidsControlFilters)),
+    ("hub4com control command enables control filters", () => Task.Run(Hub4comControlCommandEnablesControlFilters)),
     ("missing dependencies fault mapping", MissingDependenciesFaultMappingAsync),
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
     ("com0com service backend starts without hub4com", Com0comServiceBackendStartsWithoutHub4comAsync),
     ("com0com service backend restarts after network fault", Com0comServiceBackendRestartsAfterNetworkFaultAsync),
+    ("com0com service start requests are serialized", Com0comServiceStartRequestsAreSerializedAsync),
     ("starting same endpoint stops prior tunnel", StartingSameEndpointStopsPriorTunnelAsync),
     ("stale stopped session fault is ignored", StaleStoppedSessionFaultIsIgnoredAsync),
     ("com0com service backing open diagnostics", () => Task.Run(Com0comServiceBackingOpenDiagnostics)),
     ("com0com create and remove plans", Com0comCreateAndRemovePlansAsync),
     ("KMDF mapping reports startup fault", KmdfMappingReportsStartupFaultAsync),
     ("KMDF session restarts after network fault", KmdfSessionRestartsAfterNetworkFaultAsync),
+    ("KMDF default start suppresses initial control lines", KmdfDefaultStartSuppressesInitialControlLinesAsync),
     ("KMDF permanent driver faults do not restart", KmdfPermanentDriverFaultDoesNotRestartAsync),
-    ("fake com2tcp process starts and stops", FakeCom2TcpProcessStartsAndStopsAsync),
-    ("fake com2tcp process restarts after exit", FakeCom2TcpProcessRestartsAfterExitAsync),
-    ("fake com2tcp access denied does not restart", FakeCom2TcpAccessDeniedDoesNotRestartAsync),
-    ("manual stop suppresses fake com2tcp restart", ManualStopSuppressesFakeCom2TcpRestartAsync),
+    ("fake hub4com process starts and stops", FakeHub4comProcessStartsAndStopsAsync),
+    ("fake hub4com process restarts after exit", FakeHub4comProcessRestartsAfterExitAsync),
+    ("fake hub4com access denied does not restart", FakeHub4comAccessDeniedDoesNotRestartAsync),
+    ("manual stop suppresses fake hub4com restart", ManualStopSuppressesFakeHub4comRestartAsync),
     ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync),
     ("dependency installer uses bundled release archives", DependencyInstallerUsesBundledReleaseArchivesAsync),
     ("dependency installer falls back after invalid mirror", DependencyInstallerFallsBackAfterInvalidMirrorAsync),
@@ -159,7 +163,7 @@ static async Task ConfigRoundTripAsync()
     {
         Mappings =
         [
-            new TunnelMapping { Name = "RoundTrip", VisiblePort = "COM33", BackingPort = "CNCB33", Host = "127.0.0.1", Port = 2217, AutoStart = true }
+            new TunnelMapping { Name = "RoundTrip", VisiblePort = "COM33", BackingPort = "CNCB33", Host = "127.0.0.1", Port = 2217, Hub4comForwardControlLines = true, AutoStart = true }
         ]
     };
 
@@ -167,6 +171,7 @@ static async Task ConfigRoundTripAsync()
     var loaded = await store.LoadAsync();
     AssertEqual("RoundTrip", loaded.Mappings.Single().Name);
     AssertEqual("COM33", loaded.Mappings.Single().VisiblePort);
+    AssertTrue(loaded.Mappings.Single().Hub4comForwardControlLines, "hub4com control-line mode should round-trip.");
     AssertTrue(loaded.Mappings.Single().AutoStart, "AutoStart should round-trip.");
 }
 
@@ -241,6 +246,19 @@ static void Com0comServiceMapsPeerModemSignals()
     AssertTrue(
         Com0comServiceTunnelSession.MapCom0comPeerRts(SerialPortSnapshot.Cts),
         "Backing CTS should map to visible-side RTS on.");
+}
+
+static void Com0comServiceReconstructsFastRtsPulse()
+{
+    AssertBytes(
+        Concat(
+            Rfc2217Client.BuildSetModemControl(null, true),
+            Rfc2217Client.BuildSetModemControl(null, false)),
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(0, 0, SerialPortSnapshot.EventCts));
+
+    AssertBytes(
+        Rfc2217Client.BuildSetModemControl(null, true),
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(0, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
 }
 
 static void EspToolBaudMonitorWaitsForResponse()
@@ -348,6 +366,12 @@ static void Rfc2217CommandEncoding()
     AssertBytes(
         [0x56, 0xFF, 0xFF, 0x43],
         Rfc2217Client.EscapeSerialData([0x56, 0xFF, 0x43], 0, 3));
+    AssertTrue(
+        !Rfc2217Client.RequiresSerialDataEscaping([0x56, 0x43], 0, 2),
+        "Serial data without IAC should use the zero-copy write path.");
+    AssertTrue(
+        Rfc2217Client.RequiresSerialDataEscaping([0x56, 0xFF, 0x43], 0, 3),
+        "Serial data containing IAC must still be escaped.");
 
     AssertBytes(
         [0xFF, 0xF1],
@@ -691,7 +715,7 @@ static void Rfc2217LocalFlowControlDepth()
     AssertEqual("0", state.SuspendDepth.ToString());
 }
 
-static void Com2TcpCommandUsesBatchWrapper()
+static void Hub4comDefaultCommandAvoidsControlFilters()
 {
     using var temp = new TempDir();
     CreateFakeDependencies(temp.Path);
@@ -703,10 +727,38 @@ static void Com2TcpCommandUsesBatchWrapper()
         Port = 3333
     });
 
-    AssertEqual("cmd.exe", command.FileName);
-    AssertStringContains(command.Arguments, "com2tcp-rfc2217.bat");
+    AssertStringContains(command.FileName, "hub4com.exe");
     AssertStringContains(command.Arguments, "\\\\.\\CNCB12");
-    AssertStringContains(command.Arguments, "192.168.1.50 3333");
+    AssertStringContains(command.Arguments, "*192.168.1.50:3333");
+    AssertStringContains(command.Arguments, "--create-filter=telnet,tcp,telnet");
+    AssertTrue(!command.Arguments.Contains("com2tcp-rfc2217.bat", StringComparison.OrdinalIgnoreCase), "Default command must not use the com2tcp batch wrapper.");
+    AssertTrue(!command.Arguments.Contains("pinmap", StringComparison.OrdinalIgnoreCase), "Default command must not install pinmap filters.");
+    AssertTrue(!command.Arguments.Contains("linectl", StringComparison.OrdinalIgnoreCase), "Default command must not install line-control filters.");
+    AssertTrue(!command.Arguments.Contains("--rts", StringComparison.OrdinalIgnoreCase), "Default command must not map RTS.");
+    AssertTrue(!command.Arguments.Contains("--dtr", StringComparison.OrdinalIgnoreCase), "Default command must not map DTR.");
+    AssertTrue(!command.Arguments.Contains("break=break", StringComparison.OrdinalIgnoreCase), "Default command must not map BREAK.");
+}
+
+static void Hub4comControlCommandEnablesControlFilters()
+{
+    using var temp = new TempDir();
+    CreateFakeDependencies(temp.Path);
+    var detector = new DependencyDetector([temp.Path], pathOverride: "");
+    var command = new Hub4comCommandBuilder(detector).Build(new TunnelMapping
+    {
+        BackingPort = "CNCB12",
+        Host = "192.168.1.50",
+        Port = 3333,
+        Hub4comForwardControlLines = true
+    });
+
+    AssertStringContains(command.Arguments, "--create-filter=pinmap,com,pinmap");
+    AssertStringContains(command.Arguments, "--create-filter=linectl,com,lc");
+    AssertStringContains(command.Arguments, "--create-filter=pinmap,tcp,pinmap");
+    AssertStringContains(command.Arguments, "--create-filter=linectl,tcp,lc");
+    AssertStringContains(command.Arguments, "--rts=cts");
+    AssertStringContains(command.Arguments, "--dtr=dsr");
+    AssertStringContains(command.Arguments, "--break=break");
 }
 
 static async Task MissingDependenciesFaultMappingAsync()
@@ -817,6 +869,71 @@ static async Task Com0comServiceBackendRestartsAfterNetworkFaultAsync()
     AssertTrue(
         log.Snapshot().Any(e => e.Message.Contains("Scheduling Com0comService restart", StringComparison.OrdinalIgnoreCase)),
         "com0com service network fault should schedule a restart.");
+}
+
+static async Task Com0comServiceStartRequestsAreSerializedAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Name = "Serialized managed com0com",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM32",
+        BackingPort = "CNCB32",
+        Host = "127.0.0.1",
+        Port = 5000,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var firstStartEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var releaseFirstStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    var starts = 0;
+    var activeStarts = 0;
+    var maxActiveStarts = 0;
+    var disposed = 0;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        new InMemoryLog(),
+        ["COM32", "CNCB32"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            var startNumber = Interlocked.Increment(ref starts);
+            return new DelayedManagedTunnelSession(
+                async cancellationToken =>
+                {
+                    var active = Interlocked.Increment(ref activeStarts);
+                    UpdateMax(ref maxActiveStarts, active);
+                    try
+                    {
+                        if (startNumber == 1)
+                        {
+                            firstStartEntered.SetResult();
+                            await releaseFirstStart.Task.WaitAsync(cancellationToken);
+                        }
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref activeStarts);
+                    }
+                },
+                () => Interlocked.Increment(ref disposed));
+        });
+
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+    var firstStart = orchestrator.StartAsync(id);
+    await firstStartEntered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+    var secondStart = orchestrator.StartAsync(id);
+
+    await Task.Delay(50);
+    AssertEqual("1", Volatile.Read(ref starts).ToString());
+
+    releaseFirstStart.SetResult();
+    await Task.WhenAll(firstStart, secondStart);
+
+    AssertEqual("2", Volatile.Read(ref starts).ToString());
+    AssertEqual("1", Volatile.Read(ref maxActiveStarts).ToString());
+    AssertTrue(Volatile.Read(ref disposed) >= 1, "Second start should stop the first managed session before replacing it.");
 }
 
 static async Task StartingSameEndpointStopsPriorTunnelAsync()
@@ -1031,6 +1148,37 @@ static async Task KmdfSessionRestartsAfterNetworkFaultAsync()
         "KMDF network fault should schedule a restart.");
 }
 
+static async Task KmdfDefaultStartSuppressesInitialControlLinesAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Name = "Default safe driver",
+        Backend = TunnelBackend.Kmdf,
+        VisiblePort = "COM49",
+        BackingPort = null,
+        RestartOnFailure = false
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    bool? suppressInitialControlLineSync = null;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        new InMemoryLog(),
+        [],
+        kmdfSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            suppressInitialControlLineSync = sessionMapping.SuppressInitialControlLineSync;
+            return new FakeKmdfTunnelSession(faulted, failAfterStart: null);
+        });
+
+    await orchestrator.StartAsync(mapping.Id);
+
+    AssertTrue(suppressInitialControlLineSync == true, "KMDF default start should suppress the initial DTR/RTS sync event.");
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == mapping.Id);
+    AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
+}
+
 static async Task KmdfPermanentDriverFaultDoesNotRestartAsync()
 {
     using var temp = new TempDir();
@@ -1131,7 +1279,7 @@ static async Task Com0comCreateAndRemovePlansAsync()
     }
 }
 
-static async Task FakeCom2TcpProcessStartsAndStopsAsync()
+static async Task FakeHub4comProcessStartsAndStopsAsync()
 {
     using var temp = new TempDir();
     CreateFakeDependencies(temp.Path);
@@ -1146,27 +1294,32 @@ static async Task FakeCom2TcpProcessStartsAndStopsAsync()
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
     var log = new InMemoryLog();
-    var orchestrator = CreateOrchestrator(store, new DependencyDetector([temp.Path], pathOverride: ""), log);
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        [],
+        hub4comCommandFactory: mapping => BuildFakeHub4comCommand(temp.Path, mapping));
     var id = (await store.LoadAsync()).Mappings.Single().Id;
 
     var started = await orchestrator.StartAsync(id);
     AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
     AssertTrue(started.ProcessId is not null, "Process id should be reported.");
     await Task.Delay(500);
-    AssertTrue(log.Snapshot().Any(e => e.Message.Contains("fake-com2tcp", StringComparison.OrdinalIgnoreCase)), "Fake process output should be logged.");
+    AssertTrue(log.Snapshot().Any(e => e.Message.Contains("fake-hub4com", StringComparison.OrdinalIgnoreCase)), "Fake process output should be logged.");
 
     var stopped = orchestrator.Stop(id);
     AssertEqual(TunnelRunState.Stopped.ToString(), stopped.State.ToString());
 }
 
-static async Task FakeCom2TcpProcessRestartsAfterExitAsync()
+static async Task FakeHub4comProcessRestartsAfterExitAsync()
 {
     using var temp = new TempDir();
     CreateFakeDependencies(
         temp.Path,
         """
         @echo off
-        echo fake-com2tcp %*
+        echo fake-hub4com %*
         ping -n 2 127.0.0.1 > nul
         """);
     var mapping = new TunnelMapping
@@ -1185,6 +1338,7 @@ static async Task FakeCom2TcpProcessRestartsAfterExitAsync()
         new DependencyDetector([temp.Path], pathOverride: ""),
         log,
         [],
+        hub4comCommandFactory: mapping => BuildFakeHub4comCommand(temp.Path, mapping),
         restartDelay: TimeSpan.FromMilliseconds(50));
     var id = (await store.LoadAsync()).Mappings.Single().Id;
 
@@ -1200,7 +1354,7 @@ static async Task FakeCom2TcpProcessRestartsAfterExitAsync()
     orchestrator.Stop(id);
 }
 
-static async Task FakeCom2TcpAccessDeniedDoesNotRestartAsync()
+static async Task FakeHub4comAccessDeniedDoesNotRestartAsync()
 {
     using var temp = new TempDir();
     CreateFakeDependencies(
@@ -1226,6 +1380,7 @@ static async Task FakeCom2TcpAccessDeniedDoesNotRestartAsync()
         new DependencyDetector([temp.Path], pathOverride: ""),
         log,
         [],
+        hub4comCommandFactory: mapping => BuildFakeHub4comCommand(temp.Path, mapping),
         restartDelay: TimeSpan.FromMilliseconds(50));
     var id = (await store.LoadAsync()).Mappings.Single().Id;
 
@@ -1244,7 +1399,7 @@ static async Task FakeCom2TcpAccessDeniedDoesNotRestartAsync()
         log.Snapshot().Count(e => e.Message.Contains("Started hub4com process", StringComparison.OrdinalIgnoreCase)).ToString());
 }
 
-static async Task ManualStopSuppressesFakeCom2TcpRestartAsync()
+static async Task ManualStopSuppressesFakeHub4comRestartAsync()
 {
     using var temp = new TempDir();
     CreateFakeDependencies(temp.Path);
@@ -1264,6 +1419,7 @@ static async Task ManualStopSuppressesFakeCom2TcpRestartAsync()
         new DependencyDetector([temp.Path], pathOverride: ""),
         log,
         [],
+        hub4comCommandFactory: mapping => BuildFakeHub4comCommand(temp.Path, mapping),
         restartDelay: TimeSpan.FromMilliseconds(50));
     var id = (await store.LoadAsync()).Mappings.Single().Id;
 
@@ -1471,6 +1627,7 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
     IReadOnlyList<string>? registeredPorts,
     Func<TunnelMapping, InMemoryLog, Action<IKmdfTunnelSession, string>, IKmdfTunnelSession>? kmdfSessionFactory = null,
     Func<TunnelMapping, InMemoryLog, Action<IManagedTunnelSession, string>, IManagedTunnelSession>? com0comServiceSessionFactory = null,
+    Func<TunnelMapping, Hub4comCommand>? hub4comCommandFactory = null,
     TimeSpan? restartDelay = null)
 {
     return new TunnelOrchestrator(
@@ -1481,18 +1638,27 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
         log,
         kmdfSessionFactory,
         com0comServiceSessionFactory,
+        hub4comCommandFactory,
         restartDelay);
 }
 
-static void CreateFakeDependencies(string root, string? com2tcpBody = null)
+static Hub4comCommand BuildFakeHub4comCommand(string root, TunnelMapping mapping)
+{
+    var script = Path.Combine(root, "fake-hub4com.cmd");
+    var args = $"/d /c \"\"{script}\" \"\\\\.\\{mapping.BackingPort}\" {mapping.Host} {mapping.Port}\"";
+    return new Hub4comCommand("cmd.exe", args);
+}
+
+static void CreateFakeDependencies(string root, string? fakeHub4comBody = null)
 {
     File.WriteAllText(Path.Combine(root, "setupc.exe"), "");
     File.WriteAllText(Path.Combine(root, "hub4com.exe"), "");
+    File.WriteAllText(Path.Combine(root, "com2tcp-rfc2217.bat"), "@echo off");
     File.WriteAllText(
-        Path.Combine(root, "com2tcp-rfc2217.bat"),
-        com2tcpBody ?? """
+        Path.Combine(root, "fake-hub4com.cmd"),
+        fakeHub4comBody ?? """
         @echo off
-        echo fake-com2tcp %*
+        echo fake-hub4com %*
         ping -n 4 127.0.0.1 > nul
         """);
 }
@@ -1586,6 +1752,8 @@ static byte[] SlipFrame(params byte[] payload)
     return bytes.ToArray();
 }
 
+static byte[] Concat(params byte[][] chunks) => chunks.SelectMany(chunk => chunk).ToArray();
+
 static void AssertRfc2217Notifications(byte[] frame, params Rfc2217Notification[] expected)
 {
     var actual = new Rfc2217Client().ProcessNetworkBytes(frame, frame.Length).Notifications;
@@ -1602,6 +1770,18 @@ static void AssertTrue(bool condition, string message)
     if (!condition)
     {
         throw new Exception(message);
+    }
+}
+
+static void UpdateMax(ref int target, int value)
+{
+    while (true)
+    {
+        var current = Volatile.Read(ref target);
+        if (value <= current || Interlocked.CompareExchange(ref target, value, current) == current)
+        {
+            return;
+        }
     }
 }
 
@@ -1798,6 +1978,36 @@ internal sealed class FakeManagedTunnelSession : IManagedTunnelSession
 
     public void Dispose()
     {
+        if (LastError is null)
+        {
+            State = TunnelRunState.Stopped;
+        }
+    }
+}
+
+internal sealed class DelayedManagedTunnelSession : IManagedTunnelSession
+{
+    private readonly Func<CancellationToken, Task> _startAsync;
+    private readonly Action _disposed;
+
+    public DelayedManagedTunnelSession(Func<CancellationToken, Task> startAsync, Action disposed)
+    {
+        _startAsync = startAsync;
+        _disposed = disposed;
+    }
+
+    public TunnelRunState State { get; private set; } = TunnelRunState.Starting;
+    public string? LastError { get; private set; }
+
+    public async Task StartAsync(CancellationToken cancellationToken)
+    {
+        await _startAsync(cancellationToken);
+        State = TunnelRunState.Running;
+    }
+
+    public void Dispose()
+    {
+        _disposed();
         if (LastError is null)
         {
             State = TunnelRunState.Stopped;
