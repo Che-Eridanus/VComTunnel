@@ -510,30 +510,43 @@ public partial class MainWindow : Window
             _serviceStartAttempted = false;
             SetStatus(T("Status.ServiceRestarting"));
 
-            var serviceWasReady = await IsServiceReadyAsync();
             var installedService = await GetInstalledWindowsServiceInfoAsync();
             var currentInstalledService = IsCurrentInstalledWindowsService(installedService);
-            var installedServiceKnown = false;
             if (currentInstalledService)
             {
-                installedServiceKnown = true;
-                if (installedService.State != InstalledWindowsServiceState.Stopped
-                    && !await RunServiceCtlElevatedAsync("stop", []))
+                if (installedService.State != InstalledWindowsServiceState.Stopped)
                 {
-                    return;
+                    ServiceStateText.Text = T("Status.WindowsServiceStopping");
+                    if (!await RunServiceCtlElevatedAsync("stop", []))
+                    {
+                        return;
+                    }
+
+                    if (!await WaitForInstalledServiceStateAsync(InstalledWindowsServiceState.Stopped, TimeSpan.FromSeconds(30)))
+                    {
+                        SetStatus(T("Status.ServiceStopNotConfirmed"), "warn");
+                        await RefreshAsync();
+                        return;
+                    }
+
+                    AppendGuiLog("info", T("Log.Gui"), T("Status.ServiceStopped"));
                 }
-            }
-            else
-            {
-                installedServiceKnown = await TryStopInstalledWindowsServiceAsync();
+
+                if (await StartInstalledWindowsServiceElevatedAsync())
+                {
+                    SetStatus(T("Status.ServiceRestarted"));
+                }
+                return;
             }
 
+            var serviceWasReady = await IsServiceReadyAsync();
+            var installedServiceKnown = await TryStopInstalledWindowsServiceAsync();
             if ((serviceWasReady || installedServiceKnown) && await WaitForServiceOfflineAsync(TimeSpan.FromSeconds(10)))
             {
                 AppendGuiLog("info", T("Log.Gui"), T("Status.ServiceStopped"));
             }
 
-            if (!currentInstalledService && await IsServiceReadyAsync())
+            if (await IsServiceReadyAsync())
             {
                 var stoppedLocalProcess = StopLocalServiceProcesses();
                 if (stoppedLocalProcess)
@@ -550,15 +563,6 @@ public partial class MainWindow : Window
             }
 
             _serviceStartAttempted = false;
-            if (currentInstalledService)
-            {
-                if (await StartInstalledWindowsServiceElevatedAsync())
-                {
-                    SetStatus(T("Status.ServiceRestarted"));
-                }
-                return;
-            }
-
             await StartServiceAndRefreshAsync(force: true);
             if (await IsServiceReadyAsync())
             {
@@ -603,11 +607,12 @@ public partial class MainWindow : Window
 
         await RunServiceCtlElevatedAsync("stop", [], reportFailure: false);
         StopLocalServiceProcesses();
-        await WaitForServiceOfflineAsync(TimeSpan.FromSeconds(8));
+        await WaitForInstalledServiceStateAsync(InstalledWindowsServiceState.Stopped, TimeSpan.FromSeconds(20));
 
         if (await RunServiceCtlElevatedAsync("start", []))
         {
-            if (await WaitForServiceAsync(TimeSpan.FromSeconds(12)))
+            if (await WaitForInstalledServiceStateAsync(InstalledWindowsServiceState.Running, TimeSpan.FromSeconds(20))
+                && await WaitForServiceAsync(TimeSpan.FromSeconds(12)))
             {
                 await RefreshAsync();
                 SetStatus(T("Status.ServiceInstalled"));
@@ -788,13 +793,41 @@ public partial class MainWindow : Window
 
     private async Task<bool> StartInstalledWindowsServiceElevatedAsync()
     {
-        SetStatus(T("Status.WindowsServiceStarting"));
-        if (!await RunServiceCtlElevatedAsync("start", []))
+        var service = await GetInstalledWindowsServiceInfoAsync();
+        if (service.State == InstalledWindowsServiceState.NotInstalled)
         {
             return false;
         }
 
-        if (await WaitForServiceAsync(TimeSpan.FromSeconds(12)))
+        var expectedServicePath = ResolveServicePath();
+        if (!ServiceBinaryPathMatches(service.BinaryPath, expectedServicePath))
+        {
+            AppendGuiLog(
+                "warn",
+                T("Log.Gui"),
+                TF(
+                    "Status.ServicePathMismatch",
+                    string.IsNullOrWhiteSpace(service.BinaryPath) ? T("Msg.Unknown") : service.BinaryPath,
+                    string.IsNullOrWhiteSpace(expectedServicePath) ? T("Msg.Unknown") : expectedServicePath));
+            return false;
+        }
+
+        if (service.State != InstalledWindowsServiceState.Running)
+        {
+            SetStatus(T("Status.WindowsServiceStarting"));
+            if (!await RunServiceCtlElevatedAsync("start", []))
+            {
+                return false;
+            }
+        }
+
+        if (!await WaitForInstalledServiceStateAsync(InstalledWindowsServiceState.Running, TimeSpan.FromSeconds(30)))
+        {
+            SetStatus(T("Status.ServiceStartFailed"), "warn");
+            return false;
+        }
+
+        if (await WaitForServiceAsync(TimeSpan.FromSeconds(20)))
         {
             await RefreshAsync();
             SetStatus(T("Status.BackgroundServiceReady"));
@@ -819,7 +852,7 @@ public partial class MainWindow : Window
 
         SetStatus(T("Status.ServiceUninstalling"));
         await RunServiceCtlElevatedAsync("stop", []);
-        await WaitForServiceOfflineAsync(TimeSpan.FromSeconds(10));
+        await WaitForInstalledServiceStateAsync(InstalledWindowsServiceState.Stopped, TimeSpan.FromSeconds(30));
         if (!await RunServiceCtlElevatedAsync("uninstall", []))
         {
             return;
@@ -848,13 +881,14 @@ public partial class MainWindow : Window
         var installedService = await GetInstalledWindowsServiceInfoAsync();
         if (IsCurrentInstalledWindowsService(installedService))
         {
+            ServiceStateText.Text = T("Status.WindowsServiceStopping");
             if (installedService.State != InstalledWindowsServiceState.Stopped
                 && !await RunServiceCtlElevatedAsync("stop", []))
             {
                 return;
             }
 
-            if (await WaitForServiceOfflineAsync(TimeSpan.FromSeconds(12)))
+            if (await WaitForInstalledServiceStateAsync(InstalledWindowsServiceState.Stopped, TimeSpan.FromSeconds(30)))
             {
                 SetStatus(T("Status.ServiceStopped"));
                 ClearComPairsList();
@@ -890,6 +924,39 @@ public partial class MainWindow : Window
 
         _serviceStartAttempted = true;
         ServiceStateText.Text = T("Status.ServiceStarting");
+
+        var installedService = await GetInstalledWindowsServiceInfoAsync();
+        if (IsCurrentInstalledWindowsService(installedService))
+        {
+            if (installedService.State == InstalledWindowsServiceState.Running)
+            {
+                if (await WaitForServiceAsync(TimeSpan.FromSeconds(10)))
+                {
+                    await RefreshAsync();
+                    SetStatus(T("Status.BackgroundServiceReady"));
+                    return;
+                }
+
+                ServiceStateText.Text = T("Status.ServiceOffline");
+                ClearComPairsList();
+                DependenciesText.Text = TF("Diag.StartedButNotReady", ResolveServicePath() ?? "VComTunnel.Service.exe");
+                DependenciesText.Text += Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
+                return;
+            }
+
+            if (force && await StartInstalledWindowsServiceElevatedAsync())
+            {
+                await RefreshAsync();
+                SetStatus(T("Status.BackgroundServiceReady"));
+                return;
+            }
+
+            ServiceStateText.Text = T("Status.ServiceOffline");
+            ClearComPairsList();
+            DependenciesText.Text = T("Diag.WindowsBackgroundServiceStopped");
+            DependenciesText.Text += Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
+            return;
+        }
 
         if (await TryStartInstalledWindowsServiceAsync())
         {
@@ -1224,6 +1291,26 @@ public partial class MainWindow : Window
         }
 
         return !await IsServiceReadyAsync();
+    }
+
+    private async Task<bool> WaitForInstalledServiceStateAsync(InstalledWindowsServiceState expectedState, TimeSpan timeout)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            var service = await GetInstalledWindowsServiceInfoAsync();
+            if (service.State == expectedState
+                || (expectedState == InstalledWindowsServiceState.Stopped && service.State == InstalledWindowsServiceState.NotInstalled))
+            {
+                return true;
+            }
+
+            await Task.Delay(500);
+        }
+
+        var finalService = await GetInstalledWindowsServiceInfoAsync();
+        return finalService.State == expectedState
+            || (expectedState == InstalledWindowsServiceState.Stopped && finalService.State == InstalledWindowsServiceState.NotInstalled);
     }
 
     private bool StopLocalServiceProcesses()
@@ -1603,6 +1690,23 @@ public partial class MainWindow : Window
         }
 
         ServiceStateText.Text = T("Status.ServiceStarting");
+        var installedService = await GetInstalledWindowsServiceInfoAsync();
+        if (IsCurrentInstalledWindowsService(installedService))
+        {
+            if (installedService.State == InstalledWindowsServiceState.Running
+                && await WaitForServiceAsync(TimeSpan.FromSeconds(10)))
+            {
+                return true;
+            }
+
+            ServiceStateText.Text = T("Status.ServiceOffline");
+            ClearComPairsList();
+            DependenciesText.Text = T("Diag.WindowsBackgroundServiceStopped");
+            DependenciesText.Text += Environment.NewLine + Environment.NewLine + FormatDependencies(new DependencyDetector().Detect());
+            SetStatus(TF("Status.LocalServiceApiUnavailable", actionLabel, ServiceEndpoint.DefaultUrl, T("Diag.WindowsBackgroundServiceStopped")), "error");
+            return false;
+        }
+
         if (await TryStartInstalledWindowsServiceAsync())
         {
             return true;
