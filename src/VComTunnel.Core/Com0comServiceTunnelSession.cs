@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 using Microsoft.Win32.SafeHandles;
 
 namespace VComTunnel.Core;
@@ -9,11 +10,14 @@ namespace VComTunnel.Core;
 public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 {
     private const int MaxFrameBytes = 4096;
+    private const int SerialRxWriteChunkBytes = 256;
+    private const int SerialRxQueueCapacityChunks = 256;
+    private const int SerialRxQueueWarnBytes = 32 * 1024;
     private const uint StartupBaudRate = 115200;
     private const byte StartupByteSize = 8;
     private const byte StartupParity = 0;
     private const byte StartupStopBits = 0;
-    private static readonly TimeSpan SerialModemPollInterval = TimeSpan.FromMilliseconds(2);
+    private static readonly TimeSpan SerialModemPollInterval = TimeSpan.FromMilliseconds(1);
     private static readonly TimeSpan SerialSettingsPollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan CommandAckTimeout = Rfc2217Client.RecommendedCommandAckTimeout;
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
@@ -29,20 +33,29 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private readonly List<Rfc2217ExpectedAck> _pendingAcks = [];
     private readonly object _flowLock = new();
     private readonly SemaphoreSlim _networkWriteLock = new(1, 1);
-    private readonly ThroughputLogThrottle _serialTxLog = new(TimeSpan.FromSeconds(1));
-    private readonly ThroughputLogThrottle _serialRxLog = new(TimeSpan.FromSeconds(1));
+    private readonly Channel<SerialRxChunk> _serialRxQueue = Channel.CreateBounded<SerialRxChunk>(new BoundedChannelOptions(SerialRxQueueCapacityChunks)
+    {
+        SingleReader = true,
+        SingleWriter = true,
+        FullMode = BoundedChannelFullMode.Wait
+    });
+    private readonly ByteThroughputLogThrottle _serialTxLog = new(TimeSpan.FromSeconds(1));
+    private readonly ByteThroughputLogThrottle _serialRxLog = new(TimeSpan.FromSeconds(1));
     private readonly object _serialStateLock = new();
     private readonly CancellationTokenSource _stop = new();
     private TaskCompletionSource? _pendingAckCompletion;
     private TaskCompletionSource? _flowResumeCompletion;
     private bool _remoteFlowSuspended;
     private long _lastNetworkActivityTicks;
+    private int _serialRxQueuedBytes;
+    private long _serialRxQueueBackpressureLogTicks;
     private ISerialPortEndpoint? _serial;
     private TcpClient? _tcp;
     private Task? _serialLoop;
     private Task? _serialModemLoop;
     private Task? _serialSettingsLoop;
     private Task? _networkLoop;
+    private Task? _serialRxLoop;
     private Task? _keepAliveLoop;
     private SerialPortSnapshot? _lastSerialSnapshot;
     private bool _pollModemState;
@@ -82,6 +95,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         }
 
         _tcp = new TcpClient();
+        TunnelTcpOptions.ConfigureLowLatency(_tcp);
         try
         {
             await _tcp.ConnectAsync(_mapping.Host, _mapping.Port, cancellationToken).ConfigureAwait(false);
@@ -92,6 +106,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         }
 
         var stream = _tcp.GetStream();
+        _serialRxLoop = Task.Run(SerialRxWriteLoopAsync);
         _networkLoop = Task.Run(NetworkLoopAsync);
         await SendFrameWithAckAsync(
             stream,
@@ -130,10 +145,12 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         _pollModemState = !_serial.SupportsModemStatusEvents;
         if (_pollModemState)
         {
-            _log.Warn(_mapping.Name, $"Serial modem-control events are unavailable; falling back to {SerialModemPollInterval.TotalMilliseconds:0} ms polling for DTR/RTS.");
+            _log.Warn(_mapping.Name, $"Serial modem-control events are unavailable; falling back to dedicated {SerialModemPollInterval.TotalMilliseconds:0} ms polling for DTR/RTS.");
+            _serialModemLoop = Task.Run(SerialModemPollingLoopAsync);
         }
         else
         {
+            _log.Info(_mapping.Name, "Serial modem-control events enabled through overlapped WaitCommEvent for DTR/RTS.");
             _serialModemLoop = Task.Run(SerialModemEventLoopAsync);
         }
 
@@ -151,6 +168,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
         State = LastError is null ? TunnelRunState.Stopped : TunnelRunState.Faulted;
         _stop.Cancel();
+        _serialRxQueue.Writer.TryComplete();
         _tcp?.Dispose();
         _serial?.Dispose();
         _stop.Dispose();
@@ -210,6 +228,10 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                     await WriteNetworkAsync(stream, frame.Bytes).ConfigureAwait(false);
                     _log.Info(_mapping.Name, frame.Description);
                 }
+                else if (frame.LogWhenEmpty)
+                {
+                    _log.Info(_mapping.Name, frame.Description);
+                }
             }
         }
         catch (Exception ex) when (!_stop.IsCancellationRequested)
@@ -218,6 +240,33 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         }
     }
 
+    private async Task SerialModemPollingLoopAsync()
+    {
+        try
+        {
+            var stream = _tcp!.GetStream();
+            while (!_stop.IsCancellationRequested)
+            {
+                var currentModemStatus = _serial!.GetModemStatus();
+                var frame = UpdateSerialModemState(currentModemStatus, SerialPortSnapshot.EventNone);
+                if (frame.Bytes.Length > 0)
+                {
+                    await WriteNetworkAsync(stream, frame.Bytes).ConfigureAwait(false);
+                    _log.Info(_mapping.Name, frame.Description);
+                }
+                else if (frame.LogWhenEmpty)
+                {
+                    _log.Info(_mapping.Name, frame.Description);
+                }
+
+                await Task.Delay(SerialModemPollInterval, _stop.Token).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (!_stop.IsCancellationRequested)
+        {
+            Fault(ex);
+        }
+    }
     private async Task SerialSettingsLoopAsync()
     {
         try
@@ -225,16 +274,18 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             var stream = _tcp!.GetStream();
             while (!_stop.IsCancellationRequested)
             {
-                var frame = _pollModemState
-                    ? UpdateSerialStateFromPoll(_serial!.GetSnapshot())
-                    : UpdateSerialSettings(_serial!.GetSettings());
+                var frame = UpdateSerialSettings(_serial!.GetSettings());
                 if (frame.Bytes.Length > 0)
                 {
                     await WriteNetworkAsync(stream, frame.Bytes).ConfigureAwait(false);
                     _log.Info(_mapping.Name, frame.Description);
                 }
+                else if (frame.LogWhenEmpty)
+                {
+                    _log.Info(_mapping.Name, frame.Description);
+                }
 
-                await Task.Delay(_pollModemState ? SerialModemPollInterval : SerialSettingsPollInterval, _stop.Token).ConfigureAwait(false);
+                await Task.Delay(SerialSettingsPollInterval, _stop.Token).ConfigureAwait(false);
             }
         }
         catch (Exception ex) when (!_stop.IsCancellationRequested)
@@ -254,7 +305,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             }
 
             _lastSerialSnapshot = current;
-            return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone);
+            return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone, _mapping.Hub4comForwardControlLines);
         }
     }
 
@@ -292,22 +343,20 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
             var current = previous with { ModemStatus = currentModemStatus };
             _lastSerialSnapshot = current;
-            return BuildModemChangeFrame(previous, current, eventMask);
+            return BuildModemChangeFrame(previous, current, eventMask, _mapping.Hub4comForwardControlLines);
         }
     }
 
-    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current)
+    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, bool forwardControlLines)
     {
-        return CombineFrames(
-            BuildSettingsChangeFrame(previous, current),
-            BuildModemChangeFrame(previous, current, SerialPortSnapshot.EventNone));
+        return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone, forwardControlLines);
     }
 
-    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, uint eventMask)
+    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, uint eventMask, bool forwardControlLines)
     {
         return CombineFrames(
             BuildSettingsChangeFrame(previous, current),
-            BuildModemChangeFrame(previous, current, eventMask));
+            BuildModemChangeFrame(previous, current, eventMask, forwardControlLines));
     }
 
     private static Rfc2217OutboundFrame BuildSettingsChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current)
@@ -332,7 +381,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         return BuildFrame(frames, descriptions);
     }
 
-    private static Rfc2217OutboundFrame BuildModemChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, uint eventMask)
+    private static Rfc2217OutboundFrame BuildModemChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, uint eventMask, bool forwardControlLines)
     {
         var frames = new List<byte[]>();
         var descriptions = new List<string>();
@@ -342,25 +391,41 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         var currentRts = MapCom0comPeerRts(current.ModemStatus);
         bool? dtr = previousDtr != currentDtr ? currentDtr : null;
         bool? rts = previousRts != currentRts ? currentRts : null;
-        if (dtr is not null || rts is not null)
+        var modemChanged = dtr is not null || rts is not null;
+        var missedDtrPulse = !modemChanged && (eventMask & SerialPortSnapshot.EventDsr) != 0 && previousDtr == currentDtr;
+        var missedRtsPulse = !modemChanged && (eventMask & SerialPortSnapshot.EventCts) != 0 && previousRts == currentRts;
+
+        if (!forwardControlLines)
+        {
+            if (modemChanged || missedDtrPulse || missedRtsPulse)
+            {
+                bool? suppressedDtr = modemChanged ? dtr : missedDtrPulse ? !currentDtr : null;
+                bool? suppressedRts = modemChanged ? rts : missedRtsPulse ? !currentRts : null;
+                return new Rfc2217OutboundFrame(
+                    [],
+                    [],
+                    $"Suppressed modem-control because control-line forwarding is disabled raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}, event=0x{eventMask:X8}, dtr={FormatNullableBool(suppressedDtr)}, rts={FormatNullableBool(suppressedRts)}.",
+                    LogWhenEmpty: true);
+            }
+
+            return BuildFrame(frames, descriptions);
+        }
+
+        if (modemChanged)
         {
             frames.Add(Rfc2217Client.BuildSetModemControl(dtr, rts));
-            descriptions.Add($"modem raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}, dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}");
+            descriptions.Add($"TX modem-control raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}, dtr={FormatNullableBool(dtr)}, rts={FormatNullableBool(rts)}");
         }
-        else
+        else if (missedDtrPulse || missedRtsPulse)
         {
-            var missedDtrPulse = (eventMask & SerialPortSnapshot.EventDsr) != 0 && previousDtr == currentDtr;
-            var missedRtsPulse = (eventMask & SerialPortSnapshot.EventCts) != 0 && previousRts == currentRts;
-            if (missedDtrPulse || missedRtsPulse)
-            {
-                var pulseDtr = missedDtrPulse ? !currentDtr : (bool?)null;
-                var pulseRts = missedRtsPulse ? !currentRts : (bool?)null;
-                var restoreDtr = missedDtrPulse ? currentDtr : (bool?)null;
-                var restoreRts = missedRtsPulse ? currentRts : (bool?)null;
-                frames.Add(Rfc2217Client.BuildSetModemControl(pulseDtr, pulseRts));
-                frames.Add(Rfc2217Client.BuildSetModemControl(restoreDtr, restoreRts));
-                descriptions.Add($"modem raw=0x{current.ModemStatus:X8}, event=0x{eventMask:X8}, synthesized pulse dtr={FormatNullableBool(pulseDtr)}, rts={FormatNullableBool(pulseRts)}");
-            }
+            var pulseDtr = missedDtrPulse ? !currentDtr : (bool?)null;
+            var pulseRts = missedRtsPulse ? !currentRts : (bool?)null;
+            var restoreDtr = missedDtrPulse ? currentDtr : (bool?)null;
+            var restoreRts = missedRtsPulse ? currentRts : (bool?)null;
+            frames.Add(Rfc2217Client.BuildSetModemControl(pulseDtr, pulseRts));
+            frames.Add(Rfc2217Client.BuildSetModemControl(restoreDtr, restoreRts));
+            descriptions.Add($"TX modem-control synthesized-pulse raw=0x{current.ModemStatus:X8}, event=0x{eventMask:X8}, dtr={FormatNullableBool(pulseDtr)}, rts={FormatNullableBool(pulseRts)}");
+            descriptions.Add($"TX modem-control synthesized-restore raw=0x{current.ModemStatus:X8}, event=0x{eventMask:X8}, dtr={FormatNullableBool(restoreDtr)}, rts={FormatNullableBool(restoreRts)}");
         }
 
         return BuildFrame(frames, descriptions);
@@ -396,11 +461,11 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     public static bool MapCom0comPeerRts(uint modemStatus) => (modemStatus & SerialPortSnapshot.Cts) != 0;
 
-    public static byte[] BuildCom0comPeerModemControlFrames(uint previousModemStatus, uint currentModemStatus, uint eventMask)
+    public static byte[] BuildCom0comPeerModemControlFrames(uint previousModemStatus, uint currentModemStatus, uint eventMask, bool forwardControlLines = true)
     {
         var previous = new SerialPortSnapshot(previousModemStatus, 0, 0, 0, 0);
         var current = previous with { ModemStatus = currentModemStatus };
-        return BuildModemChangeFrame(previous, current, eventMask).Bytes;
+        return BuildModemChangeFrame(previous, current, eventMask, forwardControlLines).Bytes;
     }
 
     private async Task NetworkLoopAsync()
@@ -448,15 +513,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                         _log.Info(_mapping.Name, $"RFC2217 esptool baud-rate {confirmedBaudRate.Value} sent after target response.");
                     }
 
-                    try
-                    {
-                        await _serial!.WriteAsync(frame.SerialData, _stop.Token).ConfigureAwait(false);
-                        LogSerialRx(frame.SerialData.Length);
-                    }
-                    catch (SerialPortWriteTimeoutException ex)
-                    {
-                        _log.Warn(_mapping.Name, $"{ex.Message} Dropped {frame.SerialData.Length} RFC2217 RX byte(s) for {_mapping.BackingPort}.");
-                    }
+                    await EnqueueSerialRxAsync(frame.SerialData).ConfigureAwait(false);
                 }
             }
         }
@@ -466,6 +523,61 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         }
     }
 
+    private async Task EnqueueSerialRxAsync(byte[] bytes)
+    {
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            var count = Math.Min(SerialRxWriteChunkBytes, bytes.Length - offset);
+            var chunk = new byte[count];
+            Buffer.BlockCopy(bytes, offset, chunk, 0, count);
+            var queuedBytes = Interlocked.Add(ref _serialRxQueuedBytes, count);
+            var waitStarted = Stopwatch.GetTimestamp();
+            try
+            {
+                await _serialRxQueue.Writer.WriteAsync(new SerialRxChunk(chunk), _stop.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                Interlocked.Add(ref _serialRxQueuedBytes, -count);
+                throw;
+            }
+
+            var waited = Stopwatch.GetElapsedTime(waitStarted);
+            if (waited > TimeSpan.FromMilliseconds(4) || queuedBytes >= SerialRxQueueWarnBytes)
+            {
+                LogSerialRxQueueBackpressure(queuedBytes, waited);
+            }
+
+            offset += count;
+        }
+    }
+
+    private async Task SerialRxWriteLoopAsync()
+    {
+        try
+        {
+            await foreach (var chunk in _serialRxQueue.Reader.ReadAllAsync(_stop.Token).ConfigureAwait(false))
+            {
+                try
+                {
+                    await _serial!.WriteAsync(chunk.Bytes, _stop.Token, LogSerialRxBackpressure).ConfigureAwait(false);
+                    LogSerialRx(chunk.Bytes.Length);
+                }
+                finally
+                {
+                    Interlocked.Add(ref _serialRxQueuedBytes, -chunk.Bytes.Length);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (_stop.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex) when (!_stop.IsCancellationRequested)
+        {
+            Fault(ex);
+        }
+    }
     private async Task KeepAliveLoopAsync()
     {
         try
@@ -612,13 +724,35 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private void LogSerialTx(int bytes)
     {
         _serialTxLog.Record(bytes, (totalBytes, chunks) =>
-            _log.Info(_mapping.Name, $"Serial TX {totalBytes} byte(s) in {chunks} chunk(s) from {_mapping.BackingPort}."));
+            _log.Info(_mapping.Name, $"Serial TX summary since last log: {totalBytes} byte(s) in {chunks} chunk(s) from {_mapping.BackingPort}."));
     }
 
     private void LogSerialRx(int bytes)
     {
         _serialRxLog.Record(bytes, (totalBytes, chunks) =>
-            _log.Info(_mapping.Name, $"RFC2217 RX serial {totalBytes} byte(s) in {chunks} chunk(s) to {_mapping.BackingPort}."));
+            _log.Info(_mapping.Name, $"RFC2217 RX serial summary since last log: {totalBytes} byte(s) in {chunks} chunk(s) to {_mapping.BackingPort}."));
+    }
+
+    private void LogSerialRxBackpressure(SerialPortBackpressureInfo info)
+    {
+        _log.Warn(
+            _mapping.Name,
+            $"Serial RX backpressure on {_mapping.BackingPort}: no local-COM progress for {info.Duration.TotalMilliseconds:0} ms; holding {info.RemainingBytes}/{info.TotalBytes} byte(s) in the local-COM writer; RFC2217 reads continue until the bounded RX queue fills.");
+    }
+
+    private void LogSerialRxQueueBackpressure(int queuedBytes, TimeSpan waited)
+    {
+        var now = Stopwatch.GetTimestamp();
+        var next = Interlocked.Read(ref _serialRxQueueBackpressureLogTicks);
+        if (next != 0 && now < next)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _serialRxQueueBackpressureLogTicks, now + Stopwatch.Frequency);
+        _log.Warn(
+            _mapping.Name,
+            $"Serial RX queue backpressure on {_mapping.BackingPort}: queued {queuedBytes} byte(s), enqueue waited {waited.TotalMilliseconds:0.0} ms.");
     }
 
     private Task PrepareAckWait(IReadOnlyList<Rfc2217ExpectedAck> expectedAcks)
@@ -786,44 +920,19 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         byte[] Bytes,
         Rfc2217ExpectedAck[] ExpectedAckCommands,
         string Description,
-        bool ContinueOnAckTimeout = false);
+        bool ContinueOnAckTimeout = false,
+        bool LogWhenEmpty = false);
 
-    private sealed class ThroughputLogThrottle
-    {
-        private readonly long _intervalTicks;
-        private long _nextFlushTicks;
-        private long _bytes;
-        private int _chunks;
+    private sealed record SerialRxChunk(byte[] Bytes);
 
-        public ThroughputLogThrottle(TimeSpan interval)
-        {
-            _intervalTicks = (long)(interval.TotalSeconds * Stopwatch.Frequency);
-        }
 
-        public void Record(int bytes, Action<long, int> flush)
-        {
-            _bytes += bytes;
-            _chunks++;
-
-            var now = Stopwatch.GetTimestamp();
-            if (_nextFlushTicks != 0 && now < _nextFlushTicks)
-            {
-                return;
-            }
-
-            flush(_bytes, _chunks);
-            _bytes = 0;
-            _chunks = 0;
-            _nextFlushTicks = now + _intervalTicks;
-        }
-    }
 }
 
 public interface ISerialPortEndpoint : IDisposable
 {
     bool SupportsModemStatusEvents { get; }
     ValueTask<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
-    ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken);
+    ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null);
     SerialPortSnapshot GetSnapshot();
     SerialPortSettings GetSettings();
     uint GetModemStatus();
@@ -852,6 +961,11 @@ public readonly record struct SerialPortSettings(
     byte Parity,
     byte StopBits);
 
+public sealed record SerialPortBackpressureInfo(int BytesWritten, int TotalBytes, TimeSpan Duration)
+{
+    public int RemainingBytes => Math.Max(0, TotalBytes - BytesWritten);
+}
+
 public interface ISerialPortEndpointFactory
 {
     ISerialPortEndpoint Open(string portName);
@@ -878,13 +992,6 @@ public sealed class SerialPortOpenException : IOException
     }
 }
 
-public sealed class SerialPortWriteTimeoutException : IOException
-{
-    public SerialPortWriteTimeoutException(string message)
-        : base(message)
-    {
-    }
-}
 
 public sealed class EspToolBaudRateMonitor
 {
@@ -1046,19 +1153,34 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     private const uint FileShareWrite = 0x00000002;
     private const uint OpenExisting = 3;
     private const uint FileAttributeNormal = 0x00000080;
+    private const uint FileFlagOverlapped = 0x40000000;
     private const uint EventCts = 0x00000008;
     private const uint EventDsr = 0x00000010;
-    private const uint SerialReadPollTimeoutMs = 10;
-    private static readonly TimeSpan ZeroWriteRetryInterval = TimeSpan.FromMilliseconds(10);
-    private static readonly TimeSpan ZeroWriteTimeout = TimeSpan.FromMilliseconds(500);
+    private const uint DcbBinary = 0x00000001;
+    private const uint DcbOutxCtsFlow = 0x00000004;
+    private const uint DcbOutxDsrFlow = 0x00000008;
+    private const uint DcbDsrSensitivity = 0x00000040;
+    private const uint DcbOutX = 0x00000100;
+    private const uint DcbInX = 0x00000200;
+    private const uint DcbAbortOnError = 0x00004000;
+    private const uint SerialReadFirstByteTimeoutMs = 2;
+    private const uint SerialWriteTimeoutMs = 20;
+    private const int ErrorIoPending = 997;
+    private const int ErrorOperationAborted = 995;
+    private static readonly TimeSpan WriteInitialBackpressureLogDelay = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan WriteBackpressureLogInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan CancelOverlappedWaitTimeout = TimeSpan.FromSeconds(1);
 
     private readonly SafeFileHandle _handle;
-    private readonly SafeFileHandle? _eventHandle;
+    private readonly bool _supportsModemStatusEvents;
+    private readonly object _readLock = new();
+    private readonly object _writeLock = new();
+    private readonly object _waitCommEventLock = new();
 
-    private Win32SerialPortEndpoint(SafeFileHandle handle, SafeFileHandle? eventHandle)
+    private Win32SerialPortEndpoint(SafeFileHandle handle, bool supportsModemStatusEvents)
     {
         _handle = handle;
-        _eventHandle = eventHandle;
+        _supportsModemStatusEvents = supportsModemStatusEvents;
     }
 
     public static Win32SerialPortEndpoint Open(string portName)
@@ -1068,16 +1190,14 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
             throw new PlatformNotSupportedException("com0comService backend is only available on Windows.");
         }
 
-        var path = portName.StartsWith(@"\\.\", StringComparison.Ordinal)
-            ? portName
-            : $@"\\.\{portName}";
+        var path = BuildDevicePath(portName);
         var handle = CreateFileW(
             path,
             GenericRead | GenericWrite,
             FileShareRead | FileShareWrite,
             IntPtr.Zero,
             OpenExisting,
-            FileAttributeNormal,
+            FileAttributeNormal | FileFlagOverlapped,
             IntPtr.Zero);
 
         if (handle.IsInvalid)
@@ -1090,10 +1210,10 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         var timeouts = new CommTimeouts
         {
             ReadIntervalTimeout = uint.MaxValue,
-            ReadTotalTimeoutMultiplier = 0,
-            ReadTotalTimeoutConstant = SerialReadPollTimeoutMs,
+            ReadTotalTimeoutMultiplier = uint.MaxValue,
+            ReadTotalTimeoutConstant = SerialReadFirstByteTimeoutMs,
             WriteTotalTimeoutMultiplier = 0,
-            WriteTotalTimeoutConstant = 2000
+            WriteTotalTimeoutConstant = SerialWriteTimeoutMs
         };
         if (!SetCommTimeouts(handle, ref timeouts))
         {
@@ -1102,24 +1222,57 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
             throw new SerialPortOpenException(portName, path, error, "configure serial port timeouts for");
         }
 
-        var eventHandle = TryOpenEventHandle(path);
-        return new Win32SerialPortEndpoint(handle, eventHandle);
+        if (!ConfigureLowLatencyLocalHandflow(handle))
+        {
+            var error = Marshal.GetLastWin32Error();
+            handle.Dispose();
+            throw new SerialPortOpenException(portName, path, error, "configure local serial handflow for");
+        }
+
+        var supportsModemStatusEvents = SetCommMask(handle, EventCts | EventDsr);
+        return new Win32SerialPortEndpoint(handle, supportsModemStatusEvents);
     }
 
-    public bool SupportsModemStatusEvents => _eventHandle is { IsClosed: false, IsInvalid: false };
+    private static string BuildDevicePath(string portName) => portName.StartsWith(@"\\.\", StringComparison.Ordinal)
+        ? portName
+        : $@"\\.\{portName}";
+
+    private static bool ConfigureLowLatencyLocalHandflow(SafeFileHandle handle)
+    {
+        var dcb = new Dcb { DCBlength = (uint)Marshal.SizeOf<Dcb>() };
+        if (!GetCommState(handle, ref dcb))
+        {
+            return false;
+        }
+
+        dcb.Flags = NormalizeLocalSerialFlags(dcb.Flags);
+        return SetCommState(handle, ref dcb);
+    }
+
+    private static uint NormalizeLocalSerialFlags(uint flags)
+    {
+        flags |= DcbBinary;
+        flags &= ~(DcbOutxCtsFlow
+            | DcbOutxDsrFlow
+            | DcbDsrSensitivity
+            | DcbOutX
+            | DcbInX
+            | DcbAbortOnError);
+        return flags;
+    }
+
+    public bool SupportsModemStatusEvents => _supportsModemStatusEvents;
 
     public ValueTask<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (!ReadFile(_handle, buffer, buffer.Length, out var bytesRead, IntPtr.Zero))
+        lock (_readLock)
         {
-            throw new Win32Exception(Marshal.GetLastWin32Error());
+            return ValueTask.FromResult(ReadOverlapped(buffer, cancellationToken));
         }
-
-        return ValueTask.FromResult(bytesRead);
     }
 
-    public ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken)
+    public ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (bytes.Length == 0)
@@ -1127,51 +1280,12 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
             return ValueTask.CompletedTask;
         }
 
-        var pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
-        try
+        lock (_writeLock)
         {
-            var basePointer = pinned.AddrOfPinnedObject();
-            var offset = 0;
-            long? zeroWriteDeadline = null;
-            while (offset < bytes.Length)
-            {
-                var remaining = bytes.Length - offset;
-                if (!WriteFile(_handle, IntPtr.Add(basePointer, offset), remaining, out var written, IntPtr.Zero))
-                {
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
-                }
-
-                if (written <= 0)
-                {
-                    zeroWriteDeadline ??= Stopwatch.GetTimestamp() + (long)(ZeroWriteTimeout.TotalSeconds * Stopwatch.Frequency);
-                    if (Stopwatch.GetTimestamp() >= zeroWriteDeadline)
-                    {
-                        throw new SerialPortWriteTimeoutException("Serial port write completed with zero bytes.");
-                    }
-
-                    SleepBeforeRetry(cancellationToken);
-                    continue;
-                }
-
-                offset += written;
-                zeroWriteDeadline = null;
-            }
-        }
-        finally
-        {
-            pinned.Free();
+            WriteOverlapped(bytes, cancellationToken, backpressure);
         }
 
         return ValueTask.CompletedTask;
-    }
-
-    private static void SleepBeforeRetry(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (cancellationToken.WaitHandle.WaitOne(ZeroWriteRetryInterval))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-        }
     }
 
     public SerialPortSnapshot GetSnapshot()
@@ -1209,48 +1323,244 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
             throw new NotSupportedException("Serial modem status events are unavailable.");
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
-        if (!WaitCommEvent(_eventHandle!, out var eventMask, IntPtr.Zero))
+        lock (_waitCommEventLock)
         {
-            var error = Marshal.GetLastWin32Error();
             cancellationToken.ThrowIfCancellationRequested();
-            throw new Win32Exception(error);
+            return WaitForModemStatusChangeOverlapped(cancellationToken);
         }
-
-        cancellationToken.ThrowIfCancellationRequested();
-        return eventMask;
     }
 
     public void Dispose()
     {
-        _eventHandle?.Dispose();
+        if (!_handle.IsClosed && !_handle.IsInvalid)
+        {
+            _ = CancelIoEx(_handle, IntPtr.Zero);
+        }
+
         _handle.Dispose();
     }
 
-    private static SafeFileHandle? TryOpenEventHandle(string path)
+    private int ReadOverlapped(byte[] buffer, CancellationToken cancellationToken)
     {
-        var handle = CreateFileW(
-            path,
-            GenericRead | GenericWrite,
-            FileShareRead | FileShareWrite,
-            IntPtr.Zero,
-            OpenExisting,
-            FileAttributeNormal,
-            IntPtr.Zero);
-
-        if (handle.IsInvalid)
+        var pinned = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+        var wait = new ManualResetEvent(false);
+        var overlappedPointer = Marshal.AllocHGlobal(Marshal.SizeOf<OverlappedNative>());
+        var lifetime = new PendingOverlappedLifetime(pinned, wait, overlappedPointer);
+        try
         {
-            handle.Dispose();
-            return null;
+            PrepareOverlapped(overlappedPointer, wait);
+            if (!ReadFile(_handle, pinned.AddrOfPinnedObject(), buffer.Length, out var completedRead, overlappedPointer))
+            {
+                var error = Marshal.GetLastWin32Error();
+                if (error != ErrorIoPending)
+                {
+                    throw new Win32Exception(error);
+                }
+
+                return checked((int)WaitForOverlappedResult(overlappedPointer, wait, cancellationToken, lifetime, logBackpressure: null));
+            }
+
+            return checked((int)completedRead);
+        }
+        finally
+        {
+            lifetime.DisposeIfCompleted();
+        }
+    }
+
+    private void WriteOverlapped(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure)
+    {
+        var pinned = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+        var keepPinnedAfterCancel = false;
+        try
+        {
+            var offset = 0;
+            while (offset < bytes.Length)
+            {
+                var wait = new ManualResetEvent(false);
+                var overlappedPointer = Marshal.AllocHGlobal(Marshal.SizeOf<OverlappedNative>());
+                var lifetime = new PendingOverlappedLifetime(null, wait, overlappedPointer);
+                try
+                {
+                    PrepareOverlapped(overlappedPointer, wait);
+                    var remaining = bytes.Length - offset;
+                    if (!WriteFile(_handle, IntPtr.Add(pinned.AddrOfPinnedObject(), offset), remaining, out var completedWritten, overlappedPointer))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        if (error != ErrorIoPending)
+                        {
+                            throw new Win32Exception(error);
+                        }
+
+                        completedWritten = WaitForOverlappedResult(
+                            overlappedPointer,
+                            wait,
+                            cancellationToken,
+                            lifetime,
+                            () => backpressure?.Invoke(new SerialPortBackpressureInfo(offset, bytes.Length, Stopwatch.GetElapsedTime(lifetime.StartedTicks))));
+                    }
+
+                    if (completedWritten == 0)
+                    {
+                        break;
+                    }
+
+                    offset += checked((int)completedWritten);
+                }
+                finally
+                {
+                    if (lifetime.PendingAfterCancel)
+                    {
+                        keepPinnedAfterCancel = true;
+                    }
+
+                    lifetime.DisposeIfCompleted();
+                }
+            }
+        }
+        finally
+        {
+            if (!keepPinnedAfterCancel)
+            {
+                pinned.Free();
+            }
+        }
+    }
+
+    private uint WaitForModemStatusChangeOverlapped(CancellationToken cancellationToken)
+    {
+        var wait = new ManualResetEvent(false);
+        var maskPointer = Marshal.AllocHGlobal(sizeof(uint));
+        var overlappedPointer = Marshal.AllocHGlobal(Marshal.SizeOf<OverlappedNative>());
+        var lifetime = new PendingOverlappedLifetime(null, wait, overlappedPointer, maskPointer);
+        try
+        {
+            Marshal.WriteInt32(maskPointer, 0);
+            PrepareOverlapped(overlappedPointer, wait);
+
+            if (!WaitCommEvent(_handle, maskPointer, overlappedPointer))
+            {
+                var error = Marshal.GetLastWin32Error();
+                if (error != ErrorIoPending)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    throw new Win32Exception(error);
+                }
+
+                _ = WaitForOverlappedResult(overlappedPointer, wait, cancellationToken, lifetime, logBackpressure: null);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            return unchecked((uint)Marshal.ReadInt32(maskPointer));
+        }
+        finally
+        {
+            lifetime.DisposeIfCompleted();
+        }
+    }
+
+    private static void PrepareOverlapped(IntPtr overlappedPointer, ManualResetEvent wait)
+    {
+        Marshal.StructureToPtr(
+            new OverlappedNative { EventHandle = wait.SafeWaitHandle.DangerousGetHandle() },
+            overlappedPointer,
+            false);
+    }
+
+    private uint WaitForOverlappedResult(
+        IntPtr overlappedPointer,
+        ManualResetEvent wait,
+        CancellationToken cancellationToken,
+        PendingOverlappedLifetime lifetime,
+        Action? logBackpressure)
+    {
+        var nextBackpressureAt = Stopwatch.GetTimestamp() + (long)(WriteInitialBackpressureLogDelay.TotalSeconds * Stopwatch.Frequency);
+        while (true)
+        {
+            var completed = WaitHandle.WaitAny([wait, cancellationToken.WaitHandle], WriteInitialBackpressureLogDelay);
+            if (completed == 0)
+            {
+                break;
+            }
+
+            if (completed == 1)
+            {
+                _ = CancelIoEx(_handle, overlappedPointer);
+                if (!wait.WaitOne(CancelOverlappedWaitTimeout))
+                {
+                    lifetime.MarkPendingAfterCancel();
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            var now = Stopwatch.GetTimestamp();
+            if (logBackpressure is not null && now >= nextBackpressureAt)
+            {
+                logBackpressure();
+                nextBackpressureAt = now + (long)(WriteBackpressureLogInterval.TotalSeconds * Stopwatch.Frequency);
+            }
         }
 
-        if (!SetCommMask(handle, EventCts | EventDsr))
+        if (!GetOverlappedResult(_handle, overlappedPointer, out var transferred, bWait: false))
         {
-            handle.Dispose();
-            return null;
+            var resultError = Marshal.GetLastWin32Error();
+            if (resultError == ErrorOperationAborted)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            throw new Win32Exception(resultError);
         }
 
-        return handle;
+        return transferred;
+    }
+
+    private sealed class PendingOverlappedLifetime : IDisposable
+    {
+        private readonly GCHandle? _pinned;
+        private readonly ManualResetEvent _wait;
+        private readonly IntPtr _overlappedPointer;
+        private readonly IntPtr _extraPointer;
+        private bool _pendingAfterCancel;
+
+        public PendingOverlappedLifetime(GCHandle? pinned, ManualResetEvent wait, IntPtr overlappedPointer, IntPtr extraPointer = default)
+        {
+            _pinned = pinned;
+            _wait = wait;
+            _overlappedPointer = overlappedPointer;
+            _extraPointer = extraPointer;
+            StartedTicks = Stopwatch.GetTimestamp();
+        }
+
+        public long StartedTicks { get; }
+
+        public bool PendingAfterCancel => _pendingAfterCancel;
+
+        public void MarkPendingAfterCancel() => _pendingAfterCancel = true;
+
+        public void DisposeIfCompleted()
+        {
+            if (!_pendingAfterCancel)
+            {
+                Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            if (_extraPointer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(_extraPointer);
+            }
+
+            Marshal.FreeHGlobal(_overlappedPointer);
+            _wait.Dispose();
+            if (_pinned is { IsAllocated: true } pinned)
+            {
+                pinned.Free();
+            }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -1279,8 +1589,17 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         public sbyte XoffChar;
         public sbyte ErrorChar;
         public sbyte EofChar;
-        public sbyte EvtChar;
         public ushort WReserved1;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OverlappedNative
+    {
+        public IntPtr Internal;
+        public IntPtr InternalHigh;
+        public uint Offset;
+        public uint OffsetHigh;
+        public IntPtr EventHandle;
     }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -1300,6 +1619,9 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     private static extern bool GetCommState(SafeFileHandle hFile, ref Dcb lpDCB);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetCommState(SafeFileHandle hFile, ref Dcb lpDCB);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetCommModemStatus(SafeFileHandle hFile, out uint lpModemStat);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -1308,22 +1630,34 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool WaitCommEvent(
         SafeFileHandle hFile,
-        out uint lpEvtMask,
+        IntPtr lpEvtMask,
         IntPtr lpOverlapped);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ReadFile(
         SafeFileHandle hFile,
-        byte[] lpBuffer,
+        IntPtr lpBuffer,
         int nNumberOfBytesToRead,
-        out int lpNumberOfBytesRead,
+        out uint lpNumberOfBytesRead,
         IntPtr lpOverlapped);
 
-    [DllImport("kernel32.dll", SetLastError = true, EntryPoint = "WriteFile")]
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool WriteFile(
         SafeFileHandle hFile,
         IntPtr lpBuffer,
         int nNumberOfBytesToWrite,
-        out int lpNumberOfBytesWritten,
+        out uint lpNumberOfBytesWritten,
+        IntPtr lpOverlapped);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetOverlappedResult(
+        SafeFileHandle hFile,
+        IntPtr lpOverlapped,
+        out uint lpNumberOfBytesTransferred,
+        bool bWait);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CancelIoEx(
+        SafeFileHandle hFile,
         IntPtr lpOverlapped);
 }

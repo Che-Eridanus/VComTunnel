@@ -178,6 +178,7 @@ else
 static async Task ProbeRfc2217EndpointAsync(SmokeOptions options, CancellationToken cancellationToken)
 {
     using var tcp = new TcpClient();
+    TunnelTcpOptions.ConfigureLowLatency(tcp);
     await tcp.ConnectAsync(options.Host, options.Port, cancellationToken);
     using var stream = tcp.GetStream();
 
@@ -1657,6 +1658,7 @@ internal static class FakeRfc2217EchoServer
         try
         {
             using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+            TunnelTcpOptions.ConfigureLowLatency(client);
             await using var stream = client.GetStream();
             using var writeLock = new SemaphoreSlim(1, 1);
             using var remoteSenderStop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);

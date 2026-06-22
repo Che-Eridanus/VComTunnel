@@ -13,12 +13,14 @@ public sealed class TunnelOrchestrator
     private readonly InMemoryLog _log;
     private readonly Func<TunnelMapping, InMemoryLog, Action<IKmdfTunnelSession, string>, IKmdfTunnelSession> _kmdfSessionFactory;
     private readonly Func<TunnelMapping, InMemoryLog, Action<IManagedTunnelSession, string>, IManagedTunnelSession> _com0comServiceSessionFactory;
-    private readonly TimeSpan _restartDelay;
+    private readonly TimeSpan _restartInitialDelay;
+    private readonly TimeSpan _restartMaxDelay;
     private readonly TimeSpan _portReleaseRetryTimeout;
     private readonly TimeSpan _portReleaseRetryDelay;
     private readonly ConcurrentDictionary<string, ManagedTunnel> _tunnels = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, string> _lastProcessErrors = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, long> _restartVersions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, RestartBackoffState> _restartBackoffs = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<int, byte> _intentionalProcessStops = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _mappingLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
@@ -34,7 +36,8 @@ public sealed class TunnelOrchestrator
         Func<TunnelMapping, Hub4comCommand>? hub4comCommandFactory = null,
         TimeSpan? restartDelay = null,
         TimeSpan? portReleaseRetryTimeout = null,
-        TimeSpan? portReleaseRetryDelay = null)
+        TimeSpan? portReleaseRetryDelay = null,
+        TimeSpan? restartMaxDelay = null)
     {
         _configStore = configStore;
         _dependencyDetector = dependencyDetector;
@@ -44,7 +47,18 @@ public sealed class TunnelOrchestrator
         _log = log;
         _kmdfSessionFactory = kmdfSessionFactory ?? ((mapping, sessionLog, faulted) => new KmdfTunnelSession(mapping, sessionLog, faulted));
         _com0comServiceSessionFactory = com0comServiceSessionFactory ?? ((mapping, sessionLog, faulted) => new Com0comServiceTunnelSession(mapping, sessionLog, faulted));
-        _restartDelay = restartDelay ?? TimeSpan.FromSeconds(2);
+        _restartInitialDelay = restartDelay ?? TimeSpan.FromSeconds(2);
+        _restartMaxDelay = restartMaxDelay ?? TimeSpan.FromMinutes(2);
+        if (_restartInitialDelay <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(restartDelay), "Restart delay must be greater than zero.");
+        }
+
+        if (_restartMaxDelay < _restartInitialDelay)
+        {
+            throw new ArgumentOutOfRangeException(nameof(restartMaxDelay), "Restart max delay must be greater than or equal to the initial restart delay.");
+        }
+
         _portReleaseRetryTimeout = portReleaseRetryTimeout ?? TimeSpan.FromSeconds(3);
         _portReleaseRetryDelay = portReleaseRetryDelay ?? TimeSpan.FromMilliseconds(150);
     }
@@ -78,11 +92,29 @@ public sealed class TunnelOrchestrator
 
     public async Task<TunnelStatus> StartAsync(string id, CancellationToken cancellationToken = default)
     {
+        return await StartAsync(
+            id,
+            resetRestartBackoff: true,
+            logStartupFailure: true,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<TunnelStatus> StartAsync(
+        string id,
+        bool resetRestartBackoff,
+        bool logStartupFailure,
+        CancellationToken cancellationToken = default)
+    {
         var mappingLock = GetMappingLock(id);
         await mappingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            return await StartCoreAsync(id, cancellationToken).ConfigureAwait(false);
+            if (resetRestartBackoff)
+            {
+                ResetRestartBackoff(id);
+            }
+
+            return await StartCoreAsync(id, cancellationToken, logStartupFailure).ConfigureAwait(false);
         }
         finally
         {
@@ -90,7 +122,7 @@ public sealed class TunnelOrchestrator
         }
     }
 
-    private async Task<TunnelStatus> StartCoreAsync(string id, CancellationToken cancellationToken)
+    private async Task<TunnelStatus> StartCoreAsync(string id, CancellationToken cancellationToken, bool logStartupFailure)
     {
         var config = await _configStore.LoadAsync(cancellationToken);
         var mapping = config.Mappings.FirstOrDefault(m => string.Equals(m.Id, id, StringComparison.OrdinalIgnoreCase))
@@ -99,12 +131,12 @@ public sealed class TunnelOrchestrator
         if (mapping.Backend == TunnelBackend.Kmdf)
         {
             StopEndpointConflicts(mapping);
-            return await StartKmdfAsync(mapping, cancellationToken);
+            return await StartKmdfAsync(mapping, cancellationToken, logStartupFailure);
         }
 
         if (mapping.Backend == TunnelBackend.Com0comService)
         {
-            return await StartCom0comServiceAsync(mapping, cancellationToken);
+            return await StartCom0comServiceAsync(mapping, cancellationToken, logStartupFailure);
         }
 
         var dependencies = _dependencyDetector.Detect();
@@ -179,6 +211,7 @@ public sealed class TunnelOrchestrator
         var tunnel = new ManagedTunnel(mapping, TunnelRunState.Running, process, null, DateTimeOffset.UtcNow, null);
         _tunnels[id] = tunnel;
         _log.Info(mapping.Name, $"Started hub4com process {process.Id}.");
+        ResetRestartBackoff(id);
 
         await Task.Delay(500, cancellationToken);
         if (process.HasExited)
@@ -200,6 +233,7 @@ public sealed class TunnelOrchestrator
                 : new TunnelMapping { Id = id };
             StopExisting(id);
             _lastProcessErrors.TryRemove(id, out _);
+            ResetRestartBackoff(id);
             var stopped = new ManagedTunnel(mapping, TunnelRunState.Stopped, null, null, null, null);
             _tunnels[id] = stopped;
             _log.Info(mapping.Name, "Stopped.");
@@ -221,7 +255,8 @@ public sealed class TunnelOrchestrator
 
     private async Task<TunnelStatus> StartKmdfAsync(
         TunnelMapping mapping,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool logStartupFailure)
     {
         StopExisting(mapping.Id);
 
@@ -229,12 +264,14 @@ public sealed class TunnelOrchestrator
         return await StartManagedSessionAsync(
             mapping,
             () => _kmdfSessionFactory(effectiveMapping, _log, (faultedSession, error) => OnKmdfFaulted(mapping, faultedSession, error)),
-            cancellationToken);
+            cancellationToken,
+            logStartupFailure: logStartupFailure);
     }
 
     private async Task<TunnelStatus> StartCom0comServiceAsync(
         TunnelMapping mapping,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool logStartupFailure)
     {
         if (!IsBackingPortRegistered(mapping, out var portError))
         {
@@ -251,14 +288,16 @@ public sealed class TunnelOrchestrator
             mapping,
             () => _com0comServiceSessionFactory(mapping, _log, (faultedSession, error) => OnSessionFaulted(mapping, faultedSession, error)),
             cancellationToken,
-            retryBackingPortRelease: true);
+            retryBackingPortRelease: true,
+            logStartupFailure: logStartupFailure);
     }
 
     private async Task<TunnelStatus> StartManagedSessionAsync(
         TunnelMapping mapping,
         Func<IManagedTunnelSession> sessionFactory,
         CancellationToken cancellationToken,
-        bool retryBackingPortRelease = false)
+        bool retryBackingPortRelease = false,
+        bool logStartupFailure = true)
     {
         var retryUntil = DateTimeOffset.UtcNow + _portReleaseRetryTimeout;
         while (true)
@@ -271,6 +310,7 @@ public sealed class TunnelOrchestrator
                 await session.StartAsync(cancellationToken);
                 var running = new ManagedTunnel(mapping, TunnelRunState.Running, null, session, DateTimeOffset.UtcNow, null);
                 _tunnels[mapping.Id] = running;
+                ResetRestartBackoff(mapping.Id);
                 return running.ToStatus();
             }
             catch (Exception ex) when (retryBackingPortRelease
@@ -288,8 +328,17 @@ public sealed class TunnelOrchestrator
                 session.Dispose();
                 var faulted = new ManagedTunnel(mapping, TunnelRunState.Faulted, null, null, null, ex.Message);
                 _tunnels[mapping.Id] = faulted;
-                _log.Error(mapping.Name, ex.Message);
-                ScheduleSessionRestart(mapping, ex.Message);
+                if (logStartupFailure)
+                {
+                    _log.Error(mapping.Name, ex.Message);
+                }
+
+                var scheduled = ScheduleSessionRestart(mapping, ex.Message);
+                if (!logStartupFailure && !scheduled)
+                {
+                    _log.Error(mapping.Name, ex.Message);
+                }
+
                 return faulted.ToStatus();
             }
         }
@@ -312,33 +361,15 @@ public sealed class TunnelOrchestrator
         ScheduleSessionRestart(mapping, error);
     }
 
-    private void ScheduleSessionRestart(TunnelMapping mapping, string error)
+    private bool ScheduleSessionRestart(TunnelMapping mapping, string error)
     {
         if (!mapping.RestartOnFailure || IsPermanentSessionError(error))
         {
-            return;
+            return false;
         }
 
-        var restartVersion = GetRestartVersion(mapping.Id);
-        var backendName = FormatBackendForLog(mapping.Backend);
-        _log.Warn(mapping.Name, $"Scheduling {backendName} restart in {_restartDelay.TotalMilliseconds:0} ms after: {error}");
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(_restartDelay);
-            if (GetRestartVersion(mapping.Id) != restartVersion)
-            {
-                return;
-            }
-
-            try
-            {
-                await StartAsync(mapping.Id);
-            }
-            catch (Exception ex)
-            {
-                _log.Error(mapping.Name, $"{backendName} restart failed: {ex.Message}");
-            }
-        });
+        ScheduleRestart(mapping, error, FormatBackendForLog(mapping.Backend));
+        return true;
     }
 
     private void StopExisting(string id)
@@ -364,6 +395,7 @@ public sealed class TunnelOrchestrator
                 $"Stopping {conflict.Mapping.Name} ({conflict.Mapping.VisiblePort}) before starting because both use RFC2217 endpoint {endpoint}.");
             StopExisting(conflict.Mapping.Id);
             _lastProcessErrors.TryRemove(conflict.Mapping.Id, out _);
+            ResetRestartBackoff(conflict.Mapping.Id);
             _tunnels[conflict.Mapping.Id] = new ManagedTunnel(conflict.Mapping, TunnelRunState.Stopped, null, null, null, null);
             _log.Info(conflict.Mapping.Name, $"Stopped because {mapping.Name} is starting for the same RFC2217 endpoint {endpoint}.");
         }
@@ -422,24 +454,7 @@ public sealed class TunnelOrchestrator
             return;
         }
 
-        var restartVersion = GetRestartVersion(mapping.Id);
-        _ = Task.Run(async () =>
-        {
-            await Task.Delay(_restartDelay);
-            if (GetRestartVersion(mapping.Id) != restartVersion)
-            {
-                return;
-            }
-
-            try
-            {
-                await StartAsync(mapping.Id);
-            }
-            catch (Exception ex)
-            {
-                _log.Error(mapping.Name, $"Restart failed: {ex.Message}");
-            }
-        });
+        ScheduleRestart(mapping, message, FormatBackendForLog(mapping.Backend));
     }
 
     private TunnelStatus BuildExitedStatus(TunnelMapping mapping, Process process)
@@ -548,6 +563,67 @@ public sealed class TunnelOrchestrator
         _restartVersions.AddOrUpdate(id, 1, (_, version) => version + 1);
     }
 
+    private void ResetRestartBackoff(string id)
+    {
+        _restartBackoffs.TryRemove(id, out _);
+    }
+
+    private RestartBackoffState AdvanceRestartBackoff(string id, string error)
+    {
+        return _restartBackoffs.AddOrUpdate(
+            id,
+            _ => new RestartBackoffState(1, _restartInitialDelay, error),
+            (_, previous) => string.Equals(previous.LastError, error, StringComparison.Ordinal)
+                ? new RestartBackoffState(previous.Attempt + 1, DoubleRestartDelay(previous.Delay), error)
+                : new RestartBackoffState(1, _restartInitialDelay, error));
+    }
+
+    private TimeSpan DoubleRestartDelay(TimeSpan current)
+    {
+        if (current >= _restartMaxDelay || current.Ticks > _restartMaxDelay.Ticks / 2)
+        {
+            return _restartMaxDelay;
+        }
+
+        return TimeSpan.FromTicks(current.Ticks * 2);
+    }
+
+    private void ScheduleRestart(TunnelMapping mapping, string error, string backendName)
+    {
+        var restartVersion = GetRestartVersion(mapping.Id);
+        var backoff = AdvanceRestartBackoff(mapping.Id, error);
+        _log.Warn(
+            mapping.Name,
+            $"Scheduling {backendName} restart attempt {backoff.Attempt} in {FormatRestartDelay(backoff.Delay)} after: {error}");
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(backoff.Delay);
+            if (GetRestartVersion(mapping.Id) != restartVersion)
+            {
+                return;
+            }
+
+            try
+            {
+                await StartAsync(
+                    mapping.Id,
+                    resetRestartBackoff: false,
+                    logStartupFailure: false).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _log.Error(mapping.Name, $"{backendName} restart failed: {ex.Message}");
+            }
+        });
+    }
+
+    private static string FormatRestartDelay(TimeSpan delay)
+    {
+        return delay.TotalSeconds >= 1
+            ? $"{delay.TotalSeconds:0.#} s"
+            : $"{delay.TotalMilliseconds:0} ms";
+    }
+
     private bool IsBackingPortRegistered(TunnelMapping mapping, out string? error)
     {
         error = null;
@@ -571,6 +647,11 @@ public sealed class TunnelOrchestrator
         error = $"Backing port {mapping.BackingPort} is not registered in the Windows COM database. Existing ports: {string.Join(", ", ports)}. Choose the other side of an existing com0com pair, or create it first: setupc.exe install PortName={mapping.VisiblePort} PortName={mapping.BackingPort}";
         return false;
     }
+
+    private sealed record RestartBackoffState(
+        int Attempt,
+        TimeSpan Delay,
+        string LastError);
 
     private sealed record ManagedTunnel(
         TunnelMapping Mapping,

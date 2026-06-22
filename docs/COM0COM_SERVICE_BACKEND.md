@@ -14,7 +14,9 @@ This backend still uses com0com for the Windows-visible virtual COM pair, but
 it does not start `hub4com` or `com2tcp-rfc2217.bat`. `VComTunnel.Service`
 opens the backing port directly, connects to the RFC2217 endpoint, performs the
 same Telnet/RFC2217 startup negotiation used by the KMDF service path, and
-bridges serial bytes in both directions.
+bridges serial bytes in both directions. The local backing port is opened with
+Win32 overlapped I/O so serial RX/TX and modem-status events can progress as
+separate pipeline stages instead of depending on synchronous polling.
 
 Current scope:
 
@@ -27,11 +29,15 @@ Current scope:
   startup serial/control status query, SIGNATURE response, remote
   FLOWCONTROL-SUSPEND/RESUME, idle NOP keep-alive, and service-level restart
   after transient network faults.
+- Observes local backing-port CTS/DSR events on the primary serial handle with
+  overlapped `WaitCommEvent` and maps the com0com peer state to RFC2217
+  DTR/RTS changes, matching the `hub4com` `pinmap` direction for explicit
+  control-line forwarding.
+- Writes RFC2217 RX data to the local COM side through a bounded small-chunk
+  pipeline so the TCP reader is not blocked by normal local COM write latency.
 
 Known limitation:
 
-- Dynamic local serial-control changes made by the application on the visible
-  COM side are not yet fully observed and translated through the backing port.
-  The next hardening step is to poll or subscribe to the backing-port state and
-  map local baud, line-control, DTR/RTS, BREAK, purge, and XON/XOFF changes to
-  the same RFC2217 commands that the KMDF backend already emits.
+- BREAK, purge, and XON/XOFF actions from arbitrary Windows serial tools are
+  still not all surfaced through this backend with the same fidelity as
+  hub4com's full filter graph.

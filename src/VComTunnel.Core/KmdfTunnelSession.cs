@@ -62,6 +62,8 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
     private readonly bool _suppressInitialControlLineSync;
     private readonly Rfc2217Client _rfc2217 = new();
     private readonly Rfc2217LocalFlowControlState _localFlowControl = new();
+    private readonly ByteThroughputLogThrottle _serialTxLog = new(TimeSpan.FromSeconds(1));
+    private readonly ByteThroughputLogThrottle _serialRxLog = new(TimeSpan.FromSeconds(1));
     private readonly object _ackLock = new();
     private readonly List<Rfc2217ExpectedAck> _pendingAcks = [];
     private readonly object _flowLock = new();
@@ -104,6 +106,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         Attach();
 
         _tcp = new TcpClient();
+        TunnelTcpOptions.ConfigureLowLatency(_tcp);
         try
         {
             await _tcp.ConnectAsync(_mapping.Host, _mapping.Port, cancellationToken).ConfigureAwait(false);
@@ -232,6 +235,10 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 if (frame.Bytes.Length > 0)
                 {
                     await SendFrameWithAckAsync(stream, frame).ConfigureAwait(false);
+                    if (frame.PostSendLog is not null)
+                    {
+                        _log.Info(_mapping.Name, frame.PostSendLog);
+                    }
                 }
             }
         }
@@ -283,7 +290,6 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                 WriteUInt32(push, 0, 0);
                 WriteUInt32(push, 4, (uint)frame.SerialData.Length);
                 Buffer.BlockCopy(frame.SerialData, 0, push, 8, frame.SerialData.Length);
-                _log.Info(_mapping.Name, $"RFC2217 RX serial {frame.SerialData.Length} byte(s).");
                 await PushRxWithBackpressureAsync(stream, push, frame.SerialData.Length).ConfigureAwait(false);
             }
         }
@@ -552,7 +558,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             {
                 if (TryDeviceIoControl(_commandDriver, IoctlPushRx, push, null, out var error))
                 {
-                    _log.Info(_mapping.Name, $"Driver RX push completed {byteCount} byte(s).");
+                    LogSerialRx(byteCount);
                     return;
                 }
 
@@ -679,6 +685,18 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         }
     }
 
+    private void LogSerialTx(int bytes)
+    {
+        _serialTxLog.Record(bytes, (totalBytes, chunks) =>
+            _log.Info(_mapping.Name, $"KMDF TX serial summary since last log: {totalBytes} byte(s) in {chunks} chunk(s) to RFC2217."));
+    }
+
+    private void LogSerialRx(int bytes)
+    {
+        _serialRxLog.Record(bytes, (totalBytes, chunks) =>
+            _log.Info(_mapping.Name, $"RFC2217 RX serial summary since last log: {totalBytes} byte(s) in {chunks} chunk(s) pushed to KMDF driver."));
+    }
+
     private void SetRemoteFlowSuspended(bool suspended)
     {
         TaskCompletionSource? resume = null;
@@ -726,7 +744,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         switch (type)
         {
             case EventTypeTxData:
-                _log.Info(_mapping.Name, $"KMDF TX event {length} byte(s).");
+                LogSerialTx(length);
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.EscapeSerialData(buffer, offset, length),
                     [],
@@ -763,11 +781,17 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                     return new Rfc2217OutboundFrame([], [], "initial modem-control sync suppressed");
                 }
 
-                _log.Info(_mapping.Name, $"RFC2217 set modem dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
+                if (!_mapping.Hub4comForwardControlLines)
+                {
+                    _log.Info(_mapping.Name, $"Suppressed modem-control because control-line forwarding is disabled dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
+                    return new Rfc2217OutboundFrame([], [], "modem-control suppressed by control-line setting");
+                }
+
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetModemControl(dtr, rts),
                     [],
-                    "modem-control");
+                    "modem-control",
+                    PostSendLog: $"RFC2217 TX modem-control dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
 
             case EventTypeSetHandflow:
                 EnsurePayload(type, length, 8);
@@ -779,6 +803,12 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                     return new Rfc2217OutboundFrame([], [], "initial handflow sync suppressed");
                 }
 
+                if (!_mapping.Hub4comForwardControlLines)
+                {
+                    _log.Info(_mapping.Name, $"Suppressed handflow because control-line forwarding is disabled control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
+                    return new Rfc2217OutboundFrame([], [], "handflow suppressed by control-line setting");
+                }
+
                 _log.Info(_mapping.Name, $"RFC2217 set handflow control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetHandflow(controlHandshake, flowReplace),
@@ -788,11 +818,17 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             case EventTypeSetBreak:
                 EnsurePayload(type, length, 4);
                 var breakEnabled = buffer[offset] != 0;
-                _log.Info(_mapping.Name, $"RFC2217 set break {breakEnabled}.");
+                if (!_mapping.Hub4comForwardControlLines)
+                {
+                    _log.Info(_mapping.Name, $"Suppressed break because control-line forwarding is disabled enabled={breakEnabled}.");
+                    return new Rfc2217OutboundFrame([], [], "break suppressed by control-line setting");
+                }
+
                 return new Rfc2217OutboundFrame(
                     Rfc2217Client.BuildSetBreak(breakEnabled),
                     [],
-                    "break");
+                    "break",
+                    PostSendLog: $"RFC2217 TX break enabled={breakEnabled}.");
 
             case EventTypePurge:
                 EnsurePayload(type, length, 4);
@@ -928,7 +964,8 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         byte[] Bytes,
         Rfc2217ExpectedAck[] ExpectedAckCommands,
         string Description,
-        bool ContinueOnAckTimeout = false);
+        bool ContinueOnAckTimeout = false,
+        string? PostSendLog = null);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern SafeFileHandle CreateFileW(

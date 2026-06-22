@@ -1,6 +1,7 @@
 using VComTunnel.Core;
 using System.IO.Compression;
 using System.Net;
+using System.Net.Sockets;
 
 var tests = new List<(string Name, Func<Task> Test)>
 {
@@ -14,11 +15,21 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("service endpoint defaults to loopback", () => Task.Run(ServiceEndpointDefaultsToLoopback)),
     ("service endpoint accepts loopback override", () => Task.Run(ServiceEndpointAcceptsLoopbackOverride)),
     ("service endpoint rejects non-loopback override", () => Task.Run(ServiceEndpointRejectsNonLoopbackOverride)),
+    ("TCP tunnel options enable low latency", () => Task.Run(TcpTunnelOptionsEnableLowLatency)),
+    ("file logs rotate and cap archives", () => Task.Run(FileLogsRotateAndCapArchives)),
     ("com0com create hints", () => Task.Run(Com0comCreateHints)),
     ("com0com service maps peer modem signals", () => Task.Run(Com0comServiceMapsPeerModemSignals)),
     ("com0com service reconstructs fast RTS pulse", () => Task.Run(Com0comServiceReconstructsFastRtsPulse)),
+    ("com0com service control-line switch blocks forwarding", () => Task.Run(Com0comServiceControlLineSwitchBlocksForwarding)),
+    ("com0com service RX pipeline writes small chunks", Com0comServiceRxPipelineWritesSmallChunksAsync),
+    ("com0com service modem polling forwards RTS", Com0comServiceModemPollingForwardsRtsAsync),
+    ("com0com service local handflow disables blocking flags", () => Task.Run(Com0comServiceLocalHandflowDisablesBlockingFlags)),
+    ("com0com service builds Win32 device paths", () => Task.Run(Com0comServiceBuildsWin32DevicePaths)),
+    ("serial RX backpressure info reports remaining bytes", () => Task.Run(SerialRxBackpressureInfoReportsRemainingBytes)),
     ("esptool baud monitor waits for response", () => Task.Run(EspToolBaudMonitorWaitsForResponse)),
     ("KMDF control path uses visible COM", () => Task.Run(KmdfControlPathUsesVisibleCom)),
+    ("KMDF control-line switch blocks forwarding", () => Task.Run(KmdfControlLineSwitchBlocksForwarding)),
+    ("KMDF data logs are throttled", () => Task.Run(KmdfDataLogsAreThrottled)),
     ("KMDF pnputil CSV parser finds VComTunnel ports", () => Task.Run(KmdfPnpUtilCsvParserFindsPorts)),
     ("KMDF driver certificate path resolves", () => Task.Run(KmdfDriverCertificatePathResolves)),
     ("RFC2217 command encoding", () => Task.Run(Rfc2217CommandEncoding)),
@@ -34,6 +45,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("missing backing port faults before hub4com", MissingBackingPortFaultsBeforeHub4comAsync),
     ("com0com service backend starts without hub4com", Com0comServiceBackendStartsWithoutHub4comAsync),
     ("com0com service backend restarts after network fault", Com0comServiceBackendRestartsAfterNetworkFaultAsync),
+    ("restart backoff doubles and caps automatic failures", RestartBackoffDoublesAndCapsAutomaticFailuresAsync),
     ("com0com service start requests are serialized", Com0comServiceStartRequestsAreSerializedAsync),
     ("starting same endpoint stops prior tunnel", StartingSameEndpointStopsPriorTunnelAsync),
     ("hub4com to com0com service retries busy backing port", Hub4comToCom0comServiceRetriesBusyBackingPortAsync),
@@ -225,6 +237,46 @@ static void ServiceEndpointRejectsNonLoopbackOverride()
     }
 }
 
+static void TcpTunnelOptionsEnableLowLatency()
+{
+    using var client = new System.Net.Sockets.TcpClient();
+    AssertTrue(!client.NoDelay, "TcpClient should expose the platform default before tunnel tuning.");
+    TunnelTcpOptions.ConfigureLowLatency(client);
+    AssertTrue(client.NoDelay, "RFC2217 tunnel sockets must disable Nagle for low-latency serial traffic.");
+}
+
+static void FileLogsRotateAndCapArchives()
+{
+    using var temp = new TempDir();
+    var logDir = Path.Combine(temp.Path, "logs");
+    const long maxFileBytes = 1024;
+
+    using (var log = new InMemoryLog(logDir, maxFileBytes: maxFileBytes, maxArchiveFiles: 2))
+    {
+        for (var i = 0; i < 60; i++)
+        {
+            log.Info("rotate", $"entry-{i:D2} {new string('x', 120)}");
+        }
+    }
+
+    var active = Path.Combine(logDir, "service.log");
+    var archive1 = Path.Combine(logDir, "service.1.log");
+    var archive2 = Path.Combine(logDir, "service.2.log");
+    var archive3 = Path.Combine(logDir, "service.3.log");
+    AssertTrue(File.Exists(active), "active service.log should exist after flush.");
+    AssertTrue(File.Exists(archive1), "first rotated archive should exist.");
+    AssertTrue(File.Exists(archive2), "second rotated archive should exist.");
+    AssertTrue(!File.Exists(archive3), "archives beyond the configured retention must be removed.");
+
+    foreach (var file in Directory.EnumerateFiles(logDir, "service*.log"))
+    {
+        var length = new FileInfo(file).Length;
+        AssertTrue(length <= maxFileBytes, $"{Path.GetFileName(file)} should stay under {maxFileBytes} bytes, actual {length}.");
+    }
+
+    AssertStringContains(File.ReadAllText(active), "entry-59");
+}
+
 static void Com0comCreateHints()
 {
     var mapping = new TunnelMapping { Name = "A", VisiblePort = "COM12", BackingPort = "CNCB12" };
@@ -261,6 +313,191 @@ static void Com0comServiceReconstructsFastRtsPulse()
         Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(0, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
 }
 
+static void Com0comServiceControlLineSwitchBlocksForwarding()
+{
+    AssertBytes(
+        [],
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(
+            0,
+            SerialPortSnapshot.Cts,
+            SerialPortSnapshot.EventCts,
+            forwardControlLines: false));
+
+    AssertBytes(
+        [],
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(
+            0,
+            0,
+            SerialPortSnapshot.EventCts,
+            forwardControlLines: false));
+}
+
+static async Task Com0comServiceModemPollingForwardsRtsAsync()
+{
+    using var temp = new TempDir();
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var serverReady = new TaskCompletionSource<NetworkStream>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var serverTask = Task.Run(async () =>
+    {
+        using var client = await listener.AcceptTcpClientAsync(cts.Token);
+        TunnelTcpOptions.ConfigureLowLatency(client);
+        var stream = client.GetStream();
+        var buffer = new byte[4096];
+        _ = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token);
+        await stream.WriteAsync(Concat(
+            BuildRfc2217Ack(Rfc2217Client.AckSetLineStateMask, 0xFF),
+            BuildRfc2217Ack(Rfc2217Client.AckSetModemStateMask, 0xFF)), cts.Token);
+        serverReady.TrySetResult(stream);
+        await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+    }, cts.Token);
+
+    var serial = new RecordingSerialPortEndpoint();
+    using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    using var session = new Com0comServiceTunnelSession(
+        new TunnelMapping
+        {
+            Name = "RTS poll",
+            Backend = TunnelBackend.Com0comService,
+            VisiblePort = "COM92",
+            BackingPort = "CNCB92",
+            Host = IPAddress.Loopback.ToString(),
+            Port = port,
+            Hub4comForwardControlLines = true
+        },
+        log,
+        (_, _) => { },
+        new RecordingSerialPortEndpointFactory(serial));
+
+    try
+    {
+        await session.StartAsync(cts.Token);
+        var stream = await serverReady.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
+        serial.SetModemStatus(SerialPortSnapshot.Cts);
+        await WaitForStreamBytesAsync(stream, Rfc2217Client.BuildSetModemControl(null, true), TimeSpan.FromSeconds(2));
+        serial.SetModemStatus(0);
+        await WaitForStreamBytesAsync(stream, Rfc2217Client.BuildSetModemControl(null, false), TimeSpan.FromSeconds(2));
+    }
+    finally
+    {
+        session.Dispose();
+        await cts.CancelAsync();
+        listener.Stop();
+        try
+        {
+            await serverTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+}
+static void Com0comServiceLocalHandflowDisablesBlockingFlags()
+{
+    const uint binary = 0x00000001;
+    const uint outxCtsFlow = 0x00000004;
+    const uint outxDsrFlow = 0x00000008;
+    const uint dtrControlMask = 0x00000030;
+    const uint dsrSensitivity = 0x00000040;
+    const uint outX = 0x00000100;
+    const uint inX = 0x00000200;
+    const uint rtsControlMask = 0x00003000;
+    const uint abortOnError = 0x00004000;
+    var original = outxCtsFlow
+        | outxDsrFlow
+        | dtrControlMask
+        | dsrSensitivity
+        | outX
+        | inX
+        | rtsControlMask
+        | abortOnError;
+
+    var normalized = InvokeNormalizeLocalSerialFlags(original);
+
+    AssertTrue((normalized & binary) != 0, "Local serial handles should stay in binary mode.");
+    AssertEqual("0", (normalized & (outxCtsFlow | outxDsrFlow | dsrSensitivity | outX | inX | abortOnError)).ToString());
+    AssertEqual((original & dtrControlMask).ToString(), (normalized & dtrControlMask).ToString());
+    AssertEqual((original & rtsControlMask).ToString(), (normalized & rtsControlMask).ToString());
+}
+static void Com0comServiceBuildsWin32DevicePaths()
+{
+    AssertEqual(@"\\.\COM12", InvokeBuildDevicePath("COM12"));
+    AssertEqual(@"\\.\COM13", InvokeBuildDevicePath(@"\\.\COM13"));
+}
+static async Task Com0comServiceRxPipelineWritesSmallChunksAsync()
+{
+    using var temp = new TempDir();
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var serverReady = new TaskCompletionSource<NetworkStream>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var serverTask = Task.Run(async () =>
+    {
+        using var client = await listener.AcceptTcpClientAsync(cts.Token);
+        TunnelTcpOptions.ConfigureLowLatency(client);
+        var stream = client.GetStream();
+        var buffer = new byte[4096];
+        _ = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token);
+        await stream.WriteAsync(Concat(
+            BuildRfc2217Ack(Rfc2217Client.AckSetLineStateMask, 0xFF),
+            BuildRfc2217Ack(Rfc2217Client.AckSetModemStateMask, 0xFF)), cts.Token);
+        serverReady.TrySetResult(stream);
+        await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+    }, cts.Token);
+
+    var serial = new RecordingSerialPortEndpoint();
+    using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    using var session = new Com0comServiceTunnelSession(
+        new TunnelMapping
+        {
+            Name = "RX pipeline",
+            Backend = TunnelBackend.Com0comService,
+            VisiblePort = "COM91",
+            BackingPort = "CNCB91",
+            Host = IPAddress.Loopback.ToString(),
+            Port = port
+        },
+        log,
+        (_, _) => { },
+        new RecordingSerialPortEndpointFactory(serial));
+
+    try
+    {
+        await session.StartAsync(cts.Token);
+        var stream = await serverReady.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
+        var payload = Enumerable.Repeat((byte)0x55, 1025).ToArray();
+        await stream.WriteAsync(payload, cts.Token);
+        await serial.WaitForTotalBytesAsync(payload.Length, TimeSpan.FromSeconds(2));
+
+        var writes = serial.WriteSizesSnapshot();
+        AssertEqual("5", writes.Count.ToString());
+        AssertTrue(writes.All(size => size <= 256), "RFC2217 RX data should be pushed to the local COM in low-latency chunks.");
+        AssertEqual("1", writes[^1].ToString());
+    }
+    finally
+    {
+        session.Dispose();
+        await cts.CancelAsync();
+        listener.Stop();
+        try
+        {
+            await serverTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+}
+static void SerialRxBackpressureInfoReportsRemainingBytes()
+{
+    var info = new SerialPortBackpressureInfo(BytesWritten: 17, TotalBytes: 64, Duration: TimeSpan.FromMilliseconds(750));
+    AssertEqual("47", info.RemainingBytes.ToString());
+    AssertEqual("64", info.TotalBytes.ToString());
+}
+
 static void EspToolBaudMonitorWaitsForResponse()
 {
     var monitor = new EspToolBaudRateMonitor();
@@ -285,6 +522,68 @@ static void EspToolBaudMonitorWaitsForResponse()
 static void KmdfControlPathUsesVisibleCom()
 {
     AssertEqual(@"\\.\VComTunnelCtl_COM27", KmdfTunnelSession.BuildControlDevicePath("com27"));
+}
+
+static void KmdfControlLineSwitchBlocksForwarding()
+{
+    using var temp = new TempDir();
+    using var log = new InMemoryLog(temp.Path);
+    using var session = new KmdfTunnelSession(
+        new TunnelMapping
+        {
+            Name = "KmdfControlSwitch",
+            Backend = TunnelBackend.Kmdf,
+            VisiblePort = "COM77",
+            BackingPort = null,
+            Host = "127.0.0.1",
+            Port = 2217,
+            Hub4comForwardControlLines = false
+        },
+        log,
+        (_, _) => { });
+
+    var modemPayload = new byte[8];
+    BitConverter.GetBytes((uint)0x03).CopyTo(modemPayload, 0);
+    modemPayload[4] = 1;
+    modemPayload[5] = 1;
+    AssertBytes([], InvokeKmdfBuildNetworkFrame(session, type: 4, flags: 0, modemPayload));
+
+    var handflowPayload = new byte[8];
+    BitConverter.GetBytes((uint)0x22).CopyTo(handflowPayload, 0);
+    AssertBytes([], InvokeKmdfBuildNetworkFrame(session, type: 5, flags: 0, handflowPayload));
+
+    AssertBytes([], InvokeKmdfBuildNetworkFrame(session, type: 6, flags: 0, [1, 0, 0, 0]));
+    AssertBytes(Rfc2217Client.BuildSetBaudRate(115200), InvokeKmdfBuildNetworkFrame(session, type: 2, flags: 0, BitConverter.GetBytes((uint)115200)));
+
+    var messages = string.Join("\n", log.Snapshot().Select(entry => entry.Message));
+    AssertStringContains(messages, "Suppressed modem-control because control-line forwarding is disabled");
+    AssertStringContains(messages, "Suppressed handflow because control-line forwarding is disabled");
+    AssertStringContains(messages, "Suppressed break because control-line forwarding is disabled");
+}
+
+static void KmdfDataLogsAreThrottled()
+{
+    using var temp = new TempDir();
+    using var log = new InMemoryLog(temp.Path);
+    using var session = new KmdfTunnelSession(
+        new TunnelMapping
+        {
+            Name = "KmdfDataThrottle",
+            Backend = TunnelBackend.Kmdf,
+            VisiblePort = "COM78",
+            BackingPort = null,
+            Host = "127.0.0.1",
+            Port = 2217,
+            Hub4comForwardControlLines = true
+        },
+        log,
+        (_, _) => { });
+
+    AssertBytes([0x01], InvokeKmdfBuildNetworkFrame(session, type: 1, flags: 0, [0x01]));
+    AssertBytes([0x02], InvokeKmdfBuildNetworkFrame(session, type: 1, flags: 0, [0x02]));
+
+    var txLogs = log.Snapshot().Count(entry => entry.Message.Contains("KMDF TX serial", StringComparison.OrdinalIgnoreCase));
+    AssertEqual("1", txLogs.ToString());
 }
 
 static void KmdfPnpUtilCsvParserFindsPorts()
@@ -787,7 +1086,7 @@ static async Task MissingDependenciesFaultMappingAsync()
 {
     using var temp = new TempDir();
     var store = await StoreWithMappingAsync(temp.Path, new TunnelMapping { Name = "Missing", Host = "127.0.0.1" });
-    var orchestrator = CreateOrchestrator(store, new DependencyDetector([Path.Combine(temp.Path, "missing")], pathOverride: ""), new InMemoryLog());
+    var orchestrator = CreateOrchestrator(store, new DependencyDetector([Path.Combine(temp.Path, "missing")], pathOverride: ""), new InMemoryLog(Path.Combine(temp.Path, "logs")));
 
     var status = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
     AssertEqual(TunnelRunState.Faulted.ToString(), status.State.ToString());
@@ -810,7 +1109,7 @@ static async Task MissingBackingPortFaultsBeforeHub4comAsync()
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
-        new InMemoryLog(),
+        new InMemoryLog(Path.Combine(temp.Path, "logs")),
         ["COM27", "COM28"]);
 
     var status = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
@@ -837,7 +1136,7 @@ static async Task Com0comServiceBackendStartsWithoutHub4comAsync()
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
-        new InMemoryLog(),
+        new InMemoryLog(Path.Combine(temp.Path, "logs")),
         ["COM30", "CNCB30"],
         com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
         {
@@ -864,7 +1163,7 @@ static async Task Com0comServiceBackendRestartsAfterNetworkFaultAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var starts = 0;
     var orchestrator = CreateOrchestratorWithPorts(
         store,
@@ -893,6 +1192,65 @@ static async Task Com0comServiceBackendRestartsAfterNetworkFaultAsync()
         "com0com service network fault should schedule a restart.");
 }
 
+static async Task RestartBackoffDoublesAndCapsAutomaticFailuresAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Name = "Backoff managed com0com",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM33",
+        BackingPort = "CNCB33",
+        Host = "10.0.2.196",
+        Port = 5000,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var starts = 0;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM33", "CNCB33"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            Interlocked.Increment(ref starts);
+            return new FakeManagedTunnelSession(
+                faulted,
+                failAfterStart: null,
+                failOnStart: "Could not connect to RFC2217 endpoint 10.0.2.196:5000: timeout");
+        },
+        restartDelay: TimeSpan.FromMilliseconds(10),
+        restartMaxDelay: TimeSpan.FromMilliseconds(40));
+
+    var id = (await store.LoadAsync()).Mappings.Single().Id;
+    var first = await orchestrator.StartAsync(id);
+    AssertEqual(TunnelRunState.Faulted.ToString(), first.State.ToString());
+
+    await WaitUntilAsync(
+        () => log.Snapshot().Count(e => e.Message.Contains("Scheduling Com0comService restart", StringComparison.OrdinalIgnoreCase)) >= 4,
+        "restart backoff did not schedule repeated retries.");
+    orchestrator.Stop(id);
+
+    var schedules = log.Snapshot()
+        .Where(e => e.Message.Contains("Scheduling Com0comService restart", StringComparison.OrdinalIgnoreCase))
+        .Select(e => e.Message)
+        .Take(4)
+        .ToArray();
+    AssertStringContains(schedules[0], "attempt 1 in 10 ms");
+    AssertStringContains(schedules[1], "attempt 2 in 20 ms");
+    AssertStringContains(schedules[2], "attempt 3 in 40 ms");
+    AssertStringContains(schedules[3], "attempt 4 in 40 ms");
+    AssertTrue(Volatile.Read(ref starts) >= 4, "automatic restart attempts should keep running under backoff.");
+
+    var startupErrorCount = log.Snapshot().Count(e =>
+        e.Level == "error" &&
+        e.Source == "Backoff managed com0com" &&
+        e.Message.Contains("Could not connect to RFC2217 endpoint", StringComparison.OrdinalIgnoreCase));
+    AssertEqual("1", startupErrorCount.ToString());
+}
+
 static async Task Com0comServiceStartRequestsAreSerializedAsync()
 {
     using var temp = new TempDir();
@@ -916,7 +1274,7 @@ static async Task Com0comServiceStartRequestsAreSerializedAsync()
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
-        new InMemoryLog(),
+        new InMemoryLog(Path.Combine(temp.Path, "logs")),
         ["COM32", "CNCB32"],
         com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
         {
@@ -983,7 +1341,7 @@ static async Task StartingSameEndpointStopsPriorTunnelAsync()
     };
     var store = new ConfigStore(Path.Combine(temp.Path, "config.json"));
     await store.SaveAsync(new VComTunnelConfig { Mappings = [managed, kmdf] });
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     FakeManagedTunnelSession? managedSession = null;
     FakeKmdfTunnelSession? kmdfSession = null;
     var orchestrator = CreateOrchestratorWithPorts(
@@ -1046,7 +1404,7 @@ static async Task Hub4comToCom0comServiceRetriesBusyBackingPortAsync()
     };
     var store = new ConfigStore(Path.Combine(temp.Path, "config.json"));
     await store.SaveAsync(new VComTunnelConfig { Mappings = [hub, managed] });
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var starts = 0;
     var orchestrator = CreateOrchestratorWithPorts(
         store,
@@ -1101,7 +1459,7 @@ static async Task Com0comServiceAccessDeniedDoesNotRestartAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var starts = 0;
     var orchestrator = CreateOrchestratorWithPorts(
         store,
@@ -1155,7 +1513,7 @@ static async Task StaleStoppedSessionFaultIsIgnoredAsync()
     };
     var store = new ConfigStore(Path.Combine(temp.Path, "config.json"));
     await store.SaveAsync(new VComTunnelConfig { Mappings = [managed, kmdf] });
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
@@ -1221,7 +1579,7 @@ static async Task KmdfMappingReportsStartupFaultAsync()
         RestartOnFailure = false
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var orchestrator = CreateOrchestrator(store, new DependencyDetector([temp.Path], pathOverride: ""), new InMemoryLog());
+    var orchestrator = CreateOrchestrator(store, new DependencyDetector([temp.Path], pathOverride: ""), new InMemoryLog(Path.Combine(temp.Path, "logs")));
 
     var status = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
     AssertEqual(TunnelRunState.Faulted.ToString(), status.State.ToString());
@@ -1252,7 +1610,7 @@ static async Task KmdfSessionRestartsAfterNetworkFaultAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var starts = 0;
     var orchestrator = CreateOrchestratorWithPorts(
         store,
@@ -1297,7 +1655,7 @@ static async Task KmdfDefaultStartSuppressesInitialControlLinesAsync()
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
-        new InMemoryLog(),
+        new InMemoryLog(Path.Combine(temp.Path, "logs")),
         [],
         kmdfSessionFactory: (sessionMapping, sessionLog, faulted) =>
         {
@@ -1324,7 +1682,7 @@ static async Task KmdfPermanentDriverFaultDoesNotRestartAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var starts = 0;
     var orchestrator = CreateOrchestratorWithPorts(
         store,
@@ -1426,7 +1784,7 @@ static async Task FakeHub4comProcessStartsAndStopsAsync()
         RestartOnFailure = false
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
@@ -1465,7 +1823,7 @@ static async Task FakeHub4comProcessRestartsAfterExitAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
@@ -1507,7 +1865,7 @@ static async Task FakeHub4comAccessDeniedDoesNotRestartAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
@@ -1546,7 +1904,7 @@ static async Task ManualStopSuppressesFakeHub4comRestartAsync()
         RestartOnFailure = true
     };
     var store = await StoreWithMappingAsync(temp.Path, mapping);
-    var log = new InMemoryLog();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     var orchestrator = CreateOrchestratorWithPorts(
         store,
         new DependencyDetector([temp.Path], pathOverride: ""),
@@ -1714,7 +2072,8 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
     Func<TunnelMapping, Hub4comCommand>? hub4comCommandFactory = null,
     TimeSpan? restartDelay = null,
     TimeSpan? portReleaseRetryTimeout = null,
-    TimeSpan? portReleaseRetryDelay = null)
+    TimeSpan? portReleaseRetryDelay = null,
+    TimeSpan? restartMaxDelay = null)
 {
     return new TunnelOrchestrator(
         store,
@@ -1727,7 +2086,8 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
         hub4comCommandFactory,
         restartDelay,
         portReleaseRetryTimeout,
-        portReleaseRetryDelay);
+        portReleaseRetryDelay,
+        restartMaxDelay);
 }
 
 static Hub4comCommand BuildFakeHub4comCommand(string root, TunnelMapping mapping)
@@ -1818,6 +2178,81 @@ static void AssertBytes(byte[] expected, byte[] actual)
     }
 }
 
+static uint InvokeNormalizeLocalSerialFlags(uint flags)
+{
+    var endpointType = typeof(Com0comServiceTunnelSession).Assembly.GetType("VComTunnel.Core.Win32SerialPortEndpoint")
+        ?? throw new Exception("Win32SerialPortEndpoint reflection target missing.");
+    var method = endpointType.GetMethod(
+        "NormalizeLocalSerialFlags",
+        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new Exception("NormalizeLocalSerialFlags reflection target missing.");
+    return (uint)(method.Invoke(null, [flags]) ?? throw new Exception("NormalizeLocalSerialFlags returned null."));
+}
+static string InvokeBuildDevicePath(string portName)
+{
+    var endpointType = typeof(Com0comServiceTunnelSession).Assembly.GetType("VComTunnel.Core.Win32SerialPortEndpoint")
+        ?? throw new Exception("Win32SerialPortEndpoint reflection target missing.");
+    var method = endpointType.GetMethod(
+        "BuildDevicePath",
+        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new Exception("BuildDevicePath reflection target missing.");
+    return (string)(method.Invoke(null, [portName]) ?? throw new Exception("BuildDevicePath returned null."));
+}
+static async Task WaitForStreamBytesAsync(NetworkStream stream, byte[] expected, TimeSpan timeout)
+{
+    using var timeoutCts = new CancellationTokenSource(timeout);
+    var buffer = new byte[512];
+    var received = new List<byte>();
+    while (true)
+    {
+        var read = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), timeoutCts.Token);
+        if (read == 0)
+        {
+            throw new Exception("Network stream closed before expected bytes were observed.");
+        }
+
+        received.AddRange(buffer.Take(read));
+        if (ContainsSequence(received, expected))
+        {
+            return;
+        }
+    }
+}
+
+static bool ContainsSequence(IReadOnlyList<byte> bytes, IReadOnlyList<byte> expected)
+{
+    if (expected.Count == 0)
+    {
+        return true;
+    }
+
+    for (var i = 0; i <= bytes.Count - expected.Count; i++)
+    {
+        var matched = true;
+        for (var j = 0; j < expected.Count; j++)
+        {
+            if (bytes[i + j] != expected[j])
+            {
+                matched = false;
+                break;
+            }
+        }
+
+        if (matched)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+static byte[] BuildRfc2217Ack(byte command, byte payload)
+{
+    return payload == 0xFF
+        ? [255, 250, Rfc2217Client.TelnetOptionComPortControl, command, 255, 255, 255, 240]
+        : [255, 250, Rfc2217Client.TelnetOptionComPortControl, command, payload, 255, 240];
+}
+
 static byte[] SlipFrame(params byte[] payload)
 {
     var bytes = new List<byte> { 0xC0 };
@@ -1844,6 +2279,18 @@ static byte[] SlipFrame(params byte[] payload)
 }
 
 static byte[] Concat(params byte[][] chunks) => chunks.SelectMany(chunk => chunk).ToArray();
+
+static byte[] InvokeKmdfBuildNetworkFrame(KmdfTunnelSession session, ushort type, ushort flags, byte[] payload)
+{
+    var method = typeof(KmdfTunnelSession).GetMethod(
+        "BuildNetworkFrame",
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new Exception("BuildNetworkFrame reflection target missing.");
+    var frame = method.Invoke(session, new object[] { type, flags, payload, 0, payload.Length })
+        ?? throw new Exception("BuildNetworkFrame returned null.");
+    return (byte[])(frame.GetType().GetProperty("Bytes")?.GetValue(frame)
+        ?? throw new Exception("BuildNetworkFrame returned a frame without Bytes."));
+}
 
 static void AssertRfc2217Notifications(byte[] frame, params Rfc2217Notification[] expected)
 {
@@ -1885,6 +2332,98 @@ static void CreateZip(string path, IReadOnlyDictionary<string, string> files)
         var entry = archive.CreateEntry(name);
         using var writer = new StreamWriter(entry.Open());
         writer.Write(content);
+    }
+}
+
+internal sealed class RecordingSerialPortEndpointFactory(RecordingSerialPortEndpoint endpoint) : ISerialPortEndpointFactory
+{
+    public ISerialPortEndpoint Open(string portName) => endpoint;
+}
+
+internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
+{
+    private readonly object _lock = new();
+    private readonly List<int> _writeSizes = [];
+    private TaskCompletionSource _bytesWritten = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _totalBytes;
+    private uint _modemStatus;
+
+    public bool SupportsModemStatusEvents => false;
+
+    public ValueTask<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken)
+    {
+        return new ValueTask<int>(WaitForSerialReadAsync(cancellationToken));
+    }
+
+    public ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_lock)
+        {
+            _writeSizes.Add(bytes.Length);
+            _totalBytes += bytes.Length;
+            _bytesWritten.TrySetResult();
+        }
+
+        return ValueTask.CompletedTask;
+    }
+
+    public SerialPortSnapshot GetSnapshot() => new(0, 115200, 8, 0, 0);
+
+    public SerialPortSettings GetSettings() => new(115200, 8, 0, 0);
+
+    public uint GetModemStatus() => Volatile.Read(ref _modemStatus);
+
+    public void SetModemStatus(uint modemStatus) => Volatile.Write(ref _modemStatus, modemStatus);
+
+    public uint WaitForModemStatusChange(CancellationToken cancellationToken)
+    {
+        cancellationToken.WaitHandle.WaitOne();
+        cancellationToken.ThrowIfCancellationRequested();
+        return SerialPortSnapshot.EventNone;
+    }
+
+    public async Task WaitForTotalBytesAsync(int expectedBytes, TimeSpan timeout)
+    {
+        using var timeoutCts = new CancellationTokenSource(timeout);
+        while (true)
+        {
+            Task waitTask;
+            lock (_lock)
+            {
+                if (_totalBytes >= expectedBytes)
+                {
+                    return;
+                }
+
+                if (_bytesWritten.Task.IsCompleted)
+                {
+                    _bytesWritten = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
+
+                waitTask = _bytesWritten.Task;
+            }
+
+            await waitTask.WaitAsync(timeoutCts.Token);
+        }
+    }
+
+    public IReadOnlyList<int> WriteSizesSnapshot()
+    {
+        lock (_lock)
+        {
+            return _writeSizes.ToArray();
+        }
+    }
+
+    public void Dispose()
+    {
+    }
+
+    private static async Task<int> WaitForSerialReadAsync(CancellationToken cancellationToken)
+    {
+        await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        return 0;
     }
 }
 
