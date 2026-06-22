@@ -43,6 +43,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private readonly ByteThroughputLogThrottle _serialRxLog = new(TimeSpan.FromSeconds(1));
     private readonly object _serialStateLock = new();
     private readonly CancellationTokenSource _stop = new();
+    private int _forwardControlLines;
     private TaskCompletionSource? _pendingAckCompletion;
     private TaskCompletionSource? _flowResumeCompletion;
     private bool _remoteFlowSuspended;
@@ -68,6 +69,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         ISerialPortEndpointFactory? serialPorts = null)
     {
         _mapping = mapping;
+        _forwardControlLines = mapping.Hub4comForwardControlLines ? 1 : 0;
         _log = log;
         _faulted = faulted;
         _serialPorts = serialPorts ?? new Win32SerialPortEndpointFactory();
@@ -77,6 +79,13 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     public TunnelRunState State { get; private set; }
     public string? LastError { get; private set; }
+
+    private bool ForwardControlLines => Volatile.Read(ref _forwardControlLines) != 0;
+
+    public void UpdateMapping(TunnelMapping mapping)
+    {
+        Interlocked.Exchange(ref _forwardControlLines, mapping.Hub4comForwardControlLines ? 1 : 0);
+    }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -305,7 +314,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             }
 
             _lastSerialSnapshot = current;
-            return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone, _mapping.Hub4comForwardControlLines);
+            return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone, ForwardControlLines);
         }
     }
 
@@ -343,7 +352,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
             var current = previous with { ModemStatus = currentModemStatus };
             _lastSerialSnapshot = current;
-            return BuildModemChangeFrame(previous, current, eventMask, _mapping.Hub4comForwardControlLines);
+            return BuildModemChangeFrame(previous, current, eventMask, ForwardControlLines);
         }
     }
 

@@ -21,6 +21,9 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("com0com service maps peer modem signals", () => Task.Run(Com0comServiceMapsPeerModemSignals)),
     ("com0com service reconstructs fast RTS pulse", () => Task.Run(Com0comServiceReconstructsFastRtsPulse)),
     ("com0com service control-line switch blocks forwarding", () => Task.Run(Com0comServiceControlLineSwitchBlocksForwarding)),
+    ("com0com service runtime control-line update blocks forwarding", () => Task.Run(Com0comServiceRuntimeControlLineUpdateBlocksForwarding)),
+    ("running mapping options hot update on save", RunningMappingOptionsHotUpdateOnSaveAsync),
+    ("restart option hot update cancels pending restart", RestartOptionHotUpdateCancelsPendingRestartAsync),
     ("com0com service RX pipeline writes small chunks", Com0comServiceRxPipelineWritesSmallChunksAsync),
     ("com0com service modem polling forwards RTS", Com0comServiceModemPollingForwardsRtsAsync),
     ("com0com service local handflow disables blocking flags", () => Task.Run(Com0comServiceLocalHandflowDisablesBlockingFlags)),
@@ -333,6 +336,145 @@ static void Com0comServiceControlLineSwitchBlocksForwarding()
             0,
             SerialPortSnapshot.EventCts,
             forwardControlLines: false));
+}
+
+static void Com0comServiceRuntimeControlLineUpdateBlocksForwarding()
+{
+    using var temp = new TempDir();
+    using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var mapping = new TunnelMapping
+    {
+        Name = "Runtime controls",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM93",
+        BackingPort = "CNCB93",
+        Host = "127.0.0.1",
+        Port = 5000,
+        Hub4comForwardControlLines = true
+    };
+    using var session = new Com0comServiceTunnelSession(mapping, log, (_, _) => { });
+
+    AssertBytes([], InvokeCom0comUpdateSerialModemState(session, 0, SerialPortSnapshot.EventNone));
+    AssertBytes(Rfc2217Client.BuildSetModemControl(null, true), InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
+
+    session.UpdateMapping(mapping with { Hub4comForwardControlLines = false });
+    AssertBytes([], InvokeCom0comUpdateSerialModemState(session, 0, SerialPortSnapshot.EventCts));
+
+    session.UpdateMapping(mapping with { Hub4comForwardControlLines = true });
+    AssertBytes(Rfc2217Client.BuildSetModemControl(null, true), InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
+}
+
+static async Task RunningMappingOptionsHotUpdateOnSaveAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Id = "hot",
+        Name = "Hot options",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM94",
+        BackingPort = "CNCB94",
+        Host = "127.0.0.1",
+        Port = 5000,
+        Hub4comForwardControlLines = true,
+        AutoStart = false,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var starts = 0;
+    HotUpdateManagedTunnelSession? session = null;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM94", "CNCB94"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            Interlocked.Increment(ref starts);
+            session = new HotUpdateManagedTunnelSession(faulted);
+            return session;
+        },
+        restartDelay: TimeSpan.FromMilliseconds(50));
+
+    var started = await orchestrator.StartAsync("hot");
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+
+    var updated = mapping with
+    {
+        Hub4comForwardControlLines = false,
+        AutoStart = true,
+        RestartOnFailure = false
+    };
+    var errors = await orchestrator.SaveConfigAsync(new VComTunnelConfig { Mappings = [updated] });
+    AssertEqual("0", errors.Count.ToString());
+
+    var runtimeUpdate = session?.Updates.SingleOrDefault() ?? throw new Exception("Running session did not receive a mapping update.");
+    AssertTrue(!runtimeUpdate.Hub4comForwardControlLines, "Control-line forwarding should hot update to disabled.");
+    AssertTrue(runtimeUpdate.AutoStart, "Auto-start should hot update in the running mapping snapshot.");
+    AssertTrue(!runtimeUpdate.RestartOnFailure, "Restart-on-failure should hot update in the running mapping snapshot.");
+
+    session!.Fault("late network failure");
+    await Task.Delay(150);
+
+    AssertEqual("1", Volatile.Read(ref starts).ToString());
+    AssertTrue(
+        !log.Snapshot().Any(e => e.Message.Contains("Scheduling com0comService restart", StringComparison.OrdinalIgnoreCase)),
+        "RestartOnFailure=false should apply to faults raised after a hot config update.");
+
+    var messages = string.Join("\n", log.Snapshot().Select(entry => entry.Message));
+    AssertStringContains(messages, "Runtime control-line forwarding disabled");
+    AssertStringContains(messages, "Runtime auto-start option enabled");
+    AssertStringContains(messages, "Runtime restart-on-failure option disabled");
+}
+
+static async Task RestartOptionHotUpdateCancelsPendingRestartAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Id = "cancel-restart",
+        Name = "Cancel restart",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM95",
+        BackingPort = "CNCB95",
+        Host = "127.0.0.1",
+        Port = 5000,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var starts = 0;
+    HotUpdateManagedTunnelSession? session = null;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM95", "CNCB95"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            Interlocked.Increment(ref starts);
+            session = new HotUpdateManagedTunnelSession(faulted);
+            return session;
+        },
+        restartDelay: TimeSpan.FromMilliseconds(50));
+
+    var started = await orchestrator.StartAsync("cancel-restart");
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+
+    session!.Fault("temporary network failure");
+    await WaitUntilAsync(
+        () => log.Snapshot().Any(e => e.Message.Contains("Scheduling com0comService restart", StringComparison.OrdinalIgnoreCase)),
+        "Initial fault did not schedule a restart.");
+
+    var errors = await orchestrator.SaveConfigAsync(new VComTunnelConfig { Mappings = [mapping with { RestartOnFailure = false }] });
+    AssertEqual("0", errors.Count.ToString());
+    await Task.Delay(200);
+
+    AssertEqual("1", Volatile.Read(ref starts).ToString());
+    AssertStringContains(
+        string.Join("\n", log.Snapshot().Select(entry => entry.Message)),
+        "Runtime restart-on-failure option disabled");
 }
 
 static async Task Com0comServiceModemPollingForwardsRtsAsync()
@@ -2412,6 +2554,18 @@ static string InvokeBuildDevicePath(string portName)
         ?? throw new Exception("BuildDevicePath reflection target missing.");
     return (string)(method.Invoke(null, [portName]) ?? throw new Exception("BuildDevicePath returned null."));
 }
+static byte[] InvokeCom0comUpdateSerialModemState(Com0comServiceTunnelSession session, uint currentModemStatus, uint eventMask)
+{
+    var method = typeof(Com0comServiceTunnelSession).GetMethod(
+        "UpdateSerialModemState",
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new Exception("UpdateSerialModemState reflection target missing.");
+    var frame = method.Invoke(session, [currentModemStatus, eventMask])
+        ?? throw new Exception("UpdateSerialModemState returned null.");
+    return (byte[])(frame.GetType().GetProperty("Bytes")?.GetValue(frame)
+        ?? throw new Exception("UpdateSerialModemState returned a frame without Bytes."));
+}
+
 static async Task WaitForStreamBytesAsync(NetworkStream stream, byte[] expected, TimeSpan timeout)
 {
     using var timeoutCts = new CancellationTokenSource(timeout);
@@ -2799,6 +2953,47 @@ internal sealed class FakeManagedTunnelSession : IManagedTunnelSession
         }
 
         return Task.CompletedTask;
+    }
+
+    public void Dispose()
+    {
+        if (LastError is null)
+        {
+            State = TunnelRunState.Stopped;
+        }
+    }
+}
+
+internal sealed class HotUpdateManagedTunnelSession : IManagedTunnelSession
+{
+    private readonly Action<IManagedTunnelSession, string> _faulted;
+    private readonly List<TunnelMapping> _updates = [];
+
+    public HotUpdateManagedTunnelSession(Action<IManagedTunnelSession, string> faulted)
+    {
+        _faulted = faulted;
+    }
+
+    public TunnelRunState State { get; private set; } = TunnelRunState.Starting;
+    public string? LastError { get; private set; }
+    public IReadOnlyList<TunnelMapping> Updates => _updates;
+
+    public Task StartAsync(CancellationToken cancellationToken)
+    {
+        State = TunnelRunState.Running;
+        return Task.CompletedTask;
+    }
+
+    public void UpdateMapping(TunnelMapping mapping)
+    {
+        _updates.Add(mapping);
+    }
+
+    public void Fault(string error)
+    {
+        LastError = error;
+        State = TunnelRunState.Faulted;
+        _faulted(this, error);
     }
 
     public void Dispose()

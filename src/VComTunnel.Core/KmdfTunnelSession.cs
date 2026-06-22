@@ -60,6 +60,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
     private readonly InMemoryLog _log;
     private readonly Action<IKmdfTunnelSession, string> _faulted;
     private readonly bool _suppressInitialControlLineSync;
+    private int _forwardControlLines;
     private readonly Rfc2217Client _rfc2217 = new();
     private readonly Rfc2217LocalFlowControlState _localFlowControl = new();
     private readonly ByteThroughputLogThrottle _serialTxLog = new(TimeSpan.FromSeconds(1));
@@ -87,12 +88,20 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         _log = log;
         _faulted = faulted;
         _suppressInitialControlLineSync = mapping.SuppressInitialControlLineSync;
+        _forwardControlLines = mapping.Hub4comForwardControlLines ? 1 : 0;
         State = TunnelRunState.Starting;
         MarkNetworkActivity();
     }
 
     public TunnelRunState State { get; private set; }
     public string? LastError { get; private set; }
+
+    private bool ForwardControlLines => Volatile.Read(ref _forwardControlLines) != 0;
+
+    public void UpdateMapping(TunnelMapping mapping)
+    {
+        Interlocked.Exchange(ref _forwardControlLines, mapping.Hub4comForwardControlLines ? 1 : 0);
+    }
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -781,7 +790,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                     return new Rfc2217OutboundFrame([], [], "initial modem-control sync suppressed");
                 }
 
-                if (!_mapping.Hub4comForwardControlLines)
+                if (!ForwardControlLines)
                 {
                     _log.Info(_mapping.Name, $"Suppressed modem-control because control-line forwarding is disabled dtr={dtr?.ToString() ?? "-"}, rts={rts?.ToString() ?? "-"}.");
                     return new Rfc2217OutboundFrame([], [], "modem-control suppressed by control-line setting");
@@ -803,7 +812,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
                     return new Rfc2217OutboundFrame([], [], "initial handflow sync suppressed");
                 }
 
-                if (!_mapping.Hub4comForwardControlLines)
+                if (!ForwardControlLines)
                 {
                     _log.Info(_mapping.Name, $"Suppressed handflow because control-line forwarding is disabled control=0x{controlHandshake:X8}, flow=0x{flowReplace:X8}.");
                     return new Rfc2217OutboundFrame([], [], "handflow suppressed by control-line setting");
@@ -818,7 +827,7 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
             case EventTypeSetBreak:
                 EnsurePayload(type, length, 4);
                 var breakEnabled = buffer[offset] != 0;
-                if (!_mapping.Hub4comForwardControlLines)
+                if (!ForwardControlLines)
                 {
                     _log.Info(_mapping.Name, $"Suppressed break because control-line forwarding is disabled enabled={breakEnabled}.");
                     return new Rfc2217OutboundFrame([], [], "break suppressed by control-line setting");

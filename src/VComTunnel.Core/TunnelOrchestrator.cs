@@ -93,8 +93,92 @@ public sealed class TunnelOrchestrator
         }
 
         await _configStore.SaveAsync(config, cancellationToken);
+        ApplySavedConfigToKnownTunnels(config.Mappings);
         _log.Info("config", $"Saved {config.Mappings.Count} mapping(s).");
         return [];
+    }
+
+    private void ApplySavedConfigToKnownTunnels(IReadOnlyList<TunnelMapping> mappings)
+    {
+        foreach (var mapping in mappings)
+        {
+            if (!_tunnels.TryGetValue(mapping.Id, out var existing))
+            {
+                continue;
+            }
+
+            var previous = existing.Mapping;
+            var status = existing.ToStatus();
+            existing.Session?.UpdateMapping(mapping);
+            _tunnels[mapping.Id] = existing with { Mapping = mapping };
+            ApplyRestartOptionChange(previous, mapping, status);
+
+            if (status.State is TunnelRunState.Stopped)
+            {
+                continue;
+            }
+
+            LogRuntimeOptionChanges(previous, mapping, existing.Session is not null);
+        }
+    }
+
+    private void ApplyRestartOptionChange(TunnelMapping previous, TunnelMapping current, TunnelStatus previousStatus)
+    {
+        if (previous.RestartOnFailure == current.RestartOnFailure)
+        {
+            return;
+        }
+
+        if (!current.RestartOnFailure)
+        {
+            BumpRestartVersion(current.Id);
+            ResetRestartBackoff(current.Id);
+            return;
+        }
+
+        if (previousStatus.State is not TunnelRunState.Faulted || string.IsNullOrWhiteSpace(previousStatus.LastError))
+        {
+            return;
+        }
+
+        if (IsPermanentRestartError(current.Backend, previousStatus.LastError))
+        {
+            return;
+        }
+
+        ScheduleRestart(current, previousStatus.LastError, FormatBackendForLog(current.Backend));
+    }
+
+    private static bool IsPermanentRestartError(TunnelBackend backend, string error)
+    {
+        return backend == TunnelBackend.Com0comHub4com
+            ? IsPermanentProcessError(error)
+            : IsPermanentSessionError(error);
+    }
+
+    private void LogRuntimeOptionChanges(TunnelMapping previous, TunnelMapping current, bool hasManagedSession)
+    {
+        if (previous.Hub4comForwardControlLines != current.Hub4comForwardControlLines)
+        {
+            if (hasManagedSession)
+            {
+                _log.Info(current.Name, $"Runtime control-line forwarding {(current.Hub4comForwardControlLines ? "enabled" : "disabled")} for active {FormatBackendForLog(current.Backend)} tunnel.");
+            }
+            else
+            {
+                _log.Info(current.Name, "Control-line forwarding change saved; restart this hub4com tunnel for it to affect the running process.");
+            }
+        }
+
+        if (previous.AutoStart != current.AutoStart)
+        {
+            _log.Info(current.Name, $"Runtime auto-start option {(current.AutoStart ? "enabled" : "disabled")}.");
+        }
+
+        if (previous.RestartOnFailure != current.RestartOnFailure)
+        {
+            _log.Info(current.Name, $"Runtime restart-on-failure option {(current.RestartOnFailure ? "enabled" : "disabled")}.");
+        }
     }
 
     public async Task StartAutoStartMappingsAsync(CancellationToken cancellationToken = default)
@@ -517,8 +601,9 @@ public sealed class TunnelOrchestrator
             return;
         }
 
-        _tunnels[mapping.Id] = new ManagedTunnel(mapping, TunnelRunState.Faulted, null, null, null, error);
-        ScheduleSessionRestart(mapping, error);
+        var currentMapping = existing.Mapping;
+        _tunnels[currentMapping.Id] = new ManagedTunnel(currentMapping, TunnelRunState.Faulted, null, null, null, error);
+        ScheduleSessionRestart(currentMapping, error);
     }
 
     private bool ScheduleSessionRestart(TunnelMapping mapping, string error)
@@ -605,16 +690,23 @@ public sealed class TunnelOrchestrator
             return;
         }
 
-        var message = BuildExitMessage(mapping, process);
-        _log.Warn(mapping.Name, message);
-        _tunnels[mapping.Id] = new ManagedTunnel(mapping, TunnelRunState.Faulted, null, null, null, message);
+        if (!_tunnels.TryGetValue(mapping.Id, out var existing) || !ReferenceEquals(existing.Process, process))
+        {
+            _log.Info(mapping.Name, $"Ignored stale hub4com process {process.Id} exit after the tunnel was stopped or replaced.");
+            return;
+        }
 
-        if (!mapping.RestartOnFailure || IsPermanentProcessError(message))
+        var currentMapping = existing.Mapping;
+        var message = BuildExitMessage(currentMapping, process);
+        _log.Warn(currentMapping.Name, message);
+        _tunnels[currentMapping.Id] = new ManagedTunnel(currentMapping, TunnelRunState.Faulted, null, null, null, message);
+
+        if (!currentMapping.RestartOnFailure || IsPermanentProcessError(message))
         {
             return;
         }
 
-        ScheduleRestart(mapping, message, FormatBackendForLog(mapping.Backend));
+        ScheduleRestart(currentMapping, message, FormatBackendForLog(currentMapping.Backend));
     }
 
     private TunnelStatus BuildExitedStatus(TunnelMapping mapping, Process process)
