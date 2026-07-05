@@ -67,6 +67,25 @@ public static class ConfigValidator
             {
                 errors.Add($"{mapping.Name}: only RFC2217 is supported.");
             }
+
+            if (mapping.WirelessSerialAutoDiscover)
+            {
+                if (mapping.Backend != TunnelBackend.Com0comService)
+                {
+                    errors.Add($"{mapping.Name}: wirelessSerialAutoDiscover requires the com0comService backend.");
+                }
+
+                if (string.IsNullOrWhiteSpace(mapping.WirelessSerialMac))
+                {
+                    errors.Add($"{mapping.Name}: wirelessSerialMac is required when wirelessSerialAutoDiscover is enabled.");
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(mapping.WirelessSerialMac)
+                && WirelessSerialEndpointRegistry.NormalizeMac(mapping.WirelessSerialMac) is null)
+            {
+                errors.Add($"{mapping.Name}: wirelessSerialMac must contain 12 hexadecimal digits.");
+            }
         }
 
         return errors;

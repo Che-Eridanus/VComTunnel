@@ -11,6 +11,10 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("same visible and backing COM is rejected", () => Task.Run(SameVisibleAndBackingComIsRejected)),
     ("KMDF backing port is rejected", () => Task.Run(KmdfBackingPortIsRejected)),
     ("invalid host and port are rejected", () => Task.Run(InvalidHostAndPortAreRejected)),
+    ("wireless serial auto discovery validation", () => Task.Run(WirelessSerialAutoDiscoveryValidation)),
+    ("wireless serial endpoint registry", () => Task.Run(WirelessSerialEndpointRegistryUpdatesEndpoint)),
+    ("wireless serial periodic query follows MAC binding", WirelessSerialPeriodicQueryFollowsMacBindingAsync),
+    ("wireless serial endpoint change restarts running mapping", WirelessSerialEndpointChangeRestartsRunningMappingAsync),
     ("COM backing port is accepted", () => Task.Run(ComBackingPortIsAccepted)),
     ("config round trip", ConfigRoundTripAsync),
     ("service endpoint defaults to loopback", () => Task.Run(ServiceEndpointDefaultsToLoopback)),
@@ -29,6 +33,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("com0com service forwards peer serial setting insertions", Com0comServiceForwardsPeerSerialSettingInsertionsAsync),
     ("running mapping options hot update on save", RunningMappingOptionsHotUpdateOnSaveAsync),
     ("running backend change stops old process on save", RunningBackendChangeStopsOldProcessOnSaveAsync),
+    ("deleted mapping stops and removes runtime on save", DeletedMappingStopsAndRemovesRuntimeOnSaveAsync),
     ("restart option hot update cancels pending restart", RestartOptionHotUpdateCancelsPendingRestartAsync),
     ("faulted mapping restart option hot update schedules restart", FaultedMappingRestartOptionHotUpdateSchedulesRestartAsync),
     ("com0com service RX pipeline writes small chunks", Com0comServiceRxPipelineWritesSmallChunksAsync),
@@ -167,6 +172,232 @@ static void InvalidHostAndPortAreRejected()
     AssertContains(errors, "port");
 }
 
+static void WirelessSerialAutoDiscoveryValidation()
+{
+    var missingMac = new VComTunnelConfig
+    {
+        Mappings =
+        [
+            new TunnelMapping { Name = "Wireless", Backend = TunnelBackend.Com0comService, WirelessSerialAutoDiscover = true }
+        ]
+    };
+    AssertContains(ConfigValidator.Validate(missingMac), "wirelessSerialMac");
+
+    var wrongBackend = new VComTunnelConfig
+    {
+        Mappings =
+        [
+            new TunnelMapping { Name = "Wireless", WirelessSerialAutoDiscover = true, WirelessSerialMac = "AA:BB:CC:DD:EE:FF" }
+        ]
+    };
+    AssertContains(ConfigValidator.Validate(wrongBackend), "com0comService");
+
+    var valid = new VComTunnelConfig
+    {
+        Mappings =
+        [
+            new TunnelMapping
+            {
+                Name = "Wireless",
+                Backend = TunnelBackend.Com0comService,
+                BackingPort = "CNCB12",
+                WirelessSerialAutoDiscover = true,
+                WirelessSerialMac = "AA-BB-CC-DD-EE-FF"
+            }
+        ]
+    };
+    AssertEmpty(ConfigValidator.Validate(valid));
+}
+
+static void WirelessSerialEndpointRegistryUpdatesEndpoint()
+{
+    var registry = new WirelessSerialEndpointRegistry(new InMemoryLog(), deviceTtl: TimeSpan.FromMinutes(1));
+    var device = registry.Upsert(new WirelessSerialEndpointUpdateRequest(
+        Mac: "aa:bb:cc:dd:ee:ff",
+        IpAddress: "192.168.10.42",
+        ServicePort: 2217,
+        DeviceId: "unit-01",
+        Name: "XFG-N01",
+        Product: "Wireless Serial",
+        Board: "esp32c3",
+        Firmware: "1.0.0",
+        Mode: "sta",
+        WifiRssi: -58,
+        ConfigMode: false,
+        Clients: 1,
+        Source: "test"));
+
+    AssertEqual("AABBCCDDEEFF", device.Mac);
+    AssertEqual("192.168.10.42", device.IpAddress);
+    AssertEqual("2217", device.ServicePort?.ToString() ?? "");
+    AssertEqual("-58", device.WifiRssi?.ToString() ?? "");
+
+    var endpoint = registry.FindEndpointByMac("AA-BB-CC-DD-EE-FF");
+    AssertEqual("192.168.10.42", endpoint!.Host);
+    AssertEqual("2217", endpoint.Port?.ToString() ?? "");
+
+    var packet = """
+        {
+          "magic":"XFGWS",
+          "proto":"xfg-discovery",
+          "ver":1,
+          "cmd":"announce",
+          "device":{"name":"XFG-N02","id":"unit-02","mac":"11:22:33:44:55:66"},
+          "net":{"ip":"192.168.10.43","port":5000,"mode":"rfc2217"}
+        }
+        """;
+    AssertTrue(
+        registry.TryApplyDiscoveryPacket(packet, new IPEndPoint(IPAddress.Parse("192.168.10.99"), 19527), out var parsed),
+        "Expected minimal WirelessSerial UDP endpoint packet to parse.");
+    AssertEqual("112233445566", parsed!.Mac);
+    AssertEqual("192.168.10.43", parsed.IpAddress);
+}
+
+static async Task WirelessSerialPeriodicQueryFollowsMacBindingAsync()
+{
+    var manualFixedEndpoint = new VComTunnelConfig
+    {
+        Mappings =
+        [
+            new TunnelMapping
+            {
+                Name = "Manual fixed endpoint",
+                Backend = TunnelBackend.Com0comService,
+                VisiblePort = "COM31",
+                BackingPort = "CNCB31",
+                Host = "192.168.7.88",
+                Port = 2217
+            }
+        ]
+    };
+    AssertTrue(
+        !WirelessSerialEndpointRegistry.HasMacBoundMapping(manualFixedEndpoint.Mappings),
+        "A manual fixed endpoint without wirelessSerialMac must not trigger periodic UDP discovery.");
+
+    var macMetadataOnly = new VComTunnelConfig
+    {
+        Mappings =
+        [
+            manualFixedEndpoint.Mappings.Single() with
+            {
+                WirelessSerialMac = "AA:BB:CC:DD:EE:FF",
+                WirelessSerialAutoDiscover = false
+            }
+        ]
+    };
+    AssertTrue(
+        !WirelessSerialEndpointRegistry.HasMacBoundMapping(macMetadataOnly.Mappings),
+        "A MAC field without wirelessSerialAutoDiscover must remain manual and must not trigger periodic UDP discovery.");
+
+    var macBoundEndpoint = new VComTunnelConfig
+    {
+        Mappings =
+        [
+            manualFixedEndpoint.Mappings.Single() with
+            {
+                WirelessSerialMac = "AA:BB:CC:DD:EE:FF",
+                WirelessSerialAutoDiscover = true
+            }
+        ]
+    };
+    AssertTrue(
+        WirelessSerialEndpointRegistry.HasMacBoundMapping(macBoundEndpoint.Mappings),
+        "Only an explicit MAC-bound auto-discovery mapping should trigger periodic UDP discovery.");
+
+    var log = new InMemoryLog();
+    var registry = new WirelessSerialEndpointRegistry(
+        log,
+        queryInterval: TimeSpan.FromMilliseconds(50),
+        periodicQueryEnabled: _ => Task.FromResult(
+            WirelessSerialEndpointRegistry.HasMacBoundMapping(manualFixedEndpoint.Mappings)));
+
+    var result = await registry.SendPeriodicQueryIfEnabledAsync();
+    var sent = result.GetType().GetProperty("sent")?.GetValue(result);
+
+    AssertTrue(sent is false, "A registry without MAC-bound mappings should report the periodic query as skipped.");
+    AssertTrue(
+        log.Snapshot().Any(entry =>
+            entry.Message.Contains("Skipped UDP query", StringComparison.OrdinalIgnoreCase)),
+        "A registry without MAC-bound mappings should not send the periodic UDP query.");
+}
+
+static async Task WirelessSerialEndpointChangeRestartsRunningMappingAsync()
+{
+    using var temp = new TempDir();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var registry = new WirelessSerialEndpointRegistry(log, deviceTtl: TimeSpan.FromMinutes(1));
+    registry.Upsert(new WirelessSerialEndpointUpdateRequest(
+        Mac: "AA:BB:CC:DD:EE:FF",
+        IpAddress: "192.168.10.42",
+        ServicePort: 2217,
+        Source: "test"));
+
+    var mapping = new TunnelMapping
+    {
+        Id = "wireless-mapping",
+        Name = "Wireless mapping",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM44",
+        BackingPort = "CNCB44",
+        Host = "192.168.10.10",
+        Port = 5000,
+        WirelessSerialAutoDiscover = true,
+        WirelessSerialMac = "aa-bb-cc-dd-ee-ff"
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var endpoints = new List<string>();
+    var starts = 0;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM44", "CNCB44"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            Interlocked.Increment(ref starts);
+            lock (endpoints)
+            {
+                endpoints.Add($"{sessionMapping.Host}:{sessionMapping.Port}");
+            }
+
+            return new FakeManagedTunnelSession(faulted, failAfterStart: null);
+        },
+        wirelessSerialEndpoints: registry);
+
+    var started = await orchestrator.StartAsync(mapping.Id);
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+    lock (endpoints)
+    {
+        AssertEqual("192.168.10.42:2217", endpoints.Single());
+    }
+
+    registry.Upsert(new WirelessSerialEndpointUpdateRequest(
+        Mac: "AA-BB-CC-DD-EE-FF",
+        IpAddress: "192.168.10.43",
+        ServicePort: 33221,
+        Source: "test"));
+
+    await WaitUntilAsync(
+        () => Volatile.Read(ref starts) == 2
+            && orchestrator.GetStatus().Tunnels.Single(tunnel => tunnel.Id == mapping.Id).State == TunnelRunState.Running,
+        "Wireless endpoint update should restart the running mapping with the new network endpoint.");
+
+    lock (endpoints)
+    {
+        AssertEqual("192.168.10.43:33221", endpoints[^1]);
+    }
+
+    var errors = await orchestrator.SaveConfigAsync(new VComTunnelConfig { Mappings = [mapping] });
+    AssertEqual("0", errors.Count.ToString());
+    registry.Upsert(new WirelessSerialEndpointUpdateRequest(
+        Mac: "AA-BB-CC-DD-EE-FF",
+        IpAddress: "192.168.10.43",
+        ServicePort: 33221,
+        Source: "test"));
+    await Task.Delay(150);
+    AssertEqual("2", Volatile.Read(ref starts).ToString());
+}
+
 static void ComBackingPortIsAccepted()
 {
     var config = new VComTunnelConfig
@@ -188,7 +419,20 @@ static async Task ConfigRoundTripAsync()
     {
         Mappings =
         [
-            new TunnelMapping { Name = "RoundTrip", VisiblePort = "COM33", BackingPort = "CNCB33", Host = "127.0.0.1", Port = 2217, Hub4comForwardControlLines = true, AutoStart = true }
+            new TunnelMapping
+            {
+                Name = "RoundTrip",
+                Backend = TunnelBackend.Com0comService,
+                VisiblePort = "COM33",
+                BackingPort = "CNCB33",
+                Host = "127.0.0.1",
+                Port = 2217,
+                Hub4comForwardControlLines = true,
+                AutoStart = true,
+                WirelessSerialAutoDiscover = true,
+                WirelessSerialMac = "AA:BB:CC:DD:EE:FF",
+                WirelessSerialDeviceId = "unit-01"
+            }
         ]
     };
 
@@ -198,6 +442,9 @@ static async Task ConfigRoundTripAsync()
     AssertEqual("COM33", loaded.Mappings.Single().VisiblePort);
     AssertTrue(loaded.Mappings.Single().Hub4comForwardControlLines, "hub4com control-line mode should round-trip.");
     AssertTrue(loaded.Mappings.Single().AutoStart, "AutoStart should round-trip.");
+    AssertTrue(loaded.Mappings.Single().WirelessSerialAutoDiscover, "Wireless serial auto-discovery should round-trip.");
+    AssertEqual("AA:BB:CC:DD:EE:FF", loaded.Mappings.Single().WirelessSerialMac ?? "");
+    AssertEqual("unit-01", loaded.Mappings.Single().WirelessSerialDeviceId ?? "");
 }
 
 static void ServiceEndpointDefaultsToLoopback()
@@ -762,6 +1009,49 @@ static async Task RunningBackendChangeStopsOldProcessOnSaveAsync()
     AssertTrue(
         log.Snapshot().Any(e => e.Message.Contains("Stopped running tunnel because the saved mapping changed", StringComparison.OrdinalIgnoreCase)),
         "Backend-changing save should log that the old running tunnel was stopped.");
+}
+
+static async Task DeletedMappingStopsAndRemovesRuntimeOnSaveAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Id = "deleted-mapping",
+        Name = "Deleted mapping",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM76",
+        BackingPort = "CNCB76",
+        Host = "127.0.0.1",
+        Port = 5000,
+        RestartOnFailure = true
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    FakeManagedTunnelSession? session = null;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM76", "CNCB76"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            session = new FakeManagedTunnelSession(faulted, failAfterStart: null);
+            return session;
+        });
+
+    var started = await orchestrator.StartAsync(mapping.Id);
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+
+    var errors = await orchestrator.SaveConfigAsync(new VComTunnelConfig { Mappings = [] });
+    AssertEqual("0", errors.Count.ToString());
+
+    AssertEqual(TunnelRunState.Stopped.ToString(), session?.State.ToString() ?? "");
+    AssertTrue(
+        !orchestrator.GetStatus().Tunnels.Any(t => t.Id == mapping.Id),
+        "Deleted mapping should not remain in /api/status.");
+    AssertTrue(
+        log.Snapshot().Any(e => e.Message.Contains("saved mapping was deleted", StringComparison.OrdinalIgnoreCase)),
+        "Deleting a saved mapping should log that the runtime entry was removed.");
 }
 
 static async Task RestartOptionHotUpdateCancelsPendingRestartAsync()
@@ -2818,7 +3108,8 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
     TimeSpan? portReleaseRetryTimeout = null,
     TimeSpan? portReleaseRetryDelay = null,
     TimeSpan? restartMaxDelay = null,
-    TimeSpan? sessionStartTimeout = null)
+    TimeSpan? sessionStartTimeout = null,
+    WirelessSerialEndpointRegistry? wirelessSerialEndpoints = null)
 {
     return new TunnelOrchestrator(
         store,
@@ -2833,7 +3124,8 @@ static TunnelOrchestrator CreateOrchestratorWithPorts(
         portReleaseRetryTimeout,
         portReleaseRetryDelay,
         restartMaxDelay,
-        sessionStartTimeout);
+        sessionStartTimeout,
+        wirelessSerialEndpoints);
 }
 
 static Hub4comCommand BuildFakeHub4comCommand(string root, TunnelMapping mapping)

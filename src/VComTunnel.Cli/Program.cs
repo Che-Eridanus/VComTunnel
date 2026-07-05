@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Net.Http.Json;
+using System.Text.Json;
 using VComTunnel.Core;
 
 var exitCode = await VComTunnelCtl.RunAsync(args);
@@ -20,6 +22,7 @@ internal static class VComTunnelCtl
             "dependencies" => await GetAsync("/api/dependencies"),
             "mappings" => await GetAsync("/api/mappings"),
             "ports" => await GetAsync("/api/com0com/pairs"),
+            "wireless-serial" or "wireless" => await WirelessSerialAsync(args.Skip(1).ToArray()),
             "pair" => await PairAsync(args.Skip(1).ToArray()),
             "kmdf" => Kmdf(args.Skip(1).ToArray()),
             "start" => await PostMappingAsync(args.Skip(1).FirstOrDefault(), "start"),
@@ -167,10 +170,71 @@ internal static class VComTunnelCtl
         var action = args.FirstOrDefault()?.ToLowerInvariant() ?? "help";
         return action switch
         {
+            "create" => await PairPlanAsync($"/api/com0com/mappings/{args.Skip(1).FirstOrDefault()}/create"),
             "create-plan" => await PairPlanAsync($"/api/com0com/mappings/{args.Skip(1).FirstOrDefault()}/create-plan"),
+            "remove" => await PairPlanAsync($"/api/com0com/pairs/{args.Skip(1).FirstOrDefault()}/remove"),
             "remove-plan" => await PairPlanAsync($"/api/com0com/pairs/{args.Skip(1).FirstOrDefault()}/remove-plan"),
             _ => PairHelp()
         };
+    }
+
+    private static async Task<int> WirelessSerialAsync(string[] args)
+    {
+        var action = args.FirstOrDefault()?.ToLowerInvariant() ?? "help";
+        return action switch
+        {
+            "query" or "scan" => await PairPlanAsync("/api/wireless-serial/endpoints/query"),
+            "list" or "endpoints" => await ListWirelessSerialDevicesAsync(),
+            _ => WirelessSerialHelp()
+        };
+    }
+
+    private static async Task<int> ListWirelessSerialDevicesAsync()
+    {
+        if (!TryCreateServiceClient(out var client, out var serviceBaseUrl))
+        {
+            return 2;
+        }
+
+        using (client)
+        {
+            try
+            {
+                var devices = await client.GetFromJsonAsync<List<WirelessSerialDeviceEndpoint>>(
+                    "/api/wireless-serial/endpoints",
+                    new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+                if (devices is null || devices.Count == 0)
+                {
+                    Console.WriteLine("No wireless serial devices discovered.");
+                    return 0;
+                }
+
+                Console.WriteLine($"{"MAC",-17} {"Endpoint",-22} {"RSSI",5} {"Mode",-10} {"Device",-18} {"Last seen"}");
+                foreach (var device in devices.OrderBy(d => d.Mac, StringComparer.OrdinalIgnoreCase))
+                {
+                    var endpoint = device.ServicePort is null
+                        ? device.IpAddress
+                        : $"{device.IpAddress}:{device.ServicePort}";
+                    var name = FirstNonEmpty(device.DeviceId, device.Name, device.Product, device.Board) ?? "-";
+                    var rssi = device.WifiRssi?.ToString() ?? "-";
+                    var mode = device.Mode ?? "-";
+                    Console.WriteLine($"{device.Mac,-17} {endpoint,-22} {rssi,5} {mode,-10} {name,-18} {device.LastSeenAt:O}");
+                }
+
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Service is not reachable at {serviceBaseUrl}: {ex.Message}");
+                return 2;
+            }
+        }
+    }
+
+    private static string? FirstNonEmpty(params string?[] values)
+    {
+        return values.FirstOrDefault(value => !string.IsNullOrWhiteSpace(value));
     }
 
     private static async Task<int> PairPlanAsync(string path)
@@ -538,7 +602,11 @@ internal static class VComTunnelCtl
           dependencies             Read /api/dependencies from the local service
           mappings                 Read /api/mappings from the local service
           ports                    List registered com0com pairs
+          wireless-serial query    Trigger minimal UDP endpoint discovery
+          wireless-serial list     List WirelessSerial endpoints used for MAC-to-COM binding
+          pair create <id>         Ask service to create one mapping's com0com pair
           pair create-plan <id>    Print setupc plan for one mapping
+          pair remove <n>          Ask service to remove com0com pair number n
           pair remove-plan <n>     Print setupc remove plan for pair number n
           kmdf list                List VComTunnel KMDF COM ports
           kmdf add COMx [inf]      Create an experimental KMDF COM port with administrator approval
@@ -566,9 +634,15 @@ internal static class VComTunnelCtl
         return 0;
     }
 
+    private static int WirelessSerialHelp()
+    {
+        Console.WriteLine("Usage: vcomtunnelctl wireless-serial query | list");
+        return 0;
+    }
+
     private static int PairHelp()
     {
-        Console.WriteLine("Usage: vcomtunnelctl pair create-plan <mappingId> | remove-plan <pairNumber>");
+        Console.WriteLine("Usage: vcomtunnelctl pair create <mappingId> | create-plan <mappingId> | remove <pairNumber> | remove-plan <pairNumber>");
         return 0;
     }
 

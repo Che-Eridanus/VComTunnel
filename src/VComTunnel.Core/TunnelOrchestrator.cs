@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Net.Sockets;
 using System.Text.Json;
 
 namespace VComTunnel.Core;
@@ -14,6 +15,7 @@ public sealed class TunnelOrchestrator
     private readonly Func<TunnelMapping, Hub4comCommand> _hub4comCommandFactory;
     private readonly IComPortInventory _comPortInventory;
     private readonly InMemoryLog _log;
+    private readonly WirelessSerialEndpointRegistry? _wirelessSerialEndpoints;
     private readonly Func<TunnelMapping, InMemoryLog, Action<IKmdfTunnelSession, string>, IKmdfTunnelSession> _kmdfSessionFactory;
     private readonly Func<TunnelMapping, InMemoryLog, Action<IManagedTunnelSession, string>, IManagedTunnelSession> _com0comServiceSessionFactory;
     private readonly TimeSpan _restartInitialDelay;
@@ -45,7 +47,8 @@ public sealed class TunnelOrchestrator
         TimeSpan? portReleaseRetryTimeout = null,
         TimeSpan? portReleaseRetryDelay = null,
         TimeSpan? restartMaxDelay = null,
-        TimeSpan? sessionStartTimeout = null)
+        TimeSpan? sessionStartTimeout = null,
+        WirelessSerialEndpointRegistry? wirelessSerialEndpoints = null)
     {
         _configStore = configStore;
         _dependencyDetector = dependencyDetector;
@@ -53,6 +56,12 @@ public sealed class TunnelOrchestrator
         _hub4comCommandFactory = hub4comCommandFactory ?? _hub4comCommandBuilder.Build;
         _comPortInventory = comPortInventory;
         _log = log;
+        _wirelessSerialEndpoints = wirelessSerialEndpoints;
+        if (_wirelessSerialEndpoints is not null)
+        {
+            _wirelessSerialEndpoints.EndpointUpdated += OnWirelessSerialEndpointUpdated;
+        }
+
         _kmdfSessionFactory = kmdfSessionFactory ?? ((mapping, sessionLog, faulted) => new KmdfTunnelSession(mapping, sessionLog, faulted));
         _com0comServiceSessionFactory = com0comServiceSessionFactory ?? ((mapping, sessionLog, faulted) => new Com0comServiceTunnelSession(mapping, sessionLog, faulted));
         var configDirectory = Path.GetDirectoryName(_configStore.Path);
@@ -102,6 +111,23 @@ public sealed class TunnelOrchestrator
 
     private void ApplySavedConfigToKnownTunnels(IReadOnlyList<TunnelMapping> mappings)
     {
+        var savedIds = mappings
+            .Select(mapping => mapping.Id)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var removed in _tunnels.Keys.Where(id => !savedIds.Contains(id)).ToArray())
+        {
+            StopExisting(removed);
+            _lastProcessErrors.TryRemove(removed, out _);
+            ResetRestartBackoff(removed);
+            _mappingLocks.TryRemove(removed, out _);
+            if (_tunnels.TryRemove(removed, out var old))
+            {
+                _log.Info(old.Mapping.Name, "Removed tunnel runtime because the saved mapping was deleted.");
+            }
+        }
+
         foreach (var mapping in mappings)
         {
             if (!_tunnels.TryGetValue(mapping.Id, out var existing))
@@ -110,6 +136,7 @@ public sealed class TunnelOrchestrator
             }
 
             var previous = existing.Mapping;
+            var runtimeMapping = PreserveWirelessRuntimeEndpoint(previous, mapping, existing.ToStatus().State);
             var status = existing.ToStatus();
 
             if (status.State is not TunnelRunState.Stopped && RequiresRestartForConfigChange(previous, mapping))
@@ -131,12 +158,12 @@ public sealed class TunnelOrchestrator
             // Compare-and-swap so a concurrent fault/stop callback that already replaced this
             // entry is not clobbered with a stale snapshot. If the swap fails the tunnel changed
             // under us, so skip the hot update (including the session) entirely.
-            if (!_tunnels.TryUpdate(mapping.Id, existing with { Mapping = mapping }, existing))
+            if (!_tunnels.TryUpdate(mapping.Id, existing with { Mapping = runtimeMapping }, existing))
             {
                 continue;
             }
 
-            existing.Session?.UpdateMapping(mapping);
+            existing.Session?.UpdateMapping(runtimeMapping);
             ApplyRestartOptionChange(previous, mapping, status);
 
             if (status.State is TunnelRunState.Stopped)
@@ -148,14 +175,52 @@ public sealed class TunnelOrchestrator
         }
     }
 
+    private static TunnelMapping PreserveWirelessRuntimeEndpoint(
+        TunnelMapping previous,
+        TunnelMapping current,
+        TunnelRunState previousState)
+    {
+        if (previousState is not (TunnelRunState.Starting or TunnelRunState.Running)
+            || !IsSameWirelessSerialBinding(previous, current))
+        {
+            return current;
+        }
+
+        return current with { Host = previous.Host, Port = previous.Port };
+    }
+
     private static bool RequiresRestartForConfigChange(TunnelMapping previous, TunnelMapping current)
     {
         return previous.Backend != current.Backend
             || previous.Protocol != current.Protocol
             || !string.Equals(previous.VisiblePort, current.VisiblePort, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(previous.BackingPort ?? "", current.BackingPort ?? "", StringComparison.OrdinalIgnoreCase)
-            || !string.Equals(previous.Host, current.Host, StringComparison.OrdinalIgnoreCase)
+            || RequiresEndpointRestartForConfigChange(previous, current)
+            || previous.WirelessSerialAutoDiscover != current.WirelessSerialAutoDiscover
+            || !string.Equals(previous.WirelessSerialMac ?? "", current.WirelessSerialMac ?? "", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool RequiresEndpointRestartForConfigChange(TunnelMapping previous, TunnelMapping current)
+    {
+        if (IsSameWirelessSerialBinding(previous, current))
+        {
+            return false;
+        }
+
+        return !string.Equals(previous.Host, current.Host, StringComparison.OrdinalIgnoreCase)
             || previous.Port != current.Port;
+    }
+
+    private static bool IsSameWirelessSerialBinding(TunnelMapping previous, TunnelMapping current)
+    {
+        if (!previous.WirelessSerialAutoDiscover || !current.WirelessSerialAutoDiscover)
+        {
+            return false;
+        }
+
+        var previousMac = WirelessSerialEndpointRegistry.NormalizeMac(previous.WirelessSerialMac);
+        return previousMac is not null
+            && string.Equals(previousMac, WirelessSerialEndpointRegistry.NormalizeMac(current.WirelessSerialMac), StringComparison.OrdinalIgnoreCase);
     }
 
     private void ApplyRestartOptionChange(TunnelMapping previous, TunnelMapping current, TunnelStatus previousStatus)
@@ -336,8 +401,9 @@ public sealed class TunnelOrchestrator
     private async Task<TunnelStatus> StartCoreAsync(string id, CancellationToken cancellationToken, bool logStartupFailure)
     {
         var config = await _configStore.LoadAsync(cancellationToken);
-        var mapping = config.Mappings.FirstOrDefault(m => string.Equals(m.Id, id, StringComparison.OrdinalIgnoreCase))
+        var configuredMapping = config.Mappings.FirstOrDefault(m => string.Equals(m.Id, id, StringComparison.OrdinalIgnoreCase))
             ?? throw new KeyNotFoundException($"Mapping '{id}' was not found.");
+        var mapping = await ResolveWirelessSerialEndpointAsync(configuredMapping, cancellationToken).ConfigureAwait(false);
 
         if (mapping.Backend == TunnelBackend.Kmdf)
         {
@@ -432,6 +498,122 @@ public sealed class TunnelOrchestrator
         }
 
         return tunnel.ToStatus();
+    }
+
+    private async Task<TunnelMapping> ResolveWirelessSerialEndpointAsync(TunnelMapping mapping, CancellationToken cancellationToken)
+    {
+        if (!mapping.WirelessSerialAutoDiscover || string.IsNullOrWhiteSpace(mapping.WirelessSerialMac))
+        {
+            return mapping;
+        }
+
+        var endpoints = _wirelessSerialEndpoints;
+        if (endpoints is null)
+        {
+            _log.Warn(mapping.Name, "Wireless serial endpoint binding is enabled on this mapping, but the endpoint registry is not registered; using the saved endpoint.");
+            return mapping;
+        }
+
+        await Task.CompletedTask.ConfigureAwait(false);
+        var endpoint = endpoints.FindEndpointByMac(mapping.WirelessSerialMac);
+
+        if (endpoint is null)
+        {
+            _log.Warn(mapping.Name, $"No wireless serial endpoint for MAC {mapping.WirelessSerialMac}; using saved endpoint {FormatEndpoint(mapping)}.");
+            return mapping;
+        }
+
+        var resolvedPort = endpoint.Port.GetValueOrDefault(mapping.Port);
+        if (string.Equals(mapping.Host, endpoint.Host, StringComparison.OrdinalIgnoreCase) && mapping.Port == resolvedPort)
+        {
+            return mapping;
+        }
+
+        // The COM mapping owns user intent; discovery only refreshes the runtime network location
+        // so an IP change does not break the stable MAC-to-COM binding.
+        _log.Info(mapping.Name, $"Resolved wireless serial MAC {endpoint.Mac} to {endpoint.Host}:{resolvedPort}.");
+        return mapping with { Host = endpoint.Host, Port = resolvedPort };
+    }
+
+    private void OnWirelessSerialEndpointUpdated(WirelessSerialDeviceEndpoint endpoint)
+    {
+        _ = Task.Run(() => RestartMappingsForWirelessEndpointAsync(endpoint));
+    }
+
+    private async Task RestartMappingsForWirelessEndpointAsync(WirelessSerialDeviceEndpoint endpoint)
+    {
+        try
+        {
+            var config = await _configStore.LoadAsync(CancellationToken.None).ConfigureAwait(false);
+            var updatedMac = WirelessSerialEndpointRegistry.NormalizeMac(endpoint.Mac);
+            if (updatedMac is null)
+            {
+                return;
+            }
+
+            foreach (var mapping in config.Mappings.Where(mapping => IsMappingBoundToWirelessMac(mapping, updatedMac)).ToArray())
+            {
+                await RestartMappingIfWirelessEndpointChangedAsync(mapping, CancellationToken.None).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            _log.Warn("wireless-serial", $"Could not refresh MAC-bound tunnels after endpoint update: {ex.Message}");
+        }
+    }
+
+    private async Task RestartMappingIfWirelessEndpointChangedAsync(TunnelMapping configuredMapping, CancellationToken cancellationToken)
+    {
+        if (!_tunnels.TryGetValue(configuredMapping.Id, out var snapshot)
+            || snapshot.ToStatus().State is not (TunnelRunState.Starting or TunnelRunState.Running))
+        {
+            return;
+        }
+
+        var mappingLock = GetMappingLock(configuredMapping.Id);
+        await mappingLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!_tunnels.TryGetValue(configuredMapping.Id, out var existing)
+                || existing.ToStatus().State is not (TunnelRunState.Starting or TunnelRunState.Running))
+            {
+                return;
+            }
+
+            var resolvedMapping = await ResolveWirelessSerialEndpointAsync(configuredMapping, cancellationToken).ConfigureAwait(false);
+            if (string.Equals(existing.Mapping.Host, resolvedMapping.Host, StringComparison.OrdinalIgnoreCase)
+                && existing.Mapping.Port == resolvedMapping.Port)
+            {
+                return;
+            }
+
+            _log.Info(
+                configuredMapping.Name,
+                $"Wireless serial endpoint for MAC {WirelessSerialEndpointRegistry.NormalizeMac(configuredMapping.WirelessSerialMac)} changed from {FormatEndpoint(existing.Mapping)} to {FormatEndpoint(resolvedMapping)}; restarting tunnel.");
+            StopExisting(configuredMapping.Id);
+            _lastProcessErrors.TryRemove(configuredMapping.Id, out _);
+            ResetRestartBackoff(configuredMapping.Id);
+            _tunnels[configuredMapping.Id] = new ManagedTunnel(resolvedMapping, TunnelRunState.Stopped, null, null, null, null);
+            await StartCoreAsync(configuredMapping.Id, cancellationToken, logStartupFailure: true).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or SocketException or InvalidOperationException or TimeoutException)
+        {
+            _log.Error(configuredMapping.Name, $"Wireless serial endpoint refresh failed: {ex.Message}");
+        }
+        finally
+        {
+            mappingLock.Release();
+        }
+    }
+
+    private static bool IsMappingBoundToWirelessMac(TunnelMapping mapping, string normalizedMac)
+    {
+        return mapping.Backend == TunnelBackend.Com0comService
+            && mapping.WirelessSerialAutoDiscover
+            && string.Equals(
+                WirelessSerialEndpointRegistry.NormalizeMac(mapping.WirelessSerialMac),
+                normalizedMac,
+                StringComparison.OrdinalIgnoreCase);
     }
 
     public TunnelStatus Stop(string id)

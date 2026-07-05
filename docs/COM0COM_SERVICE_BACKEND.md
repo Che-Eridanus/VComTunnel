@@ -23,7 +23,9 @@ Current scope:
 - Requires `backend = com0comService`.
 - Requires `visiblePort` and `backingPort` to name different com0com pair
   sides.
-- Uses the existing com0com pair create/remove tooling.
+- Exposes fixed service-side com0com pair create/remove APIs so product UIs do
+  not need to run `setupc.exe` with a UAC prompt for every add/delete action.
+  Driver installation or repair remains an explicit elevated setup step.
 - Does not require hub4com to be installed or detected.
 - Supports RFC2217 initial negotiation, line/modem notification masks,
   startup serial/control status query, SIGNATURE response, remote
@@ -35,6 +37,8 @@ Current scope:
   control-line forwarding.
 - Writes RFC2217 RX data to the local COM side through a bounded small-chunk
   pipeline so the TCP reader is not blocked by normal local COM write latency.
+- Removes stale runtime entries when a saved mapping is deleted, so `/api/status`
+  does not keep advertising a COM mapping that no longer exists in config.
 
 Known limitation:
 

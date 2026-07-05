@@ -398,29 +398,34 @@ $firstReadme = @(
 )
 Set-Content -LiteralPath (Join-Path $packageRoot "README-FIRST.txt") -Value $firstReadme -Encoding UTF8
 
+function ConvertFrom-Utf8Base64 {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    return [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($Value))
+}
+
 $firstReadmeZh = @(
-    "VComTunnel 发布包",
+    (ConvertFrom-Utf8Base64 "VkNvbVR1bm5lbCDlj5HluIPljIU="),
     "",
-    $(if ($FrameworkDependent) { "这是 framework-dependent 包，运行前需要安装 .NET 8 Desktop Runtime 和 ASP.NET Core Runtime。" } else { "这是 self-contained 包，不需要用户单独安装 .NET 运行时。" }),
-    "支持系统：Windows 10/11 x64。Win7、Win8、Win8.1 不属于当前 .NET 8 / WPF 发布线的支持范围。",
-    "self-contained 只表示发布包内置 .NET 运行时，不会扩大操作系统兼容范围。",
+    $(if ($FrameworkDependent) { ConvertFrom-Utf8Base64 "6L+Z5pivIGZyYW1ld29yay1kZXBlbmRlbnQg5YyF77yM6L+Q6KGM5YmN6ZyA6KaB5a6J6KOFIC5ORVQgOCBEZXNrdG9wIFJ1bnRpbWUg5ZKMIEFTUC5ORVQgQ29yZSBSdW50aW1l44CC" } else { ConvertFrom-Utf8Base64 "6L+Z5pivIHNlbGYtY29udGFpbmVkIOWMhe+8jOS4jemcgOimgeeUqOaIt+WNleeLrOWuieijhSAuTkVUIOi/kOihjOaXtuOAgg==" }),
+    (ConvertFrom-Utf8Base64 "5pSv5oyB57O757uf77yaV2luZG93cyAxMC8xMSB4NjTjgIJXaW4344CBV2luOOOAgVdpbjguMSDkuI3lsZ7kuo7lvZPliY0gLk5FVCA4IC8gV1BGIOWPkeW4g+e6v+eahOaUr+aMgeiMg+WbtOOAgg=="),
+    (ConvertFrom-Utf8Base64 "c2VsZi1jb250YWluZWQg5Y+q6KGo56S65Y+R5biD5YyF5YaF572uIC5ORVQg6L+Q6KGM5pe277yM5LiN5Lya5omp5aSn5pON5L2c57O757uf5YW85a656IyD5Zu044CC"),
     "",
-    "便携使用：",
-    "1. 解压到一个当前用户可写的目录。",
-    "2. 运行 Start-VComTunnel-Portable.cmd。",
-    "3. 在 GUI 里点击 Setup deps，或运行 Setup-Dependencies-Portable.cmd。",
-    "4. Windows 请求安装 com0com 驱动时需要用户确认。应用、配置、日志和工具缓存可以便携，但虚拟串口驱动仍然是系统级安装。",
+    (ConvertFrom-Utf8Base64 "5L6/5pC65L2/55So77ya"),
+    (ConvertFrom-Utf8Base64 "MS4g6Kej5Y6L5Yiw5LiA5Liq5b2T5YmN55So5oi35Y+v5YaZ55qE55uu5b2V44CC"),
+    (ConvertFrom-Utf8Base64 "Mi4g6L+Q6KGMIFN0YXJ0LVZDb21UdW5uZWwtUG9ydGFibGUuY21k44CC"),
+    (ConvertFrom-Utf8Base64 "My4g5ZyoIEdVSSDph4zngrnlh7sgU2V0dXAgZGVwc++8jOaIlui/kOihjCBTZXR1cC1EZXBlbmRlbmNpZXMtUG9ydGFibGUuY21k44CC"),
+    (ConvertFrom-Utf8Base64 "NC4gV2luZG93cyDor7fmsYLlronoo4UgY29tMGNvbSDpqbHliqjml7bpnIDopoHnlKjmiLfnoa7orqTjgILlupTnlKjjgIHphY3nva7jgIHml6Xlv5flkozlt6XlhbfnvJPlrZjlj6/ku6Xkvr/mkLrvvIzkvYbomZrmi5/kuLLlj6PpqbHliqjku43nhLbmmK/ns7vnu5/nuqflronoo4XjgII="),
     "",
-    "安装为后台服务：",
-    "1. 运行 Install-Windows-Service.cmd 并确认 UAC。",
-    "2. 用 VComTunnel.Gui.exe 或 Start-VComTunnel.cmd 管理映射。",
-    "3. 运行 Uninstall-Windows-Service.cmd 删除 Windows Service。",
+    (ConvertFrom-Utf8Base64 "5a6J6KOF5Li65ZCO5Y+w5pyN5Yqh77ya"),
+    (ConvertFrom-Utf8Base64 "MS4g6L+Q6KGMIEluc3RhbGwtV2luZG93cy1TZXJ2aWNlLmNtZCDlubbnoa7orqQgVUFD44CC"),
+    (ConvertFrom-Utf8Base64 "Mi4g55SoIFZDb21UdW5uZWwuR3VpLmV4ZSDmiJYgU3RhcnQtVkNvbVR1bm5lbC5jbWQg566h55CG5pig5bCE44CC"),
+    (ConvertFrom-Utf8Base64 "My4g6L+Q6KGMIFVuaW5zdGFsbC1XaW5kb3dzLVNlcnZpY2UuY21kIOWIoOmZpCBXaW5kb3dzIFNlcnZpY2XjgII="),
     "",
-    "安全边界：",
-    "- 稳定发布路径是 com0comHub4com。",
-    "- 本包内 KMDF 后端为测试签名版本，仅用于授权测试或内部验证。",
-    "- 创建或更新 KMDF 端口时，程序可能会将随包 VComTunnel.Serial 测试证书写入本机证书存储区，安装或更新驱动，并要求重启。",
-    "- 本机 API 只应使用 127.0.0.1，DTR/RTS/BREAK 等控制线行为先在安全硬件上验证。"
+    (ConvertFrom-Utf8Base64 "5a6J5YWo6L6555WM77ya"),
+    (ConvertFrom-Utf8Base64 "LSDnqLPlrprlj5HluIPot6/lvoTmmK8gY29tMGNvbUh1YjRjb23jgII="),
+    (ConvertFrom-Utf8Base64 "LSDmnKzljIXlhoUgS01ERiDlkI7nq6/kuLrmtYvor5Xnrb7lkI3niYjmnKzvvIzku4XnlKjkuo7mjojmnYPmtYvor5XmiJblhoXpg6jpqozor4HjgII="),
+    (ConvertFrom-Utf8Base64 "LSDliJvlu7rmiJbmm7TmlrAgS01ERiDnq6/lj6Pml7bvvIznqIvluo/lj6/og73kvJrlsIbpmo/ljIUgVkNvbVR1bm5lbC5TZXJpYWwg5rWL6K+V6K+B5Lmm5YaZ5YWl5pys5py66K+B5Lmm5a2Y5YKo5Yy677yM5a6J6KOF5oiW5pu05paw6amx5Yqo77yM5bm26KaB5rGC6YeN5ZCv44CC"),
+    (ConvertFrom-Utf8Base64 "LSDmnKzmnLogQVBJIOWPquW6lOS9v+eUqCAxMjcuMC4wLjHvvIxEVFIvUlRTL0JSRUFLIOetieaOp+WItue6v+ihjOS4uuWFiOWcqOWuieWFqOehrOS7tuS4iumqjOivgeOAgg==")
 )
 Set-Content -LiteralPath (Join-Path $packageRoot "README-FIRST.zh-CN.txt") -Value $firstReadmeZh -Encoding UTF8
 

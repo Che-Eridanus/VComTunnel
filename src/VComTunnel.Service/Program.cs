@@ -34,8 +34,17 @@ internal static class VComTunnelHost
         builder.Services.AddSingleton<Com0comSetupManager>();
         builder.Services.AddSingleton<KmdfDeviceManager>();
         builder.Services.AddSingleton<InMemoryLog>();
+        builder.Services.AddSingleton<WirelessSerialEndpointRegistry>(services =>
+        {
+            var log = services.GetRequiredService<InMemoryLog>();
+            var store = services.GetRequiredService<ConfigStore>();
+            return new WirelessSerialEndpointRegistry(
+                log,
+                periodicQueryEnabled: token => HasWirelessSerialMacBoundMappingAsync(store, token));
+        });
         builder.Services.AddSingleton<TunnelOrchestrator>();
         builder.Services.AddHostedService<AutoStartHostedService>();
+        builder.Services.AddHostedService<WirelessSerialEndpointHostedService>();
         builder.Services.ConfigureHttpJsonOptions(options =>
         {
             options.SerializerOptions.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
@@ -163,6 +172,34 @@ internal static class VComTunnelHost
             return Results.Ok(setup.GetPairs());
         });
 
+        app.MapGet("/api/wireless-serial/endpoints", (WirelessSerialEndpointRegistry endpoints) =>
+        {
+            return Results.Ok(endpoints.Snapshot());
+        });
+
+        app.MapPost("/api/wireless-serial/endpoints/query", async (
+            WirelessSerialEndpointRegistry endpoints,
+            CancellationToken requestToken) =>
+        {
+            return Results.Ok(await endpoints.SendQueryAsync(requestToken));
+        });
+
+        app.MapPost("/api/wireless-serial/endpoints", (
+            WirelessSerialEndpointUpdateRequest request,
+            WirelessSerialEndpointRegistry endpoints,
+            InMemoryLog log) =>
+        {
+            try
+            {
+                return Results.Ok(endpoints.Upsert(request));
+            }
+            catch (ArgumentException ex)
+            {
+                log.Warn("wireless-serial", ex.Message);
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
         app.MapPost("/api/com0com/mappings/{id}/create-plan", async (
             string id,
             Com0comSetupManager setup,
@@ -182,6 +219,28 @@ internal static class VComTunnelHost
             }
         });
 
+        app.MapPost("/api/com0com/mappings/{id}/create", async (
+            string id,
+            Com0comSetupManager setup,
+            CancellationToken requestToken) =>
+        {
+            try
+            {
+                var result = await setup.CreatePairAsync(id, requestToken);
+                return result.Ok
+                    ? Results.Ok(result)
+                    : Results.BadRequest(result);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
         app.MapPost("/api/com0com/pairs/{pairNumber:int}/remove-plan", (
             int pairNumber,
             Com0comSetupManager setup) =>
@@ -189,6 +248,24 @@ internal static class VComTunnelHost
             try
             {
                 return Results.Ok(setup.BuildRemovePlan(pairNumber));
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
+        app.MapPost("/api/com0com/pairs/{pairNumber:int}/remove", async (
+            int pairNumber,
+            Com0comSetupManager setup,
+            CancellationToken requestToken) =>
+        {
+            try
+            {
+                var result = await setup.RemovePairAsync(pairNumber, requestToken);
+                return result.Ok
+                    ? Results.Ok(result)
+                    : Results.BadRequest(result);
             }
             catch (Exception ex)
             {
@@ -258,6 +335,12 @@ internal static class VComTunnelHost
 
         await app.RunAsync(cancellationToken);
     }
+
+    private static async Task<bool> HasWirelessSerialMacBoundMappingAsync(ConfigStore store, CancellationToken cancellationToken)
+    {
+        var config = await store.LoadAsync(cancellationToken);
+        return WirelessSerialEndpointRegistry.HasMacBoundMapping(config.Mappings);
+    }
 }
 
 internal sealed class VComTunnelWindowsService : ServiceBase
@@ -320,6 +403,38 @@ internal sealed class AutoStartHostedService : BackgroundService
         catch (Exception ex)
         {
             _log.Error("service", $"AutoStart failed: {ex.Message}");
+        }
+    }
+}
+
+internal sealed class WirelessSerialEndpointHostedService : BackgroundService
+{
+    private readonly WirelessSerialEndpointRegistry _endpoints;
+    private readonly InMemoryLog _log;
+
+    public WirelessSerialEndpointHostedService(WirelessSerialEndpointRegistry endpoints, InMemoryLog log)
+    {
+        _endpoints = endpoints;
+        _log = log;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        try
+        {
+            await _endpoints.StartAsync(stoppingToken);
+            await Task.Delay(Timeout.InfiniteTimeSpan, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log.Error("wireless-serial", $"Endpoint discovery service failed: {ex.Message}");
+        }
+        finally
+        {
+            await _endpoints.StopAsync();
         }
     }
 }

@@ -36,6 +36,9 @@ public sealed record TunnelMapping
     public bool Hub4comForwardControlLines { get; init; }
     public bool AutoStart { get; init; }
     public bool RestartOnFailure { get; init; } = true;
+    public bool WirelessSerialAutoDiscover { get; init; }
+    public string? WirelessSerialMac { get; init; }
+    public string? WirelessSerialDeviceId { get; init; }
     [JsonIgnore]
     public bool SuppressInitialControlLineSync { get; init; }
 }
@@ -125,8 +128,54 @@ public sealed record SetupcCommandPlan(
     bool RequiresElevation,
     string Description);
 
+public sealed record SetupcCommandRunResult(
+    bool Ok,
+    int? ExitCode,
+    string? Error,
+    string Description);
+
+public sealed record WirelessSerialDeviceEndpoint(
+    string Mac,
+    string? DeviceId,
+    string? Name,
+    string? Product,
+    string? Board,
+    string? Firmware,
+    string IpAddress,
+    int? ServicePort,
+    string? Mode,
+    int? WifiRssi,
+    bool? ConfigMode,
+    int? Clients,
+    DateTimeOffset LastSeenAt,
+    string Source);
+
+public sealed record WirelessSerialEndpoint(
+    string Mac,
+    string Host,
+    int? Port,
+    DateTimeOffset LastSeenAt);
+
+public sealed record WirelessSerialEndpointUpdateRequest(
+    string Mac,
+    string IpAddress,
+    int? ServicePort = null,
+    string? DeviceId = null,
+    string? Name = null,
+    string? Product = null,
+    string? Board = null,
+    string? Firmware = null,
+    string? Mode = null,
+    int? WifiRssi = null,
+    bool? ConfigMode = null,
+    int? Clients = null,
+    string? Source = null);
+
 [JsonSerializable(typeof(VComTunnelConfig))]
 [JsonSerializable(typeof(TunnelMapping))]
 [JsonSerializable(typeof(List<TunnelMapping>))]
 [JsonSerializable(typeof(KmdfPortRequest))]
+[JsonSerializable(typeof(WirelessSerialDeviceEndpoint))]
+[JsonSerializable(typeof(List<WirelessSerialDeviceEndpoint>))]
+[JsonSerializable(typeof(WirelessSerialEndpointUpdateRequest))]
 public partial class VComTunnelJsonContext : JsonSerializerContext;
