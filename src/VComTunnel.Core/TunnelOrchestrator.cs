@@ -632,13 +632,23 @@ public sealed class TunnelOrchestrator
 
     public TunnelStatus Stop(string id)
     {
+        if (!_tunnels.ContainsKey(id))
+        {
+            _log.Warn("runtime", $"Ignored stop request for unknown mapping '{id}'.");
+            return new ManagedTunnel(new TunnelMapping { Id = id }, TunnelRunState.Stopped, null, null, null, null).ToStatus();
+        }
+
         var mappingLock = GetMappingLock(id);
         mappingLock.Wait();
         try
         {
-            var mapping = _tunnels.TryGetValue(id, out var existing)
-                ? existing.Mapping
-                : new TunnelMapping { Id = id };
+            if (!_tunnels.TryGetValue(id, out var existing))
+            {
+                _log.Warn("runtime", $"Ignored stop request for unknown mapping '{id}'.");
+                return new ManagedTunnel(new TunnelMapping { Id = id }, TunnelRunState.Stopped, null, null, null, null).ToStatus();
+            }
+
+            var mapping = existing.Mapping;
             StopExisting(id);
             _lastProcessErrors.TryRemove(id, out _);
             ResetRestartBackoff(id);
@@ -1010,6 +1020,111 @@ public sealed class TunnelOrchestrator
             || IsBackingPortAccessDeniedError(value);
     }
 
+    private static TunnelFaultKind? ClassifyFault(TunnelMapping mapping, TunnelRunState state, string? error)
+    {
+        if (state is not (TunnelRunState.Faulted or TunnelRunState.Unsupported))
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(error))
+        {
+            return state == TunnelRunState.Unsupported
+                ? TunnelFaultKind.UnsupportedBackend
+                : TunnelFaultKind.Unknown;
+        }
+
+        if (error.Contains("dependencies are missing", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.MissingDependencies;
+        }
+
+        if (IsMissingBackingPortError(error)
+            || error.Contains("not registered in the Windows COM database", StringComparison.OrdinalIgnoreCase)
+            || (error.Contains("Backing port", StringComparison.OrdinalIgnoreCase)
+                && error.Contains("not registered", StringComparison.OrdinalIgnoreCase)))
+        {
+            return TunnelFaultKind.MissingLocalCom;
+        }
+
+        if (IsBackingPortAccessDeniedError(error)
+            || error.Contains("already open", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.LocalComBusy;
+        }
+
+        if (error.Contains("driver protocol", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.DriverProtocol;
+        }
+
+        if (error.Contains("startup timed out", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.StartupTimeout;
+        }
+
+        if (error.Contains("actively refused", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("connection refused", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("积极拒绝", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.NetworkRefused;
+        }
+
+        if (error.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("timeout", StringComparison.OrdinalIgnoreCase)
+            || error.Contains("超时", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.NetworkTimeout;
+        }
+
+        if (error.Contains("Could not connect to RFC2217 endpoint", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.NetworkUnreachable;
+        }
+
+        if (state == TunnelRunState.Unsupported)
+        {
+            return TunnelFaultKind.UnsupportedBackend;
+        }
+
+        if (error.Contains("exited with code", StringComparison.OrdinalIgnoreCase))
+        {
+            return TunnelFaultKind.ProcessExited;
+        }
+
+        return TunnelFaultKind.Unknown;
+    }
+
+    private static string? BuildFaultHint(TunnelMapping mapping, TunnelFaultKind? faultKind)
+    {
+        return faultKind switch
+        {
+            TunnelFaultKind.MissingDependencies =>
+                "Install or repair the local com0com and hub4com components, then start the tunnel again.",
+            TunnelFaultKind.MissingLocalCom =>
+                $"Create or repair the local COM pair for {mapping.VisiblePort} and {mapping.BackingPort}.",
+            TunnelFaultKind.LocalComBusy =>
+                $"Close the serial tool or tunnel using {mapping.BackingPort ?? mapping.VisiblePort}, then retry.",
+            TunnelFaultKind.NetworkRefused =>
+                $"The device refused {mapping.Protocol} at {mapping.Host}:{mapping.Port}; check the device service mode and port.",
+            TunnelFaultKind.NetworkTimeout =>
+                $"The connection to {mapping.Host}:{mapping.Port} timed out; check device power, IP, and network reachability.",
+            TunnelFaultKind.NetworkUnreachable =>
+                $"Could not reach {mapping.Host}:{mapping.Port}; refresh wireless discovery or check the fixed endpoint.",
+            TunnelFaultKind.DriverProtocol =>
+                "The installed KMDF driver is incompatible with the service; rebuild and reinstall the driver.",
+            TunnelFaultKind.StartupTimeout =>
+                "The tunnel backend did not finish startup in time; check backend logs and local driver state.",
+            TunnelFaultKind.UnsupportedBackend =>
+                "This backend is not supported on the current platform or installation.",
+            TunnelFaultKind.ProcessExited =>
+                "The tunnel backend process exited; inspect the last error and backend log.",
+            TunnelFaultKind.Unknown =>
+                "Inspect lastError and service logs to decide whether the issue is network, driver, or local COM state.",
+            _ => null
+        };
+    }
+
     private static string FormatBackendForLog(TunnelBackend backend)
     {
         return backend switch
@@ -1234,13 +1349,16 @@ public sealed class TunnelOrchestrator
         {
             var state = Session?.State ?? State;
             var lastError = Session?.LastError ?? LastError;
+            var faultKind = ClassifyFault(Mapping, state, lastError);
             return new TunnelStatus(
                 Mapping.Id,
                 state,
                 Mapping.Backend.ToString(),
                 Process?.HasExited == false ? Process.Id : null,
                 StartedAt,
-                lastError);
+                lastError,
+                faultKind,
+                BuildFaultHint(Mapping, faultKind));
         }
     }
 }

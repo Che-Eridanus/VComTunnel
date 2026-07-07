@@ -15,6 +15,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("wireless serial endpoint registry", () => Task.Run(WirelessSerialEndpointRegistryUpdatesEndpoint)),
     ("wireless serial periodic query follows MAC binding", WirelessSerialPeriodicQueryFollowsMacBindingAsync),
     ("wireless serial endpoint change restarts running mapping", WirelessSerialEndpointChangeRestartsRunningMappingAsync),
+    ("wireless serial MAC binding corrects wrong saved endpoint on start", WirelessSerialMacBindingCorrectsWrongSavedEndpointOnStartAsync),
     ("COM backing port is accepted", () => Task.Run(ComBackingPortIsAccepted)),
     ("config round trip", ConfigRoundTripAsync),
     ("service endpoint defaults to loopback", () => Task.Run(ServiceEndpointDefaultsToLoopback)),
@@ -80,6 +81,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("fake hub4com process restarts after exit", FakeHub4comProcessRestartsAfterExitAsync),
     ("fake hub4com access denied does not restart", FakeHub4comAccessDeniedDoesNotRestartAsync),
     ("manual stop suppresses fake hub4com restart", ManualStopSuppressesFakeHub4comRestartAsync),
+    ("stopping unknown mapping does not create runtime status", () => Task.Run(StoppingUnknownMappingDoesNotCreateRuntimeStatus)),
     ("dependency installer extracts tool zips", DependencyInstallerExtractsToolZipsAsync),
     ("dependency installer uses bundled release archives", DependencyInstallerUsesBundledReleaseArchivesAsync),
     ("dependency installer falls back after invalid mirror", DependencyInstallerFallsBackAfterInvalidMirrorAsync),
@@ -416,6 +418,62 @@ static async Task WirelessSerialEndpointChangeRestartsRunningMappingAsync()
         Source: "test"));
     await Task.Delay(150);
     AssertEqual("2", Volatile.Read(ref starts).ToString());
+}
+
+static async Task WirelessSerialMacBindingCorrectsWrongSavedEndpointOnStartAsync()
+{
+    using var temp = new TempDir();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var registry = new WirelessSerialEndpointRegistry(log, deviceTtl: TimeSpan.FromMinutes(1));
+    registry.Upsert(new WirelessSerialEndpointUpdateRequest(
+        Mac: "9C:CC:01:D9:30:1C",
+        IpAddress: "10.0.2.127",
+        ServicePort: 5000,
+        Source: "test"));
+
+    var mapping = new TunnelMapping
+    {
+        Id = "wireless-wrong-saved-endpoint",
+        Name = "Wireless wrong saved endpoint",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM30",
+        BackingPort = "CNCB30",
+        Host = "10.0.2.196",
+        Port = 5000,
+        WirelessSerialAutoDiscover = true,
+        WirelessSerialMac = "9c-cc-01-d9-30-1c"
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    var endpoints = new List<string>();
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        ["COM30", "CNCB30"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            lock (endpoints)
+            {
+                endpoints.Add($"{sessionMapping.Host}:{sessionMapping.Port}");
+            }
+
+            return new FakeManagedTunnelSession(faulted, failAfterStart: null);
+        },
+        wirelessSerialEndpoints: registry);
+
+    var started = await orchestrator.StartAsync(mapping.Id);
+    AssertEqual(TunnelRunState.Running.ToString(), started.State.ToString());
+    lock (endpoints)
+    {
+        AssertEqual("10.0.2.127:5000", endpoints.Single());
+    }
+
+    var savedMapping = (await store.LoadAsync()).Mappings.Single();
+    AssertEqual("10.0.2.196", savedMapping.Host);
+    AssertTrue(
+        log.Snapshot().Any(entry =>
+            entry.Message.Contains("Resolved wireless serial MAC 9CCC01D9301C to 10.0.2.127:5000", StringComparison.OrdinalIgnoreCase)),
+        "The service log should explain that the wrong saved endpoint was corrected by MAC discovery.");
 }
 
 static void ComBackingPortIsAccepted()
@@ -1934,6 +1992,7 @@ static async Task MissingDependenciesFaultMappingAsync()
     var status = await orchestrator.StartAsync((await store.LoadAsync()).Mappings.Single().Id);
     AssertEqual(TunnelRunState.Faulted.ToString(), status.State.ToString());
     AssertStringContains(status.LastError ?? "", "dependencies are missing");
+    AssertEqual(TunnelFaultKind.MissingDependencies.ToString(), status.FaultKind?.ToString() ?? "");
 }
 
 static async Task MissingBackingPortFaultsBeforeHub4comAsync()
@@ -1959,6 +2018,7 @@ static async Task MissingBackingPortFaultsBeforeHub4comAsync()
     AssertEqual(TunnelRunState.Faulted.ToString(), status.State.ToString());
     AssertStringContains(status.LastError ?? "", "Backing port CNCB27 is not registered");
     AssertStringContains(status.LastError ?? "", "Existing ports: COM27, COM28");
+    AssertEqual(TunnelFaultKind.MissingLocalCom.ToString(), status.FaultKind?.ToString() ?? "");
 }
 
 static async Task Com0comServiceBackendStartsWithoutHub4comAsync()
@@ -2070,6 +2130,7 @@ static async Task RestartBackoffKeepsRetryingAndLimitsRepeatedLogsAsync()
     var id = (await store.LoadAsync()).Mappings.Single().Id;
     var first = await orchestrator.StartAsync(id);
     AssertEqual(TunnelRunState.Faulted.ToString(), first.State.ToString());
+    AssertEqual(TunnelFaultKind.NetworkTimeout.ToString(), first.FaultKind?.ToString() ?? "");
 
     await WaitUntilAsync(
         () => Volatile.Read(ref starts) >= 4,
@@ -3005,6 +3066,7 @@ static async Task FakeHub4comAccessDeniedDoesNotRestartAsync()
     AssertEqual(TunnelRunState.Faulted.ToString(), started.State.ToString());
     AssertStringContains(started.LastError ?? "", "ERROR 5");
     AssertStringContains(started.LastError ?? "", "already open");
+    AssertEqual(TunnelFaultKind.LocalComBusy.ToString(), started.FaultKind?.ToString() ?? "");
     await Task.Delay(300);
 
     var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == id);
@@ -3052,6 +3114,27 @@ static async Task ManualStopSuppressesFakeHub4comRestartAsync()
     AssertEqual(
         "1",
         log.Snapshot().Count(e => e.Message.Contains("Started hub4com process", StringComparison.OrdinalIgnoreCase)).ToString());
+}
+
+static void StoppingUnknownMappingDoesNotCreateRuntimeStatus()
+{
+    using var temp = new TempDir();
+    var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var store = new ConfigStore(Path.Combine(temp.Path, "config.json"));
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        log,
+        []);
+
+    var stopped = orchestrator.Stop("missing mapping id");
+
+    AssertEqual(TunnelRunState.Stopped.ToString(), stopped.State.ToString());
+    AssertEqual("0", orchestrator.GetStatus().Tunnels.Count.ToString());
+    AssertTrue(
+        log.Snapshot().Any(entry =>
+            entry.Message.Contains("Ignored stop request for unknown mapping", StringComparison.OrdinalIgnoreCase)),
+        "Unknown stop requests should be visible in diagnostics without creating ghost tunnel rows.");
 }
 
 static async Task DependencyInstallerExtractsToolZipsAsync()

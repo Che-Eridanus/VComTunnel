@@ -23,6 +23,21 @@ public enum TunnelRunState
     Unsupported
 }
 
+public enum TunnelFaultKind
+{
+    MissingDependencies,
+    MissingLocalCom,
+    LocalComBusy,
+    NetworkRefused,
+    NetworkTimeout,
+    NetworkUnreachable,
+    DriverProtocol,
+    StartupTimeout,
+    UnsupportedBackend,
+    ProcessExited,
+    Unknown
+}
+
 public sealed record TunnelMapping
 {
     public string Id { get; init; } = Guid.NewGuid().ToString("n");
@@ -66,7 +81,9 @@ public sealed record TunnelStatus(
     string Backend,
     int? ProcessId,
     DateTimeOffset? StartedAt,
-    string? LastError);
+    string? LastError,
+    TunnelFaultKind? FaultKind,
+    string? FaultHint);
 
 public sealed record ServiceStatus(
     DateTimeOffset StartedAt,
