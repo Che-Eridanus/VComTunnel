@@ -89,7 +89,7 @@ internal static class VComTunnelCtl
                     VisiblePort = "COM12",
                     BackingPort = "CNCB12",
                     Host = "192.168.1.50",
-                    Port = 5000,
+                    Port = TunnelMapping.DefaultRfc2217Port,
                     Hub4comForwardControlLines = true
                 }
             ]

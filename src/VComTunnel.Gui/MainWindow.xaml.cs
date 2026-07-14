@@ -486,7 +486,7 @@ public partial class MainWindow : Window
             VisiblePort = $"COM{portNumber}",
             BackingPort = $"CNCB{portNumber}",
             Host = "127.0.0.1",
-            Port = 5000,
+            Port = TunnelMapping.DefaultRfc2217Port,
             Hub4comForwardControlLines = true,
             AutoStart = false,
             RestartOnFailure = true,

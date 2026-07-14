@@ -6,6 +6,7 @@ using System.Net.Sockets;
 
 var tests = new List<(string Name, Func<Task> Test)>
 {
+    ("RFC2217 default port is 2217", () => Task.Run(Rfc2217DefaultPortIs2217)),
     ("valid multi mapping config", () => Task.Run(ValidMultiMappingConfig)),
     ("duplicate visible COM is rejected", () => Task.Run(DuplicateVisibleComIsRejected)),
     ("same visible and backing COM is rejected", () => Task.Run(SameVisibleAndBackingComIsRejected)),
@@ -104,6 +105,14 @@ foreach (var (name, test) in tests)
 }
 
 return failed == 0 ? 0 : 1;
+
+static void Rfc2217DefaultPortIs2217()
+{
+    var mapping = new TunnelMapping();
+
+    AssertEqual("2217", mapping.Port.ToString());
+    AssertEqual("2217", TunnelMapping.DefaultRfc2217Port.ToString());
+}
 
 static void ValidMultiMappingConfig()
 {

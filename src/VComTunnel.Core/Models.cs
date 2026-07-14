@@ -40,13 +40,15 @@ public enum TunnelFaultKind
 
 public sealed record TunnelMapping
 {
+    public const int DefaultRfc2217Port = 2217;
+
     public string Id { get; init; } = Guid.NewGuid().ToString("n");
     public string Name { get; init; } = "New tunnel";
     public TunnelBackend Backend { get; init; } = TunnelBackend.Com0comHub4com;
     public string VisiblePort { get; init; } = "COM12";
     public string? BackingPort { get; init; } = "CNCB12";
     public string Host { get; init; } = "127.0.0.1";
-    public int Port { get; init; } = 5000;
+    public int Port { get; init; } = DefaultRfc2217Port;
     public TunnelProtocol Protocol { get; init; } = TunnelProtocol.Rfc2217;
     public bool Hub4comForwardControlLines { get; init; }
     public bool AutoStart { get; init; }

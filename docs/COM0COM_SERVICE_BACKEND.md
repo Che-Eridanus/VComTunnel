@@ -20,6 +20,8 @@ separate pipeline stages instead of depending on synchronous polling.
 
 Current scope:
 
+- New RFC2217 mappings default to the standard TCP port `2217`; an explicitly
+  configured or device-advertised custom port remains unchanged.
 - Requires `backend = com0comService`.
 - Requires `visiblePort` and `backingPort` to name different com0com pair
   sides.
