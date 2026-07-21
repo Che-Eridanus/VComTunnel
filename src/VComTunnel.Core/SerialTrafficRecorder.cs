@@ -64,6 +64,30 @@ public sealed class SerialTrafficRecorder : IDisposable
                 mapping.TrafficLog.Format,
                 PrimaryDirection(mapping.TrafficLog)));
 
+    public static (long? BytesWritten, DateTimeOffset? LastWriteAt) GetActiveFileStatus(
+        TunnelMapping mapping)
+    {
+        var path = GetActivePath(mapping);
+        try
+        {
+            using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            var lastWriteAt = File.GetLastWriteTimeUtc(path);
+            return (
+                stream.Length,
+                lastWriteAt == DateTime.MinValue
+                    ? null
+                    : new DateTimeOffset(lastWriteAt, TimeSpan.Zero));
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException or IOException or UnauthorizedAccessException)
+        {
+            return (null, null);
+        }
+    }
+
     private static string ResolveLogsDirectory(
         SerialTrafficLogOptions options,
         string? overrideDirectory) =>
@@ -199,33 +223,46 @@ public sealed class SerialTrafficRecorder : IDisposable
         byte[] encoded,
         Dictionary<SerialTrafficDirection, FileStream> streams)
     {
-        if (!streams.TryGetValue(direction, out var stream)
-            || stream.Length + encoded.Length > (long)_options.MaxFileSizeMb * 1024 * 1024)
+        if (!streams.TryGetValue(direction, out var stream))
         {
-            stream?.Dispose();
-            stream = OpenActiveFile(direction, rotate: File.Exists(PathFor(direction)));
+            stream = OpenActiveFile(direction, encoded.Length);
+            streams[direction] = stream;
+        }
+        else if (stream.Length > 0
+            && stream.Length + encoded.Length > (long)_options.MaxFileSizeMb * 1024 * 1024)
+        {
+            stream.Dispose();
+            RotateFiles(PathFor(direction));
+            stream = OpenActiveFile(direction, encoded.Length);
             streams[direction] = stream;
         }
 
         await stream.WriteAsync(encoded, _stop.Token).ConfigureAwait(false);
     }
 
-    private FileStream OpenActiveFile(SerialTrafficDirection direction, bool rotate)
+    private FileStream OpenActiveFile(SerialTrafficDirection direction, int incomingLength)
     {
         var path = PathFor(direction);
         Directory.CreateDirectory(_logsDirectory);
-        if (rotate)
+        if (File.Exists(path))
         {
-            RotateFiles(path);
+            var existingLength = new FileInfo(path).Length;
+            if (existingLength > 0
+                && existingLength + incomingLength > (long)_options.MaxFileSizeMb * 1024 * 1024)
+            {
+                RotateFiles(path);
+            }
         }
 
-        return new FileStream(
+        var stream = new FileStream(
             path,
-            FileMode.Create,
+            FileMode.OpenOrCreate,
             FileAccess.Write,
-            FileShare.ReadWrite,
+            FileShare.ReadWrite | FileShare.Delete,
             bufferSize: 64 * 1024,
             options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+        stream.Seek(0, SeekOrigin.End);
+        return stream;
     }
 
     private void RotateFiles(string activePath)

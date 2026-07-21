@@ -6,6 +6,8 @@ namespace VComTunnel.Core;
 public sealed class Com0comSetupManager
 {
     private static readonly TimeSpan SetupcRunTimeout = TimeSpan.FromSeconds(90);
+    internal const string VisiblePortOptions = "EmuBR=yes,EmuOverrun=yes";
+    internal const string BackingPortOptions = "EmuBR=no,EmuOverrun=yes";
     private const string SerialCommKey = @"HARDWARE\DEVICEMAP\SERIALCOMM";
     private const string Com0comPortEnumKey = @"SYSTEM\CurrentControlSet\Enum\COM0COM\PORT";
 
@@ -24,6 +26,9 @@ public sealed class Com0comSetupManager
     }
 
     public IReadOnlyList<Com0comPairInfo> GetPairs() => _comPortInventory.GetCom0comPairs();
+
+    internal static string BuildInstallArguments(string visiblePort, string backingPort) =>
+        $"install PortName={visiblePort},{VisiblePortOptions} PortName={backingPort},{BackingPortOptions}";
 
     public async Task<SetupcCommandPlan> BuildCreatePlanAsync(string mappingId, CancellationToken cancellationToken = default)
     {
@@ -44,7 +49,7 @@ public sealed class Com0comSetupManager
         }
 
         return BuildPlan(
-            $"install PortName={mapping.VisiblePort},EmuBR=yes PortName={mapping.BackingPort}",
+            BuildInstallArguments(mapping.VisiblePort, mapping.BackingPort),
             $"Create com0com pair {mapping.VisiblePort} <-> {mapping.BackingPort}");
     }
 
@@ -52,6 +57,60 @@ public sealed class Com0comSetupManager
     {
         var plan = await BuildCreatePlanAsync(mappingId, cancellationToken).ConfigureAwait(false);
         return await RunPlanAsync(plan, cancellationToken).ConfigureAwait(false);
+    }
+
+    private IReadOnlyList<SetupcCommandPlan> BuildRepairPlans(Com0comPairInfo pair, TunnelMapping mapping)
+    {
+        if (pair.PairNumber < 0)
+        {
+            throw new InvalidOperationException("pairNumber must be zero or greater.");
+        }
+
+        var portAOptions = BuildPortOptions(pair.PortA, mapping);
+        var portBOptions = BuildPortOptions(pair.PortB, mapping);
+        return
+        [
+            BuildPlan(
+                $"change CNCA{pair.PairNumber} {portAOptions}",
+                $"Repair com0com pair {pair.PairNumber} endpoint CNCA{pair.PairNumber}"),
+            BuildPlan(
+                $"change CNCB{pair.PairNumber} {portBOptions}",
+                $"Repair com0com pair {pair.PairNumber} endpoint CNCB{pair.PairNumber}")
+        ];
+    }
+
+    public async Task<IReadOnlyList<SetupcCommandPlan>> BuildConfiguredPairRepairPlansAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var config = await _configStore.LoadAsync(cancellationToken).ConfigureAwait(false);
+        var mappings = config.Mappings
+            .Where(mapping => mapping.Backend is TunnelBackend.Com0comHub4com or TunnelBackend.Com0comService)
+            .Where(mapping => !string.IsNullOrWhiteSpace(mapping.BackingPort))
+            .ToArray();
+
+        return _comPortInventory.GetCom0comPairs()
+            .Where(pair => pair.IsComplete && mappings.Any(mapping => PairMatchesMapping(pair, mapping)))
+            .Select(pair => new
+            {
+                Pair = pair,
+                Mapping = mappings.First(mapping => PairMatchesMapping(pair, mapping))
+            })
+            .OrderBy(item => item.Pair.PairNumber)
+            .SelectMany(item => BuildRepairPlans(item.Pair, item.Mapping))
+            .ToArray();
+    }
+
+    public async Task<IReadOnlyList<SetupcCommandRunResult>> RepairConfiguredPairsAsync(
+        CancellationToken cancellationToken = default)
+    {
+        var plans = await BuildConfiguredPairRepairPlansAsync(cancellationToken).ConfigureAwait(false);
+        var results = new List<SetupcCommandRunResult>(plans.Count);
+        foreach (var plan in plans)
+        {
+            results.Add(await RunPlanAsync(plan, cancellationToken).ConfigureAwait(false));
+        }
+
+        return results;
     }
 
     public SetupcCommandPlan BuildRemovePlan(int pairNumber)
@@ -157,6 +216,11 @@ public sealed class Com0comSetupManager
                 $"setupc timed out after {SetupcRunTimeout.TotalSeconds:0} seconds.",
                 plan.Description);
         }
+        catch (OperationCanceledException)
+        {
+            TryKill(process);
+            throw;
+        }
         catch (Exception ex) when (ex is InvalidOperationException or IOException or System.ComponentModel.Win32Exception)
         {
             return new SetupcCommandRunResult(false, null, ex.Message, plan.Description);
@@ -188,6 +252,16 @@ public sealed class Com0comSetupManager
         return !string.IsNullOrWhiteSpace(port)
             && (string.Equals(pair.PortA, port, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(pair.PortB, port, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string BuildPortOptions(string? pairPort, TunnelMapping mapping)
+    {
+        // The remote UART already provides physical baud pacing. Enabling com0com
+        // baud emulation on the service-owned backing port adds timer latency to
+        // small RFC2217 packets and can break short esptool response deadlines.
+        return string.Equals(pairPort, mapping.BackingPort, StringComparison.OrdinalIgnoreCase)
+            ? BackingPortOptions
+            : VisiblePortOptions;
     }
 
     private static int TryRemoveStaleSerialCommValues(Com0comPairInfo? pair)

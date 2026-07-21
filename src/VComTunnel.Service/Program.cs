@@ -190,6 +190,38 @@ internal static class VComTunnelHost
             return Results.Ok(setup.GetPairs());
         });
 
+        app.MapPost("/api/com0com/pairs/repair", async (
+            Com0comSetupManager setup,
+            InMemoryLog log,
+            CancellationToken requestToken) =>
+        {
+            try
+            {
+                var results = await setup.RepairConfiguredPairsAsync(requestToken);
+                foreach (var result in results)
+                {
+                    if (result.Ok)
+                    {
+                        log.Info("com0com", result.Description);
+                    }
+                    else
+                    {
+                        log.Error("com0com", $"{result.Description}: {result.Error}");
+                    }
+                }
+
+                var failed = results.FirstOrDefault(result => !result.Ok);
+                return failed is null
+                    ? Results.Ok(new { ok = true, repairedEndpoints = results.Count, results })
+                    : Results.BadRequest(new { error = failed.Error ?? failed.Description, results });
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or IOException)
+            {
+                log.Error("com0com", $"Configured pair repair failed: {ex.Message}");
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
         app.MapGet("/api/wireless-serial/endpoints", (WirelessSerialEndpointRegistry endpoints) =>
         {
             return Results.Ok(endpoints.Snapshot());
@@ -401,15 +433,18 @@ internal sealed class AutoStartHostedService : BackgroundService
 {
     private readonly TunnelOrchestrator _tunnels;
     private readonly SerialBackgroundLogManager _backgroundLogs;
+    private readonly Com0comSetupManager _com0comSetup;
     private readonly InMemoryLog _log;
 
     public AutoStartHostedService(
         TunnelOrchestrator tunnels,
         SerialBackgroundLogManager backgroundLogs,
+        Com0comSetupManager com0comSetup,
         InMemoryLog log)
     {
         _tunnels = tunnels;
         _backgroundLogs = backgroundLogs;
+        _com0comSetup = com0comSetup;
         _log = log;
     }
 
@@ -418,6 +453,32 @@ internal sealed class AutoStartHostedService : BackgroundService
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+            try
+            {
+                using var repairTimeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                repairTimeout.CancelAfter(TimeSpan.FromSeconds(15));
+                var repairs = await _com0comSetup.RepairConfiguredPairsAsync(repairTimeout.Token);
+                foreach (var repair in repairs)
+                {
+                    if (repair.Ok)
+                    {
+                        _log.Info("com0com", repair.Description);
+                    }
+                    else
+                    {
+                        _log.Error("com0com", $"{repair.Description}: {repair.Error}");
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+            {
+                _log.Warn("com0com", "Configured pair repair timed out; continuing with AutoStart mappings.");
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or IOException)
+            {
+                _log.Warn("com0com", $"Configured pair repair skipped: {ex.Message}");
+            }
+
             try
             {
                 await _tunnels.StartAutoStartMappingsAsync(stoppingToken);

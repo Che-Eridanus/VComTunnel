@@ -136,7 +136,9 @@ public sealed record SerialTrafficLogStatus(
     string ActivePath,
     SerialTrafficLogMode Mode,
     bool Running,
-    string? LastError);
+    string? LastError,
+    long? BytesWritten = null,
+    DateTimeOffset? LastWriteAt = null);
 
 public sealed record LogEntry(
     DateTimeOffset Timestamp,

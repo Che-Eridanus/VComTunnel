@@ -89,6 +89,7 @@ public sealed class SerialBackgroundLogManager : IAsyncDisposable
     public SerialTrafficLogStatus GetStatus(TunnelMapping mapping, TunnelStatus? tunnelStatus = null)
     {
         var options = mapping.TrafficLog ?? new SerialTrafficLogOptions();
+        var fileStatus = SerialTrafficRecorder.GetActiveFileStatus(mapping);
         if (!options.Enabled)
         {
             return new SerialTrafficLogStatus(
@@ -97,7 +98,9 @@ public sealed class SerialBackgroundLogManager : IAsyncDisposable
                 SerialTrafficRecorder.GetActivePath(mapping),
                 options.Mode,
                 false,
-                null);
+                null,
+                fileStatus.BytesWritten,
+                fileStatus.LastWriteAt);
         }
 
         if (options.Mode == SerialTrafficLogMode.InUse)
@@ -108,7 +111,9 @@ public sealed class SerialBackgroundLogManager : IAsyncDisposable
                 SerialTrafficRecorder.GetActivePath(mapping),
                 options.Mode,
                 tunnelStatus?.State == TunnelRunState.Running,
-                tunnelStatus?.LastError);
+                tunnelStatus?.LastError,
+                fileStatus.BytesWritten,
+                fileStatus.LastWriteAt);
         }
 
         return _sessions.TryGetValue(mapping.Id, out var session)
@@ -119,7 +124,9 @@ public sealed class SerialBackgroundLogManager : IAsyncDisposable
                 SerialTrafficRecorder.GetActivePath(mapping),
                 options.Mode,
                 false,
-                "Background serial log job is waiting to start.");
+                "Background serial log job is waiting to start.",
+                fileStatus.BytesWritten,
+                fileStatus.LastWriteAt);
     }
 
     public async ValueTask DisposeAsync()
@@ -188,13 +195,16 @@ public sealed class SerialBackgroundLogManager : IAsyncDisposable
         {
             lock (_stateLock)
             {
+                var fileStatus = SerialTrafficRecorder.GetActiveFileStatus(_mapping);
                 return new SerialTrafficLogStatus(
                     _mapping.Id,
                     true,
                     _activePath,
                     SerialTrafficLogMode.Exclusive,
                     _running,
-                    _lastError);
+                    _lastError,
+                    fileStatus.BytesWritten,
+                    fileStatus.LastWriteAt);
             }
         }
 

@@ -965,7 +965,7 @@ public sealed class TunnelOrchestrator
         var detail = _lastProcessErrors.TryGetValue(mapping.Id, out var lastError) ? $" Last error: {lastError}" : "";
         if (IsMissingBackingPortError(detail) && !string.IsNullOrWhiteSpace(mapping.BackingPort))
         {
-            detail += $" Create the com0com pair first: setupc.exe install PortName={mapping.VisiblePort},EmuBR=yes PortName={mapping.BackingPort}";
+            detail += $" Create the com0com pair first: setupc.exe {Com0comSetupManager.BuildInstallArguments(mapping.VisiblePort, mapping.BackingPort)}";
         }
         else if (IsBackingPortAccessDeniedError(detail) && !string.IsNullOrWhiteSpace(mapping.BackingPort))
         {
@@ -1327,7 +1327,7 @@ public sealed class TunnelOrchestrator
             return true;
         }
 
-        error = $"Backing port {mapping.BackingPort} is not registered in the Windows COM database. Existing ports: {string.Join(", ", ports)}. Choose the other side of an existing com0com pair, or create it first: setupc.exe install PortName={mapping.VisiblePort},EmuBR=yes PortName={mapping.BackingPort}";
+        error = $"Backing port {mapping.BackingPort} is not registered in the Windows COM database. Existing ports: {string.Join(", ", ports)}. Choose the other side of an existing com0com pair, or create it first: setupc.exe {Com0comSetupManager.BuildInstallArguments(mapping.VisiblePort, mapping.BackingPort)}";
         return false;
     }
 

@@ -25,12 +25,15 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("service endpoint defaults to loopback", () => Task.Run(ServiceEndpointDefaultsToLoopback)),
     ("service endpoint accepts loopback override", () => Task.Run(ServiceEndpointAcceptsLoopbackOverride)),
     ("service endpoint rejects non-loopback override", () => Task.Run(ServiceEndpointRejectsNonLoopbackOverride)),
+    ("default dependency roots skip process working directory", () => Task.Run(DefaultDependencyRootsSkipProcessWorkingDirectory)),
     ("TCP tunnel options enable low latency", () => Task.Run(TcpTunnelOptionsEnableLowLatency)),
     ("file logs rotate and cap archives", () => Task.Run(FileLogsRotateAndCapArchives)),
     ("serial traffic logger records selected directions", () => Task.Run(SerialTrafficLoggerRecordsSelectedDirections)),
     ("serial traffic text logger strips ANSI colors", () => Task.Run(SerialTrafficTextLoggerStripsAnsiColors)),
     ("serial traffic text logger timestamps lines", () => Task.Run(SerialTrafficTextLoggerTimestampsLines)),
     ("serial traffic raw logger writes exact bytes", () => Task.Run(SerialTrafficRawLoggerWritesExactBytes)),
+    ("serial traffic logger appends across service restarts", () => Task.Run(SerialTrafficLoggerAppendsAcrossServiceRestarts)),
+    ("serial traffic logger rotates only at size limit", () => Task.Run(SerialTrafficLoggerRotatesOnlyAtSizeLimit)),
     ("exclusive serial logger runs in background service", ExclusiveSerialLoggerRunsInBackgroundServiceAsync),
     ("com0com create hints", () => Task.Run(Com0comCreateHints)),
     ("com0com service maps peer modem signals", () => Task.Run(Com0comServiceMapsPeerModemSignals)),
@@ -673,6 +676,20 @@ static void ServiceEndpointRejectsNonLoopbackOverride()
     }
 }
 
+static void DefaultDependencyRootsSkipProcessWorkingDirectory()
+{
+    var detector = new DependencyDetector();
+    var workingDirectory = Path.GetFullPath(Environment.CurrentDirectory)
+        .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    AssertTrue(
+        detector.CandidateRoots.All(root =>
+            !string.Equals(
+                Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+                workingDirectory,
+                StringComparison.OrdinalIgnoreCase)),
+        "Default dependency detection must not recursively scan the service working directory.");
+}
+
 static void TcpTunnelOptionsEnableLowLatency()
 {
     using var client = new System.Net.Sockets.TcpClient();
@@ -872,6 +889,82 @@ static void SerialTrafficRawLoggerWritesExactBytes()
     AssertBytes(expectedTx, File.ReadAllBytes(txPath));
 }
 
+static void SerialTrafficLoggerAppendsAcrossServiceRestarts()
+{
+    using var temp = new TempDir();
+    using var serviceLog = new InMemoryLog(Path.Combine(temp.Path, "service"));
+    var options = new SerialTrafficLogOptions
+    {
+        Enabled = true,
+        CaptureRx = true,
+        CaptureTx = false,
+        Format = SerialTrafficLogFormat.Text,
+        DirectoryPath = temp.Path,
+        MaxFileSizeMb = 1,
+        MaxFiles = 3
+    };
+    var mapping = new TunnelMapping
+    {
+        Id = "append-restart-test",
+        Name = "Append Restart Test",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM34",
+        BackingPort = "CNCB34",
+        TrafficLog = options
+    };
+
+    using (var first = new SerialTrafficRecorder(mapping, options, serviceLog, temp.Path))
+    {
+        first.Record(SerialTrafficDirection.Rx, "first-session\r\n"u8.ToArray());
+    }
+    using (var second = new SerialTrafficRecorder(mapping, options, serviceLog, temp.Path))
+    {
+        second.Record(SerialTrafficDirection.Rx, "second-session\r\n"u8.ToArray());
+    }
+
+    var activePath = SerialTrafficRecorder.GetActivePath(mapping);
+    AssertEqual("first-session\r\nsecond-session\r\n", File.ReadAllText(activePath));
+    AssertTrue(!File.Exists($"{activePath}.1"), "Restarting below the size limit must not rotate the active log.");
+    var status = SerialTrafficRecorder.GetActiveFileStatus(mapping);
+    AssertEqual(new FileInfo(activePath).Length.ToString(), status.BytesWritten?.ToString() ?? "");
+    AssertTrue(status.LastWriteAt is not null, "Active log status should report its last write time.");
+}
+
+static void SerialTrafficLoggerRotatesOnlyAtSizeLimit()
+{
+    using var temp = new TempDir();
+    using var serviceLog = new InMemoryLog(Path.Combine(temp.Path, "service"));
+    var options = new SerialTrafficLogOptions
+    {
+        Enabled = true,
+        CaptureRx = true,
+        CaptureTx = false,
+        Format = SerialTrafficLogFormat.RawBinary,
+        DirectoryPath = temp.Path,
+        MaxFileSizeMb = 1,
+        MaxFiles = 3
+    };
+    var mapping = new TunnelMapping
+    {
+        Id = "size-rotation-test",
+        Name = "Size Rotation Test",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM35",
+        BackingPort = "CNCB35",
+        TrafficLog = options
+    };
+    var activePath = SerialTrafficRecorder.GetActivePath(mapping);
+    File.WriteAllBytes(activePath, new byte[1024 * 1024]);
+
+    using (var recorder = new SerialTrafficRecorder(mapping, options, serviceLog, temp.Path))
+    {
+        recorder.Record(SerialTrafficDirection.Rx, new byte[] { 0x5A });
+    }
+
+    AssertEqual((1024 * 1024).ToString(), new FileInfo($"{activePath}.1").Length.ToString());
+    AssertBytes(new byte[] { 0x5A }, File.ReadAllBytes(activePath));
+}
+
 static async Task ExclusiveSerialLoggerRunsInBackgroundServiceAsync()
 {
     using var temp = new TempDir();
@@ -931,10 +1024,10 @@ static void Com0comCreateHints()
     var mapping = new TunnelMapping { Name = "A", VisiblePort = "COM12", BackingPort = "CNCB12" };
     var builder = new Hub4comCommandBuilder(new DependencyDetector());
     var hint = builder.BuildCom0comCreateHint(mapping);
-    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes PortName=CNCB12", hint);
+    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes,EmuOverrun=yes PortName=CNCB12,EmuBR=no,EmuOverrun=yes", hint);
 
     var serviceHint = builder.BuildCom0comCreateHint(mapping with { Backend = TunnelBackend.Com0comService });
-    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes PortName=CNCB12", serviceHint);
+    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes,EmuOverrun=yes PortName=CNCB12,EmuBR=no,EmuOverrun=yes", serviceHint);
 }
 
 static void Com0comServiceMapsPeerModemSignals()
@@ -1090,6 +1183,7 @@ static async Task Com0comServiceStartupSyncsSerialSettingsWithoutControlLineRepl
     }, cts.Token);
 
     var serial = new RecordingSerialPortEndpoint();
+    var serialFactory = new RecordingSerialPortEndpointFactory(serial);
     using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
     using var session = new Com0comServiceTunnelSession(
         new TunnelMapping
@@ -1103,11 +1197,12 @@ static async Task Com0comServiceStartupSyncsSerialSettingsWithoutControlLineRepl
         },
         log,
         (_, _) => { },
-        new RecordingSerialPortEndpointFactory(serial));
+        serialFactory);
 
     try
     {
         await session.StartAsync(cts.Token);
+        AssertTrue(serialFactory.LastOpenWasExclusive, "The managed tunnel must open its backing COM exclusively.");
         var bytes = await startupBytes.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
         AssertTrue(ContainsSequence(bytes, Rfc2217Client.BuildSetBaudRate(115200)), "Startup should send the current local baud rate instead of querying baud=0.");
         AssertTrue(ContainsSequence(bytes, Rfc2217Client.BuildSetLineControl(0, 0, 8)), "Startup should send the current local line control instead of querying data/parity/stop=0.");
@@ -3135,7 +3230,7 @@ static void Com0comServiceBackingOpenDiagnostics()
         mapping,
         new SerialPortOpenException("CNCB27", @"\\.\CNCB27", 2, "open"));
     AssertStringContains(notFound, "ERROR 2");
-    AssertStringContains(notFound, "setupc.exe install PortName=COM27,EmuBR=yes PortName=CNCB27");
+    AssertStringContains(notFound, "setupc.exe install PortName=COM27,EmuBR=yes,EmuOverrun=yes PortName=CNCB27,EmuBR=no,EmuOverrun=yes");
 
     var accessDenied = Com0comServiceTunnelSession.BuildBackingPortOpenError(
         mapping,
@@ -3322,11 +3417,11 @@ static async Task Com0comCreateAndRemovePlansAsync()
         new FakeComPortInventory(["COM28", "CNCB28"], [new Com0comPairInfo(2, "COM28", "CNCB28", @"\Device\com0com12", @"\Device\com0com22", true)]));
 
     var create = await manager.BuildCreatePlanAsync("hub");
-    AssertStringContains(create.Arguments, "install PortName=COM29,EmuBR=yes PortName=CNCB29");
+    AssertEqual("install PortName=COM29,EmuBR=yes,EmuOverrun=yes PortName=CNCB29,EmuBR=no,EmuOverrun=yes", create.Arguments);
     AssertTrue(create.RequiresElevation, "setupc plans should require elevation.");
 
     var serviceCreate = await manager.BuildCreatePlanAsync("svc");
-    AssertStringContains(serviceCreate.Arguments, "install PortName=COM30,EmuBR=yes PortName=CNCB30");
+    AssertEqual("install PortName=COM30,EmuBR=yes,EmuOverrun=yes PortName=CNCB30,EmuBR=no,EmuOverrun=yes", serviceCreate.Arguments);
 
     var remove = manager.BuildRemovePlan(2);
     AssertStringContains(remove.Arguments, "remove 2");
@@ -3335,7 +3430,22 @@ static async Task Com0comCreateAndRemovePlansAsync()
     var existingManager = new Com0comSetupManager(
         store,
         detector,
-        new FakeComPortInventory(["COM29", "CNCB29"], [new Com0comPairInfo(3, "COM29", "CNCB29", @"\Device\com0com13", @"\Device\com0com23", true)]));
+        new FakeComPortInventory(
+            ["COM29", "CNCB29", "COM30", "CNCB30", "COM77", "CNCB77"],
+            [
+                new Com0comPairInfo(3, "COM29", "CNCB29", @"\Device\com0com13", @"\Device\com0com23", true),
+                new Com0comPairInfo(4, "CNCB30", "COM30", @"\Device\com0com14", @"\Device\com0com24", true),
+                new Com0comPairInfo(7, "COM77", "CNCB77", @"\Device\com0com17", @"\Device\com0com27", true)
+            ]));
+    var repairPlans = await existingManager.BuildConfiguredPairRepairPlansAsync();
+    AssertEqual("4", repairPlans.Count.ToString());
+    AssertEqual("change CNCA3 EmuBR=yes,EmuOverrun=yes", repairPlans[0].Arguments);
+    AssertEqual("change CNCB3 EmuBR=no,EmuOverrun=yes", repairPlans[1].Arguments);
+    AssertEqual("change CNCA4 EmuBR=no,EmuOverrun=yes", repairPlans[2].Arguments);
+    AssertEqual("change CNCB4 EmuBR=yes,EmuOverrun=yes", repairPlans[3].Arguments);
+    AssertTrue(
+        repairPlans.All(plan => !plan.Arguments.Contains("7", StringComparison.Ordinal)),
+        "Configured pair repair must not modify unrelated com0com pairs.");
     try
     {
         await existingManager.BuildCreatePlanAsync("hub");

@@ -103,7 +103,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
         try
         {
-            _serial = _serialPorts.Open(_mapping.BackingPort);
+            _serial = _serialPorts.Open(_mapping.BackingPort, exclusive: true);
         }
         catch (SerialPortOpenException ex)
         {
@@ -1082,7 +1082,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             ? $" Mapping expects {mapping.VisiblePort} <-> {mapping.BackingPort}."
             : "";
         var createHint = !string.IsNullOrWhiteSpace(mapping.BackingPort)
-            ? $" If the pair is missing, create it first: setupc.exe install PortName={mapping.VisiblePort},EmuBR=yes PortName={mapping.BackingPort}."
+            ? $" If the pair is missing, create it first: setupc.exe {Com0comSetupManager.BuildInstallArguments(mapping.VisiblePort, mapping.BackingPort)}."
             : "";
         var busyHint = exception.NativeErrorCode == 5
             ? " ERROR 5 usually means the backing port is already open by another mapping, hub4com/com2tcp, or a serial tool; stop that process and retry."

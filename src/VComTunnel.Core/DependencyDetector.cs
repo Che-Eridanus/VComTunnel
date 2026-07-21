@@ -124,7 +124,8 @@ public sealed class DependencyDetector
     {
         return
         [
-            Environment.CurrentDirectory,
+            // A Windows service starts in System32. Recursively searching the
+            // current directory makes dependency checks scan the OS tree.
             AppContext.BaseDirectory,
             AppPaths.ToolsDirectory,
             @"C:\Program Files\com0com",
