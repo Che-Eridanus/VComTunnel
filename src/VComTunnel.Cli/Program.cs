@@ -1,5 +1,8 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Runtime.Versioning;
+using System.Security.Principal;
+using System.Text;
 using System.Net.Http.Json;
 using System.Text.Json;
 using VComTunnel.Core;
@@ -25,6 +28,7 @@ internal static class VComTunnelCtl
             "ports" => await GetAsync("/api/com0com/pairs"),
             "wireless-serial" or "wireless" => await WirelessSerialAsync(args.Skip(1).ToArray()),
             "pair" => await PairAsync(args.Skip(1).ToArray()),
+            "control-request" => await ControlRequestAsync(args.Skip(1).ToArray()),
             "kmdf" => Kmdf(args.Skip(1).ToArray()),
             "start" => await PostMappingAsync(args.Skip(1).FirstOrDefault(), "start"),
             "stop" => await PostMappingAsync(args.Skip(1).FirstOrDefault(), "stop"),
@@ -260,6 +264,249 @@ internal static class VComTunnelCtl
             }
         }
     }
+
+    private static async Task<int> ControlRequestAsync(string[] args)
+    {
+        var options = ParseControlRequestOptions(args);
+        if (options.Error is not null)
+        {
+            return WriteControlResult(options.ResultFile, ErrorJson(options.Error), 2);
+        }
+
+        var method = options.Method!.ToUpperInvariant();
+        var path = options.Path!;
+        if (!IsSupportedControlMethod(method))
+        {
+            return WriteControlResult(
+                options.ResultFile,
+                ErrorJson($"Unsupported VirtualCom control method: {method}"),
+                2);
+        }
+        if (!IsCanonicalControlPath(path))
+        {
+            return WriteControlResult(
+                options.ResultFile,
+                ErrorJson("VirtualCom control path must be a canonical relative /api/ path"),
+                2);
+        }
+        if (OperatingSystem.IsWindows()
+            && IsAdministratorControlRoute(method, path)
+            && !IsAdministrator())
+        {
+            return 740;
+        }
+
+        string? body = null;
+        if (options.BodyFile is not null)
+        {
+            try
+            {
+                body = await File.ReadAllTextAsync(options.BodyFile, Encoding.UTF8);
+                using var _ = JsonDocument.Parse(body);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                return WriteControlResult(
+                    options.ResultFile,
+                    ErrorJson($"Could not read a valid JSON request body: {ex.Message}"),
+                    2);
+            }
+        }
+
+        if (!TryCreateServiceClient(out var client, out var serviceBaseUrl))
+        {
+            return WriteControlResult(
+                options.ResultFile,
+                ErrorJson("VirtualCom service endpoint is not configured"),
+                2);
+        }
+
+        using (client)
+        using (var request = new HttpRequestMessage(new HttpMethod(method), path))
+        {
+            if (body is not null)
+            {
+                request.Content = new StringContent(body, Encoding.UTF8, "application/json");
+            }
+            try
+            {
+                using var response = await client.SendAsync(request);
+                var responseText = await response.Content.ReadAsStringAsync();
+                if (string.IsNullOrWhiteSpace(responseText))
+                {
+                    responseText = "{}";
+                }
+                return WriteControlResult(
+                    options.ResultFile,
+                    responseText,
+                    response.IsSuccessStatusCode ? 0 : 2);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
+            {
+                return WriteControlResult(
+                    options.ResultFile,
+                    ErrorJson($"Service is not reachable at {serviceBaseUrl}: {ex.Message}"),
+                    2);
+            }
+        }
+    }
+
+    private static ControlRequestOptions ParseControlRequestOptions(string[] args)
+    {
+        string? method = null;
+        string? path = null;
+        string? bodyFile = null;
+        string? resultFile = null;
+        for (var index = 0; index < args.Length; index++)
+        {
+            var option = args[index];
+            if (option is not ("--method" or "--path" or "--body-file" or "--result-file"))
+            {
+                return new ControlRequestOptions(
+                    method,
+                    path,
+                    bodyFile,
+                    resultFile,
+                    $"Unknown control-request option: {option}");
+            }
+            if (++index >= args.Length)
+            {
+                return new ControlRequestOptions(
+                    method,
+                    path,
+                    bodyFile,
+                    resultFile,
+                    $"Missing value for {option}");
+            }
+            var value = args[index];
+            switch (option)
+            {
+                case "--method":
+                    method = value;
+                    break;
+                case "--path":
+                    path = value;
+                    break;
+                case "--body-file":
+                    bodyFile = value;
+                    break;
+                case "--result-file":
+                    resultFile = value;
+                    break;
+            }
+        }
+        if (string.IsNullOrWhiteSpace(method) || string.IsNullOrWhiteSpace(path))
+        {
+            return new ControlRequestOptions(
+                method,
+                path,
+                bodyFile,
+                resultFile,
+                "control-request requires --method and --path");
+        }
+        return new ControlRequestOptions(method, path, bodyFile, resultFile, null);
+    }
+
+    private static bool IsSupportedControlMethod(string method) =>
+        method is "GET" or "POST" or "PUT" or "DELETE" or "PATCH";
+
+    private static bool IsCanonicalControlPath(string path)
+    {
+        if (!path.StartsWith("/api/", StringComparison.Ordinal)
+            || path.StartsWith("//", StringComparison.Ordinal)
+            || path.Contains("//", StringComparison.Ordinal)
+            || path.EndsWith("/", StringComparison.Ordinal)
+            || path.Contains('\\')
+            || path.Contains('?')
+            || path.Contains('#')
+            || path.Contains('%')
+            || path.Any(value => value < 0x20 || value == 0x7f))
+        {
+            return false;
+        }
+
+        var segments = path[1..].Split('/');
+        return segments.Length >= 2
+            && segments[0] == "api"
+            && segments.All(segment =>
+                segment.Length > 0
+                && segment is not ("." or "..")
+                && segment.All(value =>
+                    value is >= 'A' and <= 'Z'
+                    or >= 'a' and <= 'z'
+                    or >= '0' and <= '9'
+                    or '.' or '_' or '~' or '-'));
+    }
+
+    private static bool IsAdministratorControlRoute(string method, string path)
+    {
+        if (method != "POST" || !IsCanonicalControlPath(path))
+        {
+            return false;
+        }
+        if (path is "/api/dependencies/install"
+            or "/api/kmdf/ports/add"
+            or "/api/kmdf/ports/remove"
+            or "/api/kmdf/ports/update")
+        {
+            return true;
+        }
+
+        var segments = path[1..].Split('/');
+        if (segments.Length == 5
+            && segments[0] == "api"
+            && segments[1] == "com0com"
+            && segments[2] == "mappings"
+            && segments[4] is "create" or "repair")
+        {
+            return true;
+        }
+        return segments.Length == 5
+            && segments[0] == "api"
+            && segments[1] == "com0com"
+            && segments[2] == "pairs"
+            && int.TryParse(segments[3], out _)
+            && segments[4] == "remove";
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static bool IsAdministrator()
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        return new WindowsPrincipal(identity)
+            .IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static string ErrorJson(string message) =>
+        JsonSerializer.Serialize(new { error = message });
+
+    private static int WriteControlResult(string? resultFile, string text, int exitCode)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(resultFile))
+            {
+                Console.WriteLine(text);
+            }
+            else
+            {
+                File.WriteAllText(resultFile, text, Encoding.UTF8);
+            }
+            return exitCode;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            Console.WriteLine(ErrorJson($"Could not write control result: {ex.Message}"));
+            return 2;
+        }
+    }
+
+    private sealed record ControlRequestOptions(
+        string? Method,
+        string? Path,
+        string? BodyFile,
+        string? ResultFile,
+        string? Error);
 
     private static bool TryCreateServiceClient(out HttpClient client, out string serviceBaseUrl)
     {
@@ -656,6 +903,7 @@ internal static class VComTunnelCtl
           ports                    List registered com0com pairs
           wireless-serial query    Trigger minimal UDP endpoint discovery
           wireless-serial list     List WirelessSerial endpoints used for MAC-to-COM binding
+          control-request          Send a validated local /api/ control request
           pair create <id>         Ask service to create one mapping's com0com pair
           pair create-plan <id>    Print setupc plan for one mapping
           pair remove <n>          Ask service to remove com0com pair number n
@@ -709,6 +957,7 @@ internal static class VComTunnelCtl
     private static int Unknown(string command)
     {
         Console.WriteLine($"Unknown command: {command}");
-        return Help();
+        Help();
+        return 2;
     }
 }

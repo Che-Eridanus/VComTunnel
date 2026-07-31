@@ -138,6 +138,18 @@ try {
         if (($cliMappings -join "`n") -notmatch 'missing-deps') { throw "CLI mappings did not show missing-deps." }
         $cliStatus = Invoke-DotnetCapture @('run', '-c', $Configuration, '--project', $cliProject, '--no-build', '--', 'status')
         if (($cliStatus -join "`n") -notmatch 'configPath') { throw "CLI status did not return service status." }
+        $cliControlStatus = Invoke-DotnetCapture @(
+            'run', '-c', $Configuration, '--project', $cliProject, '--no-build', '--',
+            'control-request', '--method', 'GET', '--path', '/api/status'
+        )
+        try {
+            $cliControlStatusJson = ($cliControlStatus -join "`n") | ConvertFrom-Json
+        } catch {
+            throw "CLI control-request did not return JSON.`n$($cliControlStatus -join "`n")"
+        }
+        if ($null -eq $cliControlStatusJson.configPath) {
+            throw "CLI control-request did not return service status.`n$($cliControlStatus -join "`n")"
+        }
         $cliLogs = Invoke-DotnetCapture @('run', '-c', $Configuration, '--project', $cliProject, '--no-build', '--', 'logs')
         if (($cliLogs -join "`n") -notmatch 'missing-deps|driver-prototype|KMDF|dependencies') {
             throw "CLI logs did not return smoke service logs.`n$($cliLogs -join "`n")"

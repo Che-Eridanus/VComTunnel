@@ -13,6 +13,17 @@ $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+$gitRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitRevision)) {
+    throw "Cannot resolve the VirtualCom git revision from $repoRoot"
+}
+$gitStatus = @(& git -C $repoRoot status --porcelain --untracked-files=normal)
+if ($LASTEXITCODE -ne 0) {
+    throw "Cannot inspect the VirtualCom source status at $repoRoot"
+}
+if ($gitStatus.Count -ne 0) {
+    throw "VirtualCom release packages require a clean source tree so gitRevision identifies the packaged code.`n$($gitStatus -join "`n")"
+}
 $repoDependencyArchiveRoot = Join-Path $repoRoot "third_party\dependencies"
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $repoRoot "artifacts\release"
@@ -428,6 +439,19 @@ $firstReadmeZh = @(
     (ConvertFrom-Utf8Base64 "LSDmnKzmnLogQVBJIOWPquW6lOS9v+eUqCAxMjcuMC4wLjHvvIxEVFIvUlRTL0JSRUFLIOetieaOp+WItue6v+ihjOS4uuWFiOWcqOWuieWFqOehrOS7tuS4iumqjOivgeOAgg==")
 )
 Set-Content -LiteralPath (Join-Path $packageRoot "README-FIRST.zh-CN.txt") -Value $firstReadmeZh -Encoding UTF8
+
+$releaseVersion = [ordered]@{
+    schema = 1
+    package = 'vcomtunnel'
+    version = $Version
+    runtime = $Runtime
+    gitRevision = $gitRevision
+    builtAtUtc = [DateTime]::UtcNow.ToString('o')
+}
+Set-Content `
+    -LiteralPath (Join-Path $packageRoot 'release-version.json') `
+    -Value ($releaseVersion | ConvertTo-Json -Depth 3) `
+    -Encoding UTF8
 
 $packageRootFull = (Resolve-Path -LiteralPath $packageRoot).Path
 $hashLines = Get-ChildItem -LiteralPath $packageRootFull -Recurse -File |
