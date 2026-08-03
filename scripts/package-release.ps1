@@ -12,6 +12,35 @@ param(
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+function Get-Com0comPairOptions {
+    param([Parameter(Mandatory = $true)][string]$Root)
+
+    $sourcePath = Join-Path $Root "src\VComTunnel.Core\Com0comSetupManager.cs"
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "Com0com setup source is missing: $sourcePath"
+    }
+    $source = Get-Content -LiteralPath $sourcePath -Raw
+    $resolved = [ordered]@{}
+    foreach ($spec in @(
+        [pscustomobject]@{ Constant = 'VisiblePortOptions'; Property = 'visible' },
+        [pscustomobject]@{ Constant = 'BackingPortOptions'; Property = 'backing' }
+    )) {
+        $pattern = 'internal\s+const\s+string\s+' +
+            [regex]::Escape($spec.Constant) + '\s*=\s*"(?<value>[^"]+)"\s*;'
+        $match = [regex]::Match($source, $pattern)
+        if (-not $match.Success) {
+            throw "Cannot resolve $($spec.Constant) from $sourcePath"
+        }
+        $resolved[$spec.Property] = $match.Groups['value'].Value
+    }
+
+    if ($resolved.visible -ne 'EmuBR=yes,EmuOverrun=no' -or
+        $resolved.backing -ne 'EmuBR=no,EmuOverrun=no') {
+        throw "VirtualCom com0com pair options do not satisfy the reliable flash contract."
+    }
+    return [pscustomobject]$resolved
+}
+
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $gitRevision = (& git -C $repoRoot rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitRevision)) {
@@ -24,6 +53,7 @@ if ($LASTEXITCODE -ne 0) {
 if ($gitStatus.Count -ne 0) {
     throw "VirtualCom release packages require a clean source tree so gitRevision identifies the packaged code.`n$($gitStatus -join "`n")"
 }
+$com0comPairOptions = Get-Com0comPairOptions -Root $repoRoot
 $repoDependencyArchiveRoot = Join-Path $repoRoot "third_party\dependencies"
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $repoRoot "artifacts\release"
@@ -446,6 +476,7 @@ $releaseVersion = [ordered]@{
     version = $Version
     runtime = $Runtime
     gitRevision = $gitRevision
+    com0comPairOptions = $com0comPairOptions
     builtAtUtc = [DateTime]::UtcNow.ToString('o')
 }
 Set-Content `

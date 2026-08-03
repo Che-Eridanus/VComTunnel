@@ -1024,10 +1024,10 @@ static void Com0comCreateHints()
     var mapping = new TunnelMapping { Name = "A", VisiblePort = "COM12", BackingPort = "CNCB12" };
     var builder = new Hub4comCommandBuilder(new DependencyDetector());
     var hint = builder.BuildCom0comCreateHint(mapping);
-    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes,EmuOverrun=yes PortName=CNCB12,EmuBR=no,EmuOverrun=yes", hint);
+    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes,EmuOverrun=no PortName=CNCB12,EmuBR=no,EmuOverrun=no", hint);
 
     var serviceHint = builder.BuildCom0comCreateHint(mapping with { Backend = TunnelBackend.Com0comService });
-    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes,EmuOverrun=yes PortName=CNCB12,EmuBR=no,EmuOverrun=yes", serviceHint);
+    AssertEqual("setupc.exe install PortName=COM12,EmuBR=yes,EmuOverrun=no PortName=CNCB12,EmuBR=no,EmuOverrun=no", serviceHint);
 }
 
 static void Com0comServiceMapsPeerModemSignals()
@@ -3230,7 +3230,7 @@ static void Com0comServiceBackingOpenDiagnostics()
         mapping,
         new SerialPortOpenException("CNCB27", @"\\.\CNCB27", 2, "open"));
     AssertStringContains(notFound, "ERROR 2");
-    AssertStringContains(notFound, "setupc.exe install PortName=COM27,EmuBR=yes,EmuOverrun=yes PortName=CNCB27,EmuBR=no,EmuOverrun=yes");
+    AssertStringContains(notFound, "setupc.exe install PortName=COM27,EmuBR=yes,EmuOverrun=no PortName=CNCB27,EmuBR=no,EmuOverrun=no");
 
     var accessDenied = Com0comServiceTunnelSession.BuildBackingPortOpenError(
         mapping,
@@ -3417,11 +3417,11 @@ static async Task Com0comCreateAndRemovePlansAsync()
         new FakeComPortInventory(["COM28", "CNCB28"], [new Com0comPairInfo(2, "COM28", "CNCB28", @"\Device\com0com12", @"\Device\com0com22", true)]));
 
     var create = await manager.BuildCreatePlanAsync("hub");
-    AssertEqual("install PortName=COM29,EmuBR=yes,EmuOverrun=yes PortName=CNCB29,EmuBR=no,EmuOverrun=yes", create.Arguments);
+    AssertEqual("install PortName=COM29,EmuBR=yes,EmuOverrun=no PortName=CNCB29,EmuBR=no,EmuOverrun=no", create.Arguments);
     AssertTrue(create.RequiresElevation, "setupc plans should require elevation.");
 
     var serviceCreate = await manager.BuildCreatePlanAsync("svc");
-    AssertEqual("install PortName=COM30,EmuBR=yes,EmuOverrun=yes PortName=CNCB30,EmuBR=no,EmuOverrun=yes", serviceCreate.Arguments);
+    AssertEqual("install PortName=COM30,EmuBR=yes,EmuOverrun=no PortName=CNCB30,EmuBR=no,EmuOverrun=no", serviceCreate.Arguments);
 
     var remove = manager.BuildRemovePlan(2);
     AssertStringContains(remove.Arguments, "remove 2");
@@ -3439,10 +3439,10 @@ static async Task Com0comCreateAndRemovePlansAsync()
             ]));
     var repairPlans = await existingManager.BuildConfiguredPairRepairPlansAsync();
     AssertEqual("4", repairPlans.Count.ToString());
-    AssertEqual("change CNCA3 EmuBR=yes,EmuOverrun=yes", repairPlans[0].Arguments);
-    AssertEqual("change CNCB3 EmuBR=no,EmuOverrun=yes", repairPlans[1].Arguments);
-    AssertEqual("change CNCA4 EmuBR=no,EmuOverrun=yes", repairPlans[2].Arguments);
-    AssertEqual("change CNCB4 EmuBR=yes,EmuOverrun=yes", repairPlans[3].Arguments);
+    AssertEqual("change CNCA3 EmuBR=yes,EmuOverrun=no", repairPlans[0].Arguments);
+    AssertEqual("change CNCB3 EmuBR=no,EmuOverrun=no", repairPlans[1].Arguments);
+    AssertEqual("change CNCA4 EmuBR=no,EmuOverrun=no", repairPlans[2].Arguments);
+    AssertEqual("change CNCB4 EmuBR=yes,EmuOverrun=no", repairPlans[3].Arguments);
     AssertTrue(
         repairPlans.All(plan => !plan.Arguments.Contains("7", StringComparison.Ordinal)),
         "Configured pair repair must not modify unrelated com0com pairs.");
