@@ -1,6 +1,13 @@
 using System.ServiceProcess;
+using System.IO.Pipes;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Connections.Features;
+using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.AspNetCore.Server.Kestrel.Transport.NamedPipes;
 using VComTunnel.Core;
 
 if (ShouldRunAsWindowsService(args))
@@ -25,7 +32,54 @@ internal static class VComTunnelHost
     {
         var builder = WebApplication.CreateBuilder(args);
 
-        builder.WebHost.UseUrls(ServiceEndpoint.GetBaseUrl());
+        builder.WebHost.ConfigureKestrel(options =>
+        {
+            options.ListenLocalhost(ServiceEndpoint.GetBaseUri().Port);
+            options.ListenNamedPipe(ServiceEndpoint.GetControlPipeName(), listenOptions =>
+            {
+                listenOptions.Protocols = HttpProtocols.Http1;
+            });
+        });
+        builder.WebHost.UseNamedPipes(options =>
+        {
+            // The service is the privilege boundary. Interactive local users
+            // may request product-scoped operations without another UAC prompt;
+            // remote and anonymous tokens are denied at the transport layer.
+            var pipeSecurity = new PipeSecurity();
+            pipeSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            var serviceIdentity = WindowsIdentity.GetCurrent().User;
+            if (serviceIdentity is not null)
+            {
+                pipeSecurity.AddAccessRule(new PipeAccessRule(
+                    serviceIdentity,
+                    PipeAccessRights.FullControl,
+                    AccessControlType.Allow));
+            }
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.LocalSystemSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.BuiltinAdministratorsSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.BuiltinUsersSid,
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.NetworkSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Deny));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.AnonymousSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Deny));
+            options.CurrentUserOnly = false;
+            options.PipeSecurity = pipeSecurity;
+            options.MaxReadBufferSize = 1024 * 1024;
+            options.MaxWriteBufferSize = 1024 * 1024;
+        });
         builder.Services.AddSingleton<ConfigStore>();
         builder.Services.AddSingleton<DependencyDetector>();
         builder.Services.AddSingleton<DependencyInstaller>();
@@ -53,6 +107,29 @@ internal static class VComTunnelHost
         });
 
         var app = builder.Build();
+
+        app.Use(async (context, next) =>
+        {
+            var localEndpoint = context.Features
+                .Get<IConnectionEndPointFeature>()?
+                .LocalEndPoint;
+            var protectedControlTransport = localEndpoint is NamedPipeEndPoint
+                || (context.Connection.LocalIpAddress is null
+                    && context.Connection.RemoteIpAddress is null);
+            if (ServiceControlPolicy.RequiresProtectedTransport(context.Request.Method)
+                && !protectedControlTransport)
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    error = "State-changing VirtualCom requests require the protected local control channel.",
+                    code = "VCOM_CONTROL_CHANNEL_REQUIRED"
+                });
+                return;
+            }
+
+            await next(context);
+        });
 
         app.MapGet("/", () => Results.Redirect("/api/status"));
 
@@ -385,6 +462,12 @@ internal static class VComTunnelHost
 
         await app.RunAsync(cancellationToken);
     }
+
+    private static PipeAccessRule CreatePipeRule(
+        WellKnownSidType sidType,
+        PipeAccessRights rights,
+        AccessControlType accessType) =>
+        new(new SecurityIdentifier(sidType, domainSid: null), rights, accessType);
 
     private static async Task<bool> HasWirelessSerialMacBoundMappingAsync(ConfigStore store, CancellationToken cancellationToken)
     {

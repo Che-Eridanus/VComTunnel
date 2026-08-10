@@ -26,7 +26,7 @@ public partial class MainWindow : Window
     };
     private static readonly TimeSpan RuntimeStatusRefreshInterval = TimeSpan.FromSeconds(5);
 
-    private readonly HttpClient _client = new() { BaseAddress = new Uri(ServiceEndpoint.DefaultUrl) };
+    private readonly HttpClient _client = ServiceEndpoint.CreateControlClient();
     private readonly System.Windows.Threading.DispatcherTimer _runtimeStatusRefreshTimer = new() { Interval = RuntimeStatusRefreshInterval };
     private readonly ObservableCollection<MappingRow> _mappings = [];
     private readonly ObservableCollection<ComPairRow> _comPairs = [];

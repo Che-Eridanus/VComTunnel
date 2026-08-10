@@ -25,6 +25,8 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("service endpoint defaults to loopback", () => Task.Run(ServiceEndpointDefaultsToLoopback)),
     ("service endpoint accepts loopback override", () => Task.Run(ServiceEndpointAcceptsLoopbackOverride)),
     ("service endpoint rejects non-loopback override", () => Task.Run(ServiceEndpointRejectsNonLoopbackOverride)),
+    ("service control pipe rejects unsafe override", () => Task.Run(ServiceControlPipeRejectsUnsafeOverride)),
+    ("service mutations require protected transport", () => Task.Run(ServiceMutationsRequireProtectedTransport)),
     ("default dependency roots skip process working directory", () => Task.Run(DefaultDependencyRootsSkipProcessWorkingDirectory)),
     ("TCP tunnel options enable low latency", () => Task.Run(TcpTunnelOptionsEnableLowLatency)),
     ("file logs rotate and cap archives", () => Task.Run(FileLogsRotateAndCapArchives)),
@@ -673,6 +675,41 @@ static void ServiceEndpointRejectsNonLoopbackOverride()
     finally
     {
         Environment.SetEnvironmentVariable(ServiceEndpoint.EnvironmentVariable, oldUrl);
+    }
+}
+
+static void ServiceMutationsRequireProtectedTransport()
+{
+    AssertTrue(!ServiceControlPolicy.RequiresProtectedTransport("GET"), "GET must remain readable over loopback HTTP.");
+    AssertTrue(!ServiceControlPolicy.RequiresProtectedTransport("head"), "HEAD must remain readable over loopback HTTP.");
+    AssertTrue(!ServiceControlPolicy.RequiresProtectedTransport("OPTIONS"), "OPTIONS must not mutate service state.");
+    AssertTrue(ServiceControlPolicy.RequiresProtectedTransport("POST"), "POST must use the protected channel.");
+    AssertTrue(ServiceControlPolicy.RequiresProtectedTransport("PUT"), "PUT must use the protected channel.");
+    AssertTrue(ServiceControlPolicy.RequiresProtectedTransport("PATCH"), "PATCH must use the protected channel.");
+    AssertTrue(ServiceControlPolicy.RequiresProtectedTransport("DELETE"), "DELETE must use the protected channel.");
+}
+
+static void ServiceControlPipeRejectsUnsafeOverride()
+{
+    var oldName = Environment.GetEnvironmentVariable(ServiceEndpoint.ControlPipeEnvironmentVariable);
+    try
+    {
+        Environment.SetEnvironmentVariable(ServiceEndpoint.ControlPipeEnvironmentVariable, "VComTunnel.Control.test-01");
+        AssertEqual("VComTunnel.Control.test-01", ServiceEndpoint.GetControlPipeName());
+        Environment.SetEnvironmentVariable(ServiceEndpoint.ControlPipeEnvironmentVariable, @"..\attacker\pipe");
+        try
+        {
+            _ = ServiceEndpoint.GetControlPipeName();
+            throw new Exception("Expected unsafe control pipe name to be rejected.");
+        }
+        catch (InvalidOperationException ex)
+        {
+            AssertStringContains(ex.Message, "simple local pipe name");
+        }
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable(ServiceEndpoint.ControlPipeEnvironmentVariable, oldName);
     }
 }
 

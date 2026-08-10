@@ -71,6 +71,10 @@ serial tool -> COMx -> VComTunnel.Serial.sys -> VComTunnel.Service -> RFC2217
 
 The GUI is a controller for the local service. Closing the GUI does not stop
 running tunnels; stop mappings from the GUI or with `vcomtunnelctl stop`.
+Per-machine service and driver setup is the elevation boundary. Routine GUI and
+CLI control uses the installed service over an ACL-protected Windows Named Pipe
+without another UAC prompt. Loopback HTTP remains read-only for status and
+inventory compatibility.
 
 ## Verified Windows GUI State
 
@@ -435,6 +439,8 @@ Test Mode, and Secure Boot or driver signing policy can block installation.
 ## Safety and Security
 
 - The local API is intended for loopback use at `127.0.0.1:44817`.
+- State-changing requests are accepted only through the ACL-protected
+  `VComTunnel.Control.v1` named pipe. Loopback HTTP rejects them with `403`.
 - Treat RFC2217 endpoints as trusted lab infrastructure. RFC2217 itself does
   not provide encryption or authentication.
 - Do not expose VComTunnel service ports directly to untrusted networks.

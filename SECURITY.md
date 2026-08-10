@@ -23,6 +23,8 @@ opening a public issue with exploit details. Include:
 ## Deployment Guidance
 
 - Keep the local VComTunnel API bound to loopback.
+- Keep all state-changing operations on the ACL-protected named-pipe control
+  transport. Loopback HTTP is a read-only compatibility surface.
 - Do not expose RFC2217 endpoints or VComTunnel service ports to untrusted
   networks without a separate trusted transport layer.
 - Treat RFC2217 peers as trusted devices. RFC2217 does not provide built-in
@@ -42,3 +44,5 @@ The current prototype does not claim to provide:
 - TLS or encrypted RFC2217 transport
 - Production EV/attestation-signed driver distribution
 - Hard multi-tenant isolation between users on the same Windows machine
+- Process-level isolation between applications running as the same authorized
+  local Windows user

@@ -1,7 +1,5 @@
 using System.ComponentModel;
 using System.Diagnostics;
-using System.Runtime.Versioning;
-using System.Security.Principal;
 using System.Text;
 using System.Net.Http.Json;
 using System.Text.Json;
@@ -289,13 +287,6 @@ internal static class VComTunnelCtl
                 ErrorJson("VirtualCom control path must be a canonical relative /api/ path"),
                 2);
         }
-        if (OperatingSystem.IsWindows()
-            && IsAdministratorControlRoute(method, path)
-            && !IsAdministrator())
-        {
-            return 740;
-        }
-
         string? body = null;
         if (options.BodyFile is not null)
         {
@@ -438,45 +429,6 @@ internal static class VComTunnelCtl
                     or '.' or '_' or '~' or '-'));
     }
 
-    private static bool IsAdministratorControlRoute(string method, string path)
-    {
-        if (method != "POST" || !IsCanonicalControlPath(path))
-        {
-            return false;
-        }
-        if (path is "/api/dependencies/install"
-            or "/api/kmdf/ports/add"
-            or "/api/kmdf/ports/remove"
-            or "/api/kmdf/ports/update")
-        {
-            return true;
-        }
-
-        var segments = path[1..].Split('/');
-        if (segments.Length == 5
-            && segments[0] == "api"
-            && segments[1] == "com0com"
-            && segments[2] == "mappings"
-            && segments[4] is "create" or "repair")
-        {
-            return true;
-        }
-        return segments.Length == 5
-            && segments[0] == "api"
-            && segments[1] == "com0com"
-            && segments[2] == "pairs"
-            && int.TryParse(segments[3], out _)
-            && segments[4] == "remove";
-    }
-
-    [SupportedOSPlatform("windows")]
-    private static bool IsAdministrator()
-    {
-        using var identity = WindowsIdentity.GetCurrent();
-        return new WindowsPrincipal(identity)
-            .IsInRole(WindowsBuiltInRole.Administrator);
-    }
-
     private static string ErrorJson(string message) =>
         JsonSerializer.Serialize(new { error = message });
 
@@ -513,7 +465,7 @@ internal static class VComTunnelCtl
         try
         {
             serviceBaseUrl = ServiceEndpoint.GetBaseUrl();
-            client = new HttpClient { BaseAddress = new Uri(serviceBaseUrl) };
+            client = ServiceEndpoint.CreateControlClient();
             return true;
         }
         catch (Exception ex) when (ex is InvalidOperationException or UriFormatException)

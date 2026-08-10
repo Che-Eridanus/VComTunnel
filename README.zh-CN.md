@@ -156,16 +156,18 @@ vcomtunnelctl pair create-plan <mappingId>
 vcomtunnelctl pair remove-plan <pairNumber>
 ```
 
-实际创建/删除 com0com 端口需要管理员确认，因为它会调用 com0com 的
-`setupc.exe` 修改驱动设备。
+首次安装服务和驱动仍属于安装器提权边界。安装完成后，创建/删除 com0com
+端口由已提权的后台服务执行，日常操作不再反复弹出 UAC；Windows 仍可能在
+首次驱动安装时显示驱动信任或重启提示。
 
 `kmdf` 后端没有 `CNCB` 这一侧。它只有一个可见 COM 口，例如 `COM25`，
 服务通过驱动私有通道收发数据。
 
 ## 后台服务
 
-VComTunnel.Service 监听本机 `127.0.0.1:44817`，GUI 和 CLI 都通过这个本机
-API 管理映射。
+VComTunnel.Service 在 `127.0.0.1:44817` 保留只读状态 API。GUI 和 CLI 的
+状态变更请求通过带 Windows ACL 的 `VComTunnel.Control.v1` Named Pipe
+进入服务；直接向 loopback HTTP 发送 POST/PUT/PATCH/DELETE 会返回 403。
 
 安装 Windows 后台服务：
 
@@ -316,6 +318,8 @@ RTS、BREAK、purge 等控制可能影响连接的开发板。
 ## 安全边界
 
 - 本机 API 只应监听 `127.0.0.1`。
+- 变更状态的请求只允许通过带 ACL 的本机 Named Pipe，日常操作复用已安装
+  服务权限，不再次触发 UAC。
 - RFC2217 本身没有 TLS 和认证，默认只适合可信局域网或实验室网络。
 - 不要把 VComTunnel 的 API 或 RFC2217 设备直接暴露到不可信网络。
 - 驱动、COM 口创建和控制线时序都可能影响真实硬件，升级前先用安全目标验证。
