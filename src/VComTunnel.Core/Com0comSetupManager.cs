@@ -9,20 +9,24 @@ public sealed class Com0comSetupManager
     internal const string VisiblePortOptions = "EmuBR=no,EmuOverrun=no";
     internal const string BackingPortOptions = "EmuBR=no,EmuOverrun=no";
     private const string SerialCommKey = @"HARDWARE\DEVICEMAP\SERIALCOMM";
+    private const string Com0comParametersKey = @"SYSTEM\CurrentControlSet\Services\com0com\Parameters";
     private const string Com0comPortEnumKey = @"SYSTEM\CurrentControlSet\Enum\COM0COM\PORT";
 
     private readonly ConfigStore _configStore;
     private readonly DependencyDetector _dependencyDetector;
     private readonly IComPortInventory _comPortInventory;
+    private readonly Func<string, bool> _endpointOptionsReliable;
 
     public Com0comSetupManager(
         ConfigStore configStore,
         DependencyDetector dependencyDetector,
-        IComPortInventory comPortInventory)
+        IComPortInventory comPortInventory,
+        Func<string, bool>? endpointOptionsReliable = null)
     {
         _configStore = configStore;
         _dependencyDetector = dependencyDetector;
         _comPortInventory = comPortInventory;
+        _endpointOptionsReliable = endpointOptionsReliable ?? Com0comEndpointOptionsReliable;
     }
 
     public IReadOnlyList<Com0comPairInfo> GetPairs() => _comPortInventory.GetCom0comPairs();
@@ -68,15 +72,24 @@ public sealed class Com0comSetupManager
 
         var portAOptions = BuildPortOptions(pair.PortA, mapping);
         var portBOptions = BuildPortOptions(pair.PortB, mapping);
-        return
-        [
-            BuildPlan(
+        var plans = new List<SetupcCommandPlan>(2);
+        var endpointA = $"CNCA{pair.PairNumber}";
+        if (!_endpointOptionsReliable(endpointA))
+        {
+            plans.Add(BuildPlan(
                 $"change CNCA{pair.PairNumber} {portAOptions}",
-                $"Repair com0com pair {pair.PairNumber} endpoint CNCA{pair.PairNumber}"),
-            BuildPlan(
+                $"Repair com0com pair {pair.PairNumber} endpoint {endpointA}"));
+        }
+
+        var endpointB = $"CNCB{pair.PairNumber}";
+        if (!_endpointOptionsReliable(endpointB))
+        {
+            plans.Add(BuildPlan(
                 $"change CNCB{pair.PairNumber} {portBOptions}",
-                $"Repair com0com pair {pair.PairNumber} endpoint CNCB{pair.PairNumber}")
-        ];
+                $"Repair com0com pair {pair.PairNumber} endpoint {endpointB}"));
+        }
+
+        return plans;
     }
 
     public async Task<IReadOnlyList<SetupcCommandPlan>> BuildConfiguredPairRepairPlansAsync(
@@ -267,6 +280,45 @@ public sealed class Com0comSetupManager
         return string.Equals(pairPort, mapping.BackingPort, StringComparison.OrdinalIgnoreCase)
             ? BackingPortOptions
             : VisiblePortOptions;
+    }
+
+    private static bool Com0comEndpointOptionsReliable(string endpoint)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        try
+        {
+#pragma warning disable CA1416
+            using var key = Registry.LocalMachine.OpenSubKey($@"{Com0comParametersKey}\{endpoint}");
+            return key is not null
+                && RegistryOptionDisabled(key.GetValue("EmuBR"))
+                && RegistryOptionDisabled(key.GetValue("EmuOverrun"));
+#pragma warning restore CA1416
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static bool RegistryOptionDisabled(object? value)
+    {
+        if (value is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            return Convert.ToInt64(value, System.Globalization.CultureInfo.InvariantCulture) == 0;
+        }
+        catch (Exception ex) when (ex is FormatException or InvalidCastException or OverflowException)
+        {
+            return false;
+        }
     }
 
     private static int TryRemoveStaleSerialCommValues(Com0comPairInfo? pair)

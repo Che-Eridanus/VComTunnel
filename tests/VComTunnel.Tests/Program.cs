@@ -1170,7 +1170,8 @@ static void Com0comServiceRemoteSerialSettingsDoNotOverwriteLocalSettings()
     AssertBytes(
         Concat(
             Rfc2217Client.BuildSetBaudRate(115200),
-            Rfc2217Client.BuildSetLineControl(stopBits: 0, parity: 0, wordLength: 8)),
+            Rfc2217Client.BuildSetLineControl(stopBits: 0, parity: 0, wordLength: 8),
+            Rfc2217Client.BuildPurge(0x08)),
         InvokeCom0comUpdateSerialSettings(session, settings));
 }
 
@@ -1333,6 +1334,7 @@ static async Task Com0comServiceStartupUsesPeerSerialSettingInsertionsAsync()
         var bytes = await startupBytes.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
         AssertTrue(ContainsSequence(bytes, Rfc2217Client.BuildSetBaudRate(19200)), "Startup should prefer the visible peer baud reported by com0com insertion events.");
         AssertTrue(ContainsSequence(bytes, Rfc2217Client.BuildSetLineControl(stopBits: 2, parity: 2, wordLength: 7)), "Startup should prefer the visible peer line control reported by com0com insertion events.");
+        AssertTrue(ContainsSequence(bytes, Rfc2217Client.BuildPurge(0x08)), "Startup baud synchronization should clear target RX bytes sampled under the previous line timing.");
         AssertTrue(!ContainsSequence(bytes, Rfc2217Client.BuildSetBaudRate(115200)), "Startup must not send the backing-port DCB baud when com0com reports visible peer settings.");
         AssertStringContains(string.Join("\n", log.Snapshot().Select(entry => entry.Message)), "peer serial-setting events enabled");
     }
@@ -1395,7 +1397,10 @@ static async Task Com0comServiceForwardsPeerSerialSettingInsertionsAsync()
         await session.StartAsync(cts.Token);
         var stream = await serverReady.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
         serial.EnqueueRead(Com0comPeerBaudInsertion(230400));
-        await WaitForStreamBytesAsync(stream, Rfc2217Client.BuildSetBaudRate(230400), TimeSpan.FromSeconds(2));
+        await WaitForStreamBytesAsync(
+            stream,
+            Concat(Rfc2217Client.BuildSetBaudRate(230400), Rfc2217Client.BuildPurge(0x08)),
+            TimeSpan.FromSeconds(2));
 
         serial.EnqueueRead(Com0comPeerLineInsertion(7, 2, 2));
         await WaitForStreamBytesAsync(stream, Rfc2217Client.BuildSetLineControl(stopBits: 2, parity: 2, wordLength: 7), TimeSpan.FromSeconds(2));
@@ -3464,16 +3469,18 @@ static async Task Com0comCreateAndRemovePlansAsync()
     AssertStringContains(remove.Arguments, "remove 2");
     AssertEqual(1.ToString(), manager.GetPairs().Count.ToString());
 
+    var existingInventory = new FakeComPortInventory(
+        ["COM29", "CNCB29", "COM30", "CNCB30", "COM77", "CNCB77"],
+        [
+            new Com0comPairInfo(3, "COM29", "CNCB29", @"\Device\com0com13", @"\Device\com0com23", true),
+            new Com0comPairInfo(4, "CNCB30", "COM30", @"\Device\com0com14", @"\Device\com0com24", true),
+            new Com0comPairInfo(7, "COM77", "CNCB77", @"\Device\com0com17", @"\Device\com0com27", true)
+        ]);
     var existingManager = new Com0comSetupManager(
         store,
         detector,
-        new FakeComPortInventory(
-            ["COM29", "CNCB29", "COM30", "CNCB30", "COM77", "CNCB77"],
-            [
-                new Com0comPairInfo(3, "COM29", "CNCB29", @"\Device\com0com13", @"\Device\com0com23", true),
-                new Com0comPairInfo(4, "CNCB30", "COM30", @"\Device\com0com14", @"\Device\com0com24", true),
-                new Com0comPairInfo(7, "COM77", "CNCB77", @"\Device\com0com17", @"\Device\com0com27", true)
-            ]));
+        existingInventory,
+        endpointOptionsReliable: _ => false);
     var repairPlans = await existingManager.BuildConfiguredPairRepairPlansAsync();
     AssertEqual("4", repairPlans.Count.ToString());
     AssertEqual("change CNCA3 EmuBR=no,EmuOverrun=no", repairPlans[0].Arguments);
@@ -3483,6 +3490,14 @@ static async Task Com0comCreateAndRemovePlansAsync()
     AssertTrue(
         repairPlans.All(plan => !plan.Arguments.Contains("7", StringComparison.Ordinal)),
         "Configured pair repair must not modify unrelated com0com pairs.");
+    var reliableManager = new Com0comSetupManager(
+        store,
+        detector,
+        existingInventory,
+        endpointOptionsReliable: _ => true);
+    AssertEqual(
+        "0",
+        (await reliableManager.BuildConfiguredPairRepairPlansAsync()).Count.ToString());
     try
     {
         await existingManager.BuildCreatePlanAsync("hub");

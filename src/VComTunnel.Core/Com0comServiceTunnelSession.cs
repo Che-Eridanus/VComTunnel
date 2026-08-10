@@ -14,6 +14,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private const int SerialRxWriteChunkBytes = 256;
     private const int SerialRxQueueCapacityChunks = 256;
     private const int SerialRxQueueWarnBytes = 32 * 1024;
+    private const uint SerialPurgeRxClear = 0x08;
     private const byte Com0comPeerSettingsEscapeChar = 0xFF;
 
     private static readonly TimeSpan SerialModemPollInterval = TimeSpan.FromMilliseconds(1);
@@ -414,7 +415,10 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             var previous = _lastSerialSnapshot ?? _serial!.GetSnapshot();
             var current = settings.Apply(previous);
             _lastSerialSnapshot = current;
-            var frame = BuildSettingsChangeFrame(previous, current);
+            var frame = BuildSettingsChangeFrame(
+                previous,
+                current,
+                purgeRxOnBaudEvent: settings.BaudRate.HasValue);
             return frame.Bytes.Length == 0
                 ? frame
                 : frame with { Description = $"RFC2217 com0com peer serial setting {frame.Description} sent without ACK wait." };
@@ -468,12 +472,16 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             BuildModemChangeFrame(previous, current, eventMask, forwardControlLines));
     }
 
-    private static Rfc2217OutboundFrame BuildSettingsChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current)
+    private static Rfc2217OutboundFrame BuildSettingsChangeFrame(
+        SerialPortSnapshot previous,
+        SerialPortSnapshot current,
+        bool purgeRxOnBaudEvent = false)
     {
         var frames = new List<byte[]>();
         var descriptions = new List<string>();
+        var baudChanged = previous.BaudRate != current.BaudRate && current.BaudRate > 0;
 
-        if (previous.BaudRate != current.BaudRate && current.BaudRate > 0)
+        if (baudChanged)
         {
             frames.Add(Rfc2217Client.BuildSetBaudRate(current.BaudRate));
             descriptions.Add($"baud={current.BaudRate}");
@@ -485,6 +493,16 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         {
             frames.Add(Rfc2217Client.BuildSetLineControl(current.StopBits, current.Parity, current.ByteSize));
             descriptions.Add($"line data={current.ByteSize}, parity={current.Parity}, stop={current.StopBits}");
+        }
+
+        if (baudChanged || purgeRxOnBaudEvent)
+        {
+            // A visible COM open or DCB change can emit the baud insertion
+            // immediately before payload bytes.  Discard target RX bytes that
+            // were sampled under the previous line timing before forwarding
+            // any following serial data from the same ordered TCP stream.
+            frames.Add(Rfc2217Client.BuildPurge(SerialPurgeRxClear));
+            descriptions.Add("purge-rx-after-baud");
         }
 
         return BuildFrame(frames, descriptions);

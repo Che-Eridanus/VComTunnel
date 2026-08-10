@@ -375,6 +375,10 @@ Every com0com pair created or repaired by VComTunnel uses
 UART is the only physical baud-rate clock; com0com must forward bytes with
 backpressure and must not add a second baud timer or silently discard data.
 Existing pairs created by older packages require one explicit pair repair.
+When the visible COM reports a baud event, the managed tunnel sends the
+ordered RFC2217 sequence `SET-BAUD/line control -> PURGE-DATA(RX)` before any
+following payload bytes. This removes target RX bytes sampled under the old
+line timing without reintroducing com0com baud emulation.
 
 ## Phase 1 real device bring-up
 
