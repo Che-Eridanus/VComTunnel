@@ -6,7 +6,7 @@ namespace VComTunnel.Core;
 public sealed class Com0comSetupManager
 {
     private static readonly TimeSpan SetupcRunTimeout = TimeSpan.FromSeconds(90);
-    internal const string VisiblePortOptions = "EmuBR=yes,EmuOverrun=no";
+    internal const string VisiblePortOptions = "EmuBR=no,EmuOverrun=no";
     internal const string BackingPortOptions = "EmuBR=no,EmuOverrun=no";
     private const string SerialCommKey = @"HARDWARE\DEVICEMAP\SERIALCOMM";
     private const string Com0comPortEnumKey = @"SYSTEM\CurrentControlSet\Enum\COM0COM\PORT";
@@ -256,9 +256,10 @@ public sealed class Com0comSetupManager
 
     private static string BuildPortOptions(string? pairPort, TunnelMapping mapping)
     {
-        // The remote UART already provides physical baud pacing. Enabling com0com
-        // baud emulation on the service-owned backing port adds timer latency to
-        // small RFC2217 packets and can break short esptool response deadlines.
+        // The remote UART already provides physical baud pacing. Both com0com
+        // endpoints must therefore leave baud emulation disabled: the visible
+        // port's DCB still drives RFC2217 line settings, while com0com must pass
+        // bytes immediately instead of applying a second local baud-rate timer.
         // Receive-overrun emulation must stay disabled on both endpoints. A flash
         // block is larger than com0com's receive queue, so dropping on overrun can
         // turn one valid SLIP packet into a shorter packet without notifying the

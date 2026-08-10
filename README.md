@@ -370,6 +370,12 @@ RTS/DTR/BREAK and line-control changes can reach the target. It also means the
 hub4com path no longer has VComTunnel's startup-only suppression hook; validate
 it on hardware that can tolerate the initial line state.
 
+Every com0com pair created or repaired by VComTunnel uses
+`EmuBR=no,EmuOverrun=no` on both the visible and backing endpoints. The remote
+UART is the only physical baud-rate clock; com0com must forward bytes with
+backpressure and must not add a second baud timer or silently discard data.
+Existing pairs created by older packages require one explicit pair repair.
+
 ## Phase 1 real device bring-up
 
 For a `com0comHub4com` mapping, install external dependencies and create the

@@ -34,7 +34,7 @@ function Get-Com0comPairOptions {
         $resolved[$spec.Property] = $match.Groups['value'].Value
     }
 
-    if ($resolved.visible -ne 'EmuBR=yes,EmuOverrun=no' -or
+    if ($resolved.visible -ne 'EmuBR=no,EmuOverrun=no' -or
         $resolved.backing -ne 'EmuBR=no,EmuOverrun=no') {
         throw "VirtualCom com0com pair options do not satisfy the reliable flash contract."
     }
