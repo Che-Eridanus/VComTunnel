@@ -47,12 +47,13 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("com0com service startup uses peer serial setting insertions", Com0comServiceStartupUsesPeerSerialSettingInsertionsAsync),
     ("com0com service forwards peer serial setting insertions", Com0comServiceForwardsPeerSerialSettingInsertionsAsync),
     ("com0com service synchronizes modem state before serial data", Com0comServiceSynchronizesModemStateBeforeSerialDataAsync),
+    ("com0com service coalesces already pending serial reads", Com0comServiceCoalescesAlreadyPendingSerialReadsAsync),
     ("running mapping options hot update on save", RunningMappingOptionsHotUpdateOnSaveAsync),
     ("running backend change stops old process on save", RunningBackendChangeStopsOldProcessOnSaveAsync),
     ("deleted mapping stops and removes runtime on save", DeletedMappingStopsAndRemovesRuntimeOnSaveAsync),
     ("restart option hot update cancels pending restart", RestartOptionHotUpdateCancelsPendingRestartAsync),
     ("faulted mapping restart option hot update schedules restart", FaultedMappingRestartOptionHotUpdateSchedulesRestartAsync),
-    ("com0com service RX pipeline writes small chunks", Com0comServiceRxPipelineWritesSmallChunksAsync),
+    ("com0com service RX pipeline writes EmuBR-safe chunks", Com0comServiceRxPipelineWritesEmuBrSafeChunksAsync),
     ("com0com service modem polling forwards RTS", Com0comServiceModemPollingForwardsRtsAsync),
     ("com0com service backing transport is binary clean", () => Task.Run(Com0comServiceBackingTransportIsBinaryClean)),
     ("com0com service builds Win32 device paths", () => Task.Run(Com0comServiceBuildsWin32DevicePaths)),
@@ -1500,6 +1501,73 @@ static async Task Com0comServiceSynchronizesModemStateBeforeSerialDataAsync()
     }
 }
 
+static async Task Com0comServiceCoalescesAlreadyPendingSerialReadsAsync()
+{
+    using var temp = new TempDir();
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var serverReady = new TaskCompletionSource<NetworkStream>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var serverTask = Task.Run(async () =>
+    {
+        using var client = await listener.AcceptTcpClientAsync(cts.Token);
+        TunnelTcpOptions.ConfigureLowLatency(client);
+        var stream = client.GetStream();
+        var buffer = new byte[4096];
+        _ = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token);
+        await stream.WriteAsync(Concat(
+            BuildRfc2217Ack(Rfc2217Client.AckSetLineStateMask, 0xFF),
+            BuildRfc2217Ack(Rfc2217Client.AckSetModemStateMask, 0xFF)), cts.Token);
+        serverReady.TrySetResult(stream);
+        await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+    }, cts.Token);
+
+    var serial = new RecordingSerialPortEndpoint();
+    using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    using var session = new Com0comServiceTunnelSession(
+        new TunnelMapping
+        {
+            Name = "Coalesced serial reads",
+            Backend = TunnelBackend.Com0comService,
+            VisiblePort = "COM93",
+            BackingPort = "CNCB93",
+            Host = IPAddress.Loopback.ToString(),
+            Port = port
+        },
+        log,
+        (_, _) => { },
+        new RecordingSerialPortEndpointFactory(serial));
+
+    try
+    {
+        await session.StartAsync(cts.Token);
+        var stream = await serverReady.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
+        var first = Enumerable.Repeat((byte)0x31, 128).ToArray();
+        var second = Enumerable.Repeat((byte)0x32, 384).ToArray();
+        serial.EnqueueReads(first, second);
+
+        await WaitForStreamBytesAsync(stream, Concat(first, second), TimeSpan.FromSeconds(2));
+        AssertTrue(serial.PendingReadQueryCount > 0, "Serial loop should query bytes already queued by the driver.");
+        AssertTrue(
+            serial.ReadRequestsSnapshot().Any(request => request.Offset == first.Length && request.Count >= second.Length),
+            "The pending chunk should be drained into the unused portion of the current RFC2217 frame.");
+    }
+    finally
+    {
+        session.Dispose();
+        await cts.CancelAsync();
+        listener.Stop();
+        try
+        {
+            await serverTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+}
+
 static async Task RunningMappingOptionsHotUpdateOnSaveAsync()
 {
     using var temp = new TempDir();
@@ -1854,7 +1922,7 @@ static void Com0comServiceBuildsWin32DevicePaths()
     AssertEqual(@"\\.\COM12", InvokeBuildDevicePath("COM12"));
     AssertEqual(@"\\.\COM13", InvokeBuildDevicePath(@"\\.\COM13"));
 }
-static async Task Com0comServiceRxPipelineWritesSmallChunksAsync()
+static async Task Com0comServiceRxPipelineWritesEmuBrSafeChunksAsync()
 {
     using var temp = new TempDir();
     using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -1902,8 +1970,8 @@ static async Task Com0comServiceRxPipelineWritesSmallChunksAsync()
 
         var writes = serial.WriteSizesSnapshot();
         AssertEqual("5", writes.Count.ToString());
-        AssertTrue(writes.All(size => size <= 256), "RFC2217 RX data should be pushed to the local COM in low-latency chunks.");
-        AssertEqual("1", writes[^1].ToString());
+        AssertTrue(writes.Take(4).All(size => size == 256), "EmuBR=no writes should remain bounded to 256 bytes.");
+        AssertEqual("1", writes[4].ToString());
     }
     finally
     {
@@ -4214,6 +4282,8 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
     private SerialPortSettings _settings = new(115200, 8, 0, 0);
     private SerialPeerSettingsInsertion _peerSettingsInsertion = SerialPeerSettingsInsertion.Unavailable();
     private bool _supportsModemStatusEvents;
+    private readonly List<(int Offset, int Count)> _readRequests = [];
+    private int _pendingReadQueryCount;
 
     public bool? Dtr { get; private set; }
     public bool? Rts { get; private set; }
@@ -4229,9 +4299,28 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
     }
 
     public ValueTask<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken)
+        => ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+
+    public ValueTask<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
-        return new ValueTask<int>(WaitForSerialReadAsync(buffer, cancellationToken));
+        lock (_lock)
+        {
+            _readRequests.Add((offset, count));
+        }
+
+        return new ValueTask<int>(WaitForSerialReadAsync(buffer, offset, count, cancellationToken));
     }
+
+    public int GetPendingReadBytes()
+    {
+        lock (_lock)
+        {
+            _pendingReadQueryCount++;
+            return _readChunks.Sum(chunk => chunk.Length);
+        }
+    }
+
+    public int PendingReadQueryCount => Volatile.Read(ref _pendingReadQueryCount);
 
     public ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null)
     {
@@ -4285,10 +4374,16 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
     public void SetSupportsModemStatusEvents(bool enabled) => _supportsModemStatusEvents = enabled;
 
     public void EnqueueRead(byte[] bytes)
+        => EnqueueReads(bytes);
+
+    public void EnqueueReads(params byte[][] chunks)
     {
         lock (_lock)
         {
-            _readChunks.Enqueue(bytes);
+            foreach (var chunk in chunks)
+            {
+                _readChunks.Enqueue(chunk);
+            }
             _readReady.TrySetResult();
         }
     }
@@ -4337,11 +4432,19 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
         }
     }
 
+    public IReadOnlyList<(int Offset, int Count)> ReadRequestsSnapshot()
+    {
+        lock (_lock)
+        {
+            return _readRequests.ToArray();
+        }
+    }
+
     public void Dispose()
     {
     }
 
-    private async Task<int> WaitForSerialReadAsync(byte[] buffer, CancellationToken cancellationToken)
+    private async Task<int> WaitForSerialReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
         while (true)
         {
@@ -4351,13 +4454,24 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
                 if (_readChunks.Count > 0)
                 {
                     var chunk = _readChunks.Dequeue();
-                    if (chunk.Length > buffer.Length)
+                    var copyLength = Math.Min(chunk.Length, count);
+                    if (offset > buffer.Length - copyLength)
                     {
-                        throw new InvalidOperationException("Test serial read chunk is larger than the read buffer.");
+                        throw new InvalidOperationException("Test serial read range exceeds the read buffer.");
                     }
 
-                    Buffer.BlockCopy(chunk, 0, buffer, 0, chunk.Length);
-                    return chunk.Length;
+                    Buffer.BlockCopy(chunk, 0, buffer, offset, copyLength);
+                    if (copyLength < chunk.Length)
+                    {
+                        var queuedAfterChunk = _readChunks.ToArray();
+                        _readChunks.Clear();
+                        _readChunks.Enqueue(chunk.AsSpan(copyLength).ToArray());
+                        foreach (var queued in queuedAfterChunk)
+                        {
+                            _readChunks.Enqueue(queued);
+                        }
+                    }
+                    return copyLength;
                 }
 
                 if (_readReady.Task.IsCompleted)

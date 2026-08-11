@@ -11,8 +11,12 @@ namespace VComTunnel.Core;
 public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 {
     private const int MaxFrameBytes = 4096;
+    // With EmuBR=no the com0com peer does not silently discard excess bytes.
+    // Keep individual writes bounded so a slow visible-COM reader applies
+    // backpressure before the driver's receive queue is overrun.
     private const int SerialRxWriteChunkBytes = 256;
-    private const int SerialRxQueueCapacityChunks = 256;
+    private const int SerialRxQueueCapacityBytes = 64 * 1024;
+    private const int SerialRxQueueCapacityChunks = SerialRxQueueCapacityBytes / SerialRxWriteChunkBytes;
     private const int SerialRxQueueWarnBytes = 32 * 1024;
     private const uint SerialPurgeRxClear = 0x08;
     private const byte Com0comPeerSettingsEscapeChar = 0xFF;
@@ -41,8 +45,8 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         SingleWriter = true,
         FullMode = BoundedChannelFullMode.Wait
     });
-    private readonly ByteThroughputLogThrottle _serialTxLog = new(TimeSpan.FromSeconds(1));
-    private readonly ByteThroughputLogThrottle _serialRxLog = new(TimeSpan.FromSeconds(1));
+    private readonly ByteThroughputLogThrottle _serialTxLog = new(TimeSpan.FromSeconds(5));
+    private readonly ByteThroughputLogThrottle _serialRxLog = new(TimeSpan.FromSeconds(5));
     private readonly Com0comPeerSettingsParser _peerSettingsParser = new(Com0comPeerSettingsEscapeChar);
     private readonly object _serialStateLock = new();
     private readonly CancellationTokenSource _stop = new();
@@ -216,70 +220,99 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                     continue;
                 }
 
-                IReadOnlyList<Com0comSerialInputEvent> events = _peerSettingsInsertionEnabled
-                    ? _peerSettingsParser.Parse(buffer, 0, read)
-                    : [new Com0comSerialInputEvent(buffer.AsMemory(0, read).ToArray(), null)];
-
-                foreach (var inputEvent in events)
+                // Fold only bytes that com0com has already queued into the
+                // current 4 KiB frame. This improves TCP payload density
+                // without adding another queue, worker, timer, or buffer; a
+                // slow network therefore applies backpressure directly to the
+                // virtual COM instead of accumulating hidden data.
+                while (read < buffer.Length)
                 {
-                    if (inputEvent.PeerSettings is { } settings)
+                    var pending = _serial.GetPendingReadBytes();
+                    if (pending <= 0)
                     {
-                        await WriteSerialStateFrameAsync(stream, () => UpdateSerialSettings(settings)).ConfigureAwait(false);
-
-                        continue;
+                        break;
                     }
 
-                    if (inputEvent.SerialData.Length == 0)
+                    var drained = await _serial.ReadAsync(
+                        buffer,
+                        read,
+                        Math.Min(pending, buffer.Length - read),
+                        _stop.Token).ConfigureAwait(false);
+                    if (drained <= 0)
                     {
-                        continue;
+                        break;
                     }
 
-                    var serialData = inputEvent.SerialData;
-                    var requestedBaudRate = _espToolBaudRate.ObserveOutbound(serialData, 0, serialData.Length);
-                    if (requestedBaudRate is not null)
-                    {
-                        _log.Info(_mapping.Name, $"Detected esptool baud-rate change request {requestedBaudRate.Value}.");
-                    }
-
-                    await WaitForRemoteFlowAsync().ConfigureAwait(false);
-                    await _serialOutboundLock.WaitAsync(_stop.Token).ConfigureAwait(false);
-                    try
-                    {
-                        // A visible-COM control IOCTL and its following write can
-                        // wake the modem and data loops at nearly the same time.
-                        // Sample and serialize the current peer state here so an
-                        // esptool synchronization packet cannot overtake DTR/RTS.
-                        var modemFrame = UpdateSerialModemState(
-                            _serial.GetModemStatus(),
-                            SerialPortSnapshot.EventNone);
-                        await WriteSerialStateFrameUnlockedAsync(
-                            stream,
-                            modemFrame.Bytes.Length == 0
-                                ? modemFrame
-                                : modemFrame with { Description = $"{modemFrame.Description} synchronized before serial data" }).ConfigureAwait(false);
-
-                        if (Rfc2217Client.RequiresSerialDataEscaping(serialData, 0, serialData.Length))
-                        {
-                            await WriteNetworkAsync(stream, Rfc2217Client.EscapeSerialData(serialData, 0, serialData.Length)).ConfigureAwait(false);
-                        }
-                        else
-                        {
-                            await WriteNetworkAsync(stream, serialData).ConfigureAwait(false);
-                        }
-                    }
-                    finally
-                    {
-                        _serialOutboundLock.Release();
-                    }
-
-                    LogSerialTx(serialData.Length);
-                    _trafficRecorder?.Record(SerialTrafficDirection.Tx, serialData);
+                    read += drained;
                 }
+
+                await ProcessSerialTxBatchAsync(stream, buffer, read).ConfigureAwait(false);
             }
         }
         catch (Exception ex) when (!_stop.IsCancellationRequested)
         {
             Fault(ex);
+        }
+    }
+
+    private async Task ProcessSerialTxBatchAsync(NetworkStream stream, byte[] buffer, int length)
+    {
+        IReadOnlyList<Com0comSerialInputEvent> events = _peerSettingsInsertionEnabled
+            ? _peerSettingsParser.Parse(buffer, 0, length)
+            : [new Com0comSerialInputEvent(buffer.AsMemory(0, length).ToArray(), null)];
+
+        foreach (var inputEvent in events)
+        {
+            if (inputEvent.PeerSettings is { } settings)
+            {
+                await WriteSerialStateFrameAsync(stream, () => UpdateSerialSettings(settings)).ConfigureAwait(false);
+                continue;
+            }
+
+            if (inputEvent.SerialData.Length == 0)
+            {
+                continue;
+            }
+
+            var serialData = inputEvent.SerialData;
+            var requestedBaudRate = _espToolBaudRate.ObserveOutbound(serialData, 0, serialData.Length);
+            if (requestedBaudRate is not null)
+            {
+                _log.Info(_mapping.Name, $"Detected esptool baud-rate change request {requestedBaudRate.Value}.");
+            }
+
+            await WaitForRemoteFlowAsync().ConfigureAwait(false);
+            await _serialOutboundLock.WaitAsync(_stop.Token).ConfigureAwait(false);
+            try
+            {
+                // A visible-COM control IOCTL and its following write can wake
+                // the modem and data loops at nearly the same time. Serialize
+                // the current peer state before the corresponding data batch.
+                var modemFrame = UpdateSerialModemState(
+                    _serial!.GetModemStatus(),
+                    SerialPortSnapshot.EventNone);
+                await WriteSerialStateFrameUnlockedAsync(
+                    stream,
+                    modemFrame.Bytes.Length == 0
+                        ? modemFrame
+                        : modemFrame with { Description = $"{modemFrame.Description} synchronized before serial data" }).ConfigureAwait(false);
+
+                if (Rfc2217Client.RequiresSerialDataEscaping(serialData, 0, serialData.Length))
+                {
+                    await WriteNetworkAsync(stream, Rfc2217Client.EscapeSerialData(serialData, 0, serialData.Length)).ConfigureAwait(false);
+                }
+                else
+                {
+                    await WriteNetworkAsync(stream, serialData).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                _serialOutboundLock.Release();
+            }
+
+            LogSerialTx(serialData.Length);
+            _trafficRecorder?.Record(SerialTrafficDirection.Tx, serialData);
         }
     }
 
@@ -1255,6 +1288,8 @@ public interface ISerialPortEndpoint : IDisposable
     bool SupportsModemStatusEvents { get; }
     SerialPeerSettingsInsertion EnablePeerSettingsInsertion(byte escapeChar);
     ValueTask<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken);
+    ValueTask<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken);
+    int GetPendingReadBytes();
     ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null);
     SerialPortSnapshot GetSnapshot();
     SerialPortSettings GetSettings();
@@ -1553,6 +1588,9 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
 
         var timeouts = new CommTimeouts
         {
+            // Return bytes already queued by com0com immediately. If the queue
+            // is empty, wait at most 2 ms for the first byte; SerialLoop then
+            // folds any already-pending tail into the same 4 KiB network frame.
             ReadIntervalTimeout = uint.MaxValue,
             ReadTotalTimeoutMultiplier = uint.MaxValue,
             ReadTotalTimeoutConstant = SerialReadFirstByteTimeoutMs,
@@ -1658,11 +1696,35 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     }
 
     public ValueTask<int> ReadAsync(byte[] buffer, CancellationToken cancellationToken)
+        => ReadAsync(buffer, 0, buffer.Length, cancellationToken);
+
+    public ValueTask<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(buffer);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(count);
+        if (offset > buffer.Length - count)
+        {
+            throw new ArgumentException("Serial read range exceeds the destination buffer.");
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         lock (_readLock)
         {
-            return ValueTask.FromResult(ReadOverlapped(buffer, cancellationToken));
+            return ValueTask.FromResult(ReadOverlapped(buffer, offset, count, cancellationToken));
+        }
+    }
+
+    public int GetPendingReadBytes()
+    {
+        lock (_readLock)
+        {
+            if (!ClearCommError(_handle, out _, out var status))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            return checked((int)status.InputQueueBytes);
         }
     }
 
@@ -1848,8 +1910,13 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         _handle.Dispose();
     }
 
-    private int ReadOverlapped(byte[] buffer, CancellationToken cancellationToken)
+    private int ReadOverlapped(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
     {
+        if (count == 0)
+        {
+            return 0;
+        }
+
         var pinned = GCHandle.Alloc(buffer, GCHandleType.Pinned);
         var wait = new ManualResetEvent(false);
         var overlappedPointer = Marshal.AllocHGlobal(Marshal.SizeOf<OverlappedNative>());
@@ -1857,7 +1924,7 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         try
         {
             PrepareOverlapped(overlappedPointer, wait);
-            if (!ReadFile(_handle, pinned.AddrOfPinnedObject(), buffer.Length, out var completedRead, overlappedPointer))
+            if (!ReadFile(_handle, IntPtr.Add(pinned.AddrOfPinnedObject(), offset), count, out var completedRead, overlappedPointer))
             {
                 var error = Marshal.GetLastWin32Error();
                 if (error != ErrorIoPending)
@@ -2082,6 +2149,14 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    private struct CommStatus
+    {
+        public uint Flags;
+        public uint InputQueueBytes;
+        public uint OutputQueueBytes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     private struct Dcb
     {
         public uint DCBlength;
@@ -2123,6 +2198,9 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetCommTimeouts(SafeFileHandle hFile, ref CommTimeouts lpCommTimeouts);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ClearCommError(SafeFileHandle hFile, out uint lpErrors, out CommStatus lpStat);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetCommState(SafeFileHandle hFile, ref Dcb lpDCB);
