@@ -419,7 +419,8 @@ FLOWCONTROL-SUSPEND/RESUME,
 hub4com client-mode purge semantics where local RX clear stays inside the
 virtual COM driver and only TX clear is sent as RFC2217 PURGE-DATA,
 SIGNATURE request response, serialized Telnet/RFC2217 writes with idle NOP
-keep-alive that continues during serial flow-control suspension,
+keep-alive that continues during serial flow-control suspension, plus OS TCP
+keepalive configured as 5 seconds idle / 1 second interval / 3 failed probes,
 modem/line notification handling, and basic wait-mask notifications
 for RX, RXFLAG/EventChar, RX80FULL, TXEMPTY, CTS, DSR, RLSD, RING, BREAK, and
 ERR events,

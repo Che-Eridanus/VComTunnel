@@ -31,8 +31,10 @@ Current scope:
 - Does not require hub4com to be installed or detected.
 - Supports RFC2217 initial negotiation, line/modem notification masks,
   startup serial/control status query, SIGNATURE response, remote
-  FLOWCONTROL-SUSPEND/RESUME, idle NOP keep-alive, and service-level restart
-  after transient network faults.
+  FLOWCONTROL-SUSPEND/RESUME, idle NOP keep-alive, OS TCP keepalive configured
+  as 5 seconds idle / 1 second interval / 3 failed probes, and service-level
+  restart after transient network faults. Keepalive only detects a dead peer;
+  it does not change user-controlled connect, reset, DTR, or RTS behavior.
 - Observes local backing-port CTS/DSR events on the primary serial handle with
   overlapped `WaitCommEvent` and maps the com0com peer state to RFC2217
   DTR/RTS changes, matching the `hub4com` `pinmap` direction for explicit

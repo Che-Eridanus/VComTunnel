@@ -734,6 +734,26 @@ static void TcpTunnelOptionsEnableLowLatency()
     AssertTrue(!client.NoDelay, "TcpClient should expose the platform default before tunnel tuning.");
     TunnelTcpOptions.ConfigureLowLatency(client);
     AssertTrue(client.NoDelay, "RFC2217 tunnel sockets must disable Nagle for low-latency serial traffic.");
+    AssertEqual(
+        "1",
+        Convert.ToInt32(client.Client.GetSocketOption(
+            System.Net.Sockets.SocketOptionLevel.Socket,
+            System.Net.Sockets.SocketOptionName.KeepAlive)).ToString());
+    AssertEqual(
+        "5",
+        Convert.ToInt32(client.Client.GetSocketOption(
+            System.Net.Sockets.SocketOptionLevel.Tcp,
+            System.Net.Sockets.SocketOptionName.TcpKeepAliveTime)).ToString());
+    AssertEqual(
+        "1",
+        Convert.ToInt32(client.Client.GetSocketOption(
+            System.Net.Sockets.SocketOptionLevel.Tcp,
+            System.Net.Sockets.SocketOptionName.TcpKeepAliveInterval)).ToString());
+    AssertEqual(
+        "3",
+        Convert.ToInt32(client.Client.GetSocketOption(
+            System.Net.Sockets.SocketOptionLevel.Tcp,
+            System.Net.Sockets.SocketOptionName.TcpKeepAliveRetryCount)).ToString());
 }
 
 static void FileLogsRotateAndCapArchives()
