@@ -378,7 +378,11 @@ Existing pairs created by older packages require one explicit pair repair.
 When the visible COM reports a baud event, the managed tunnel sends the
 ordered RFC2217 sequence `SET-BAUD/line control -> PURGE-DATA(RX)` before any
 following payload bytes. This removes target RX bytes sampled under the old
-line timing without reintroducing com0com baud emulation.
+line timing without reintroducing com0com baud emulation. The same ordered baud
+event also starts a new local receive generation: pending backing-port writes
+are purged and older bounded-queue chunks are rejected. This preserves active
+backpressure while preventing bytes received with the visible COM closed from
+being replayed into the next flashing or monitor session.
 
 ## Phase 1 real device bring-up
 

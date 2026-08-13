@@ -57,6 +57,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private long _lastNetworkActivityTicks;
     private int _serialRxQueuedBytes;
     private long _serialRxQueueBackpressureLogTicks;
+    private long _serialRxGeneration;
     private ISerialPortEndpoint? _serial;
     private TcpClient? _tcp;
     private Task? _serialLoop;
@@ -443,6 +444,11 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     private Rfc2217OutboundFrame UpdateSerialSettings(Com0comPeerSettingsChange settings)
     {
+        if (settings.BaudRate.HasValue)
+        {
+            BeginVisibleComReceiveGeneration();
+        }
+
         lock (_serialStateLock)
         {
             var previous = _lastSerialSnapshot ?? _serial!.GetSnapshot();
@@ -456,6 +462,23 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                 ? frame
                 : frame with { Description = $"RFC2217 com0com peer serial setting {frame.Description} sent without ACK wait." };
         }
+    }
+
+    private void BeginVisibleComReceiveGeneration()
+    {
+        var generation = Interlocked.Increment(ref _serialRxGeneration);
+        var queuedBytes = Volatile.Read(ref _serialRxQueuedBytes);
+
+        // com0com intentionally keeps EmuOverrun disabled so an active reader
+        // gets lossless backpressure. That also leaves remote bytes pending when
+        // the visible COM is closed. A peer baud insertion is the ordered
+        // visible-session boundary emitted before the new client's payload.
+        // Abort the backing-port write and advance the generation so neither
+        // the driver queue nor our bounded channel can replay an older session.
+        _serial!.PurgePendingWrites();
+        _log.Info(
+            _mapping.Name,
+            $"Started visible-COM RX generation {generation}; purged up to {queuedBytes} queued historical byte(s) before applying peer baud.");
     }
 
     private SerialPortSnapshot ApplyPeerSettingsInsertionEvents(SerialPortSnapshot snapshot, byte[] bytes)
@@ -678,6 +701,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     private async Task EnqueueSerialRxAsync(byte[] bytes)
     {
+        var generation = Volatile.Read(ref _serialRxGeneration);
         var offset = 0;
         while (offset < bytes.Length)
         {
@@ -688,7 +712,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             var waitStarted = Stopwatch.GetTimestamp();
             try
             {
-                await _serialRxQueue.Writer.WriteAsync(new SerialRxChunk(chunk), _stop.Token).ConfigureAwait(false);
+                await _serialRxQueue.Writer.WriteAsync(new SerialRxChunk(chunk, generation), _stop.Token).ConfigureAwait(false);
             }
             catch
             {
@@ -714,7 +738,17 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             {
                 try
                 {
+                    if (chunk.Generation != Volatile.Read(ref _serialRxGeneration))
+                    {
+                        continue;
+                    }
+
                     await _serial!.WriteAsync(chunk.Bytes, _stop.Token, LogSerialRxBackpressure).ConfigureAwait(false);
+                    if (chunk.Generation != Volatile.Read(ref _serialRxGeneration))
+                    {
+                        continue;
+                    }
+
                     LogSerialRx(chunk.Bytes.Length);
                     _trafficRecorder?.Record(SerialTrafficDirection.Rx, chunk.Bytes);
                 }
@@ -1158,7 +1192,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         bool ContinueOnAckTimeout = false,
         bool LogWhenEmpty = false);
 
-    private sealed record SerialRxChunk(byte[] Bytes);
+    private sealed record SerialRxChunk(byte[] Bytes, long Generation);
 
     private sealed record Com0comSerialInputEvent(byte[] SerialData, Com0comPeerSettingsChange? PeerSettings);
 
@@ -1291,6 +1325,7 @@ public interface ISerialPortEndpoint : IDisposable
     ValueTask<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken);
     int GetPendingReadBytes();
     ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null);
+    void PurgePendingWrites();
     SerialPortSnapshot GetSnapshot();
     SerialPortSettings GetSettings();
     void SetSettings(SerialPortSettings settings);
@@ -1531,6 +1566,8 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     private const uint ClearRts = 4;
     private const uint SetDtr = 5;
     private const uint ClearDtr = 6;
+    private const uint PurgeTxAbort = 0x0001;
+    private const uint PurgeTxClear = 0x0004;
     private const uint DcbBinary = 0x00000001;
     private const uint DcbParity = 0x00000002;
     private const uint DcbOutxCtsFlow = 0x00000004;
@@ -1742,6 +1779,14 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         }
 
         return ValueTask.CompletedTask;
+    }
+
+    public void PurgePendingWrites()
+    {
+        if (!PurgeComm(_handle, PurgeTxAbort | PurgeTxClear))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
     }
 
     public SerialPortSnapshot GetSnapshot()
@@ -1967,12 +2012,22 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
                             throw new Win32Exception(error);
                         }
 
-                        completedWritten = WaitForOverlappedResult(
-                            overlappedPointer,
-                            wait,
-                            cancellationToken,
-                            lifetime,
-                            () => backpressure?.Invoke(new SerialPortBackpressureInfo(offset, bytes.Length, Stopwatch.GetElapsedTime(lifetime.StartedTicks))));
+                        try
+                        {
+                            completedWritten = WaitForOverlappedResult(
+                                overlappedPointer,
+                                wait,
+                                cancellationToken,
+                                lifetime,
+                                () => backpressure?.Invoke(new SerialPortBackpressureInfo(offset, bytes.Length, Stopwatch.GetElapsedTime(lifetime.StartedTicks))));
+                        }
+                        catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorOperationAborted && !cancellationToken.IsCancellationRequested)
+                        {
+                            // A peer baud insertion started a new visible-COM
+                            // receive generation and intentionally aborted this
+                            // stale write. The session remains healthy.
+                            return;
+                        }
                     }
 
                     if (completedWritten == 0)
@@ -2201,6 +2256,9 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool ClearCommError(SafeFileHandle hFile, out uint lpErrors, out CommStatus lpStat);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool PurgeComm(SafeFileHandle hFile, uint dwFlags);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetCommState(SafeFileHandle hFile, ref Dcb lpDCB);

@@ -48,6 +48,12 @@ Current scope:
   RFC2217 settings to the remote physical UART.
 - Writes RFC2217 RX data to the local COM side through a bounded small-chunk
   pipeline so the TCP reader is not blocked by normal local COM write latency.
+- Keeps com0com receive-overrun emulation disabled for lossless active-session
+  backpressure, but treats each visible-peer baud insertion as a new local COM
+  receive generation. The service aborts the backing-port pending write and
+  rejects older queued generations before forwarding the new session, so logs
+  received while the visible COM was closed cannot be replayed into esptool or
+  another later serial client.
 - Removes stale runtime entries when a saved mapping is deleted, so `/api/status`
   does not keep advertising a COM mapping that no longer exists in config.
 

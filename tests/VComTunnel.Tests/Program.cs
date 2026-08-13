@@ -54,6 +54,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("restart option hot update cancels pending restart", RestartOptionHotUpdateCancelsPendingRestartAsync),
     ("faulted mapping restart option hot update schedules restart", FaultedMappingRestartOptionHotUpdateSchedulesRestartAsync),
     ("com0com service RX pipeline writes EmuBR-safe chunks", Com0comServiceRxPipelineWritesEmuBrSafeChunksAsync),
+    ("com0com service drops closed-session RX history at peer baud boundary", Com0comServiceDropsClosedSessionRxHistoryAtPeerBaudBoundaryAsync),
     ("com0com service modem polling forwards RTS", Com0comServiceModemPollingForwardsRtsAsync),
     ("com0com service backing transport is binary clean", () => Task.Run(Com0comServiceBackingTransportIsBinaryClean)),
     ("com0com service builds Win32 device paths", () => Task.Run(Com0comServiceBuildsWin32DevicePaths)),
@@ -2007,6 +2008,82 @@ static async Task Com0comServiceRxPipelineWritesEmuBrSafeChunksAsync()
         }
     }
 }
+static async Task Com0comServiceDropsClosedSessionRxHistoryAtPeerBaudBoundaryAsync()
+{
+    using var temp = new TempDir();
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+    var listener = new TcpListener(IPAddress.Loopback, 0);
+    listener.Start();
+    var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+    var serverReady = new TaskCompletionSource<NetworkStream>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var serverTask = Task.Run(async () =>
+    {
+        using var client = await listener.AcceptTcpClientAsync(cts.Token);
+        TunnelTcpOptions.ConfigureLowLatency(client);
+        var stream = client.GetStream();
+        var buffer = new byte[4096];
+        _ = await stream.ReadAsync(buffer.AsMemory(0, buffer.Length), cts.Token);
+        await stream.WriteAsync(Concat(
+            BuildRfc2217Ack(Rfc2217Client.AckSetLineStateMask, 0xFF),
+            BuildRfc2217Ack(Rfc2217Client.AckSetModemStateMask, 0xFF)), cts.Token);
+        serverReady.TrySetResult(stream);
+        await Task.Delay(Timeout.InfiniteTimeSpan, cts.Token);
+    }, cts.Token);
+
+    var serial = new RecordingSerialPortEndpoint();
+    serial.SetPeerSettingsInsertion(new SerialPeerSettingsInsertion(true, []));
+    using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    using var session = new Com0comServiceTunnelSession(
+        new TunnelMapping
+        {
+            Name = "Fresh visible COM RX",
+            Backend = TunnelBackend.Com0comService,
+            VisiblePort = "COM90",
+            BackingPort = "CNCB90",
+            Host = IPAddress.Loopback.ToString(),
+            Port = port
+        },
+        log,
+        (_, _) => { },
+        new RecordingSerialPortEndpointFactory(serial));
+
+    try
+    {
+        await session.StartAsync(cts.Token);
+        var stream = await serverReady.Task.WaitAsync(TimeSpan.FromSeconds(2), cts.Token);
+        serial.BlockWrites();
+        await stream.WriteAsync(Enumerable.Repeat((byte)0x53, 1024).ToArray(), cts.Token);
+        await serial.WaitForWriteStartAsync(TimeSpan.FromSeconds(2));
+
+        serial.EnqueueRead(Com0comPeerBaudInsertion(115200));
+        await serial.WaitForPurgeAsync(TimeSpan.FromSeconds(2));
+        serial.ReleaseWrites();
+
+        var fresh = new byte[] { 0x46, 0x52, 0x45, 0x53, 0x48 };
+        await stream.WriteAsync(fresh, cts.Token);
+        await serial.WaitForTotalBytesAsync(fresh.Length, TimeSpan.FromSeconds(2));
+
+        AssertEqual(fresh.Length.ToString(), serial.TotalBytes.ToString());
+        AssertEqual("1", serial.PurgeCount.ToString());
+        AssertStringContains(
+            string.Join("\n", log.Snapshot().Select(entry => entry.Message)),
+            "Started visible-COM RX generation 1");
+    }
+    finally
+    {
+        session.Dispose();
+        await cts.CancelAsync();
+        listener.Stop();
+        try
+        {
+            await serverTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+    }
+}
+
 static void SerialRxBackpressureInfoReportsRemainingBytes()
 {
     var info = new SerialPortBackpressureInfo(BytesWritten: 17, TotalBytes: 64, Duration: TimeSpan.FromMilliseconds(750));
@@ -4304,6 +4381,11 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
     private bool _supportsModemStatusEvents;
     private readonly List<(int Offset, int Count)> _readRequests = [];
     private int _pendingReadQueryCount;
+    private bool _writesBlocked;
+    private int _writePurgeGeneration;
+    private TaskCompletionSource _writeStateChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _writeStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private TaskCompletionSource _purged = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public bool? Dtr { get; private set; }
     public bool? Rts { get; private set; }
@@ -4342,17 +4424,58 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
 
     public int PendingReadQueryCount => Volatile.Read(ref _pendingReadQueryCount);
 
+    public int TotalBytes => Volatile.Read(ref _totalBytes);
+
+    public int PurgeCount => Volatile.Read(ref _writePurgeGeneration);
+
     public ValueTask WriteAsync(byte[] bytes, CancellationToken cancellationToken, Action<SerialPortBackpressureInfo>? backpressure = null)
+        => new(WriteAsyncCore(bytes, cancellationToken));
+
+    private async Task WriteAsyncCore(byte[] bytes, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        while (true)
+        {
+            int generation;
+            Task waitTask;
+            lock (_lock)
+            {
+                generation = _writePurgeGeneration;
+                if (!_writesBlocked)
+                {
+                    _writeSizes.Add(bytes.Length);
+                    _totalBytes += bytes.Length;
+                    _bytesWritten.TrySetResult();
+                    return;
+                }
+
+                _writeStarted.TrySetResult();
+                if (_writeStateChanged.Task.IsCompleted)
+                {
+                    _writeStateChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                }
+                waitTask = _writeStateChanged.Task;
+            }
+
+            await waitTask.WaitAsync(cancellationToken);
+            lock (_lock)
+            {
+                if (generation != _writePurgeGeneration)
+                {
+                    return;
+                }
+            }
+        }
+    }
+
+    public void PurgePendingWrites()
+    {
         lock (_lock)
         {
-            _writeSizes.Add(bytes.Length);
-            _totalBytes += bytes.Length;
-            _bytesWritten.TrySetResult();
+            _writePurgeGeneration++;
+            _writeStateChanged.TrySetResult();
+            _purged.TrySetResult();
         }
-
-        return ValueTask.CompletedTask;
     }
 
     public SerialPortSnapshot GetSnapshot()
@@ -4457,6 +4580,41 @@ internal sealed class RecordingSerialPortEndpoint : ISerialPortEndpoint
         lock (_lock)
         {
             return _readRequests.ToArray();
+        }
+    }
+
+    public void BlockWrites()
+    {
+        lock (_lock)
+        {
+            _writesBlocked = true;
+            _writeStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _purged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        }
+    }
+
+    public void ReleaseWrites()
+    {
+        lock (_lock)
+        {
+            _writesBlocked = false;
+            _writeStateChanged.TrySetResult();
+        }
+    }
+
+    public Task WaitForWriteStartAsync(TimeSpan timeout)
+    {
+        lock (_lock)
+        {
+            return _writeStarted.Task.WaitAsync(timeout);
+        }
+    }
+
+    public Task WaitForPurgeAsync(TimeSpan timeout)
+    {
+        lock (_lock)
+        {
+            return _purged.Task.WaitAsync(timeout);
         }
     }
 
