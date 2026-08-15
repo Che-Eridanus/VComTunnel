@@ -125,6 +125,11 @@ public sealed class Rfc2217Client
         return BuildSubnegotiation(Signature, Encoding.ASCII.GetBytes(signature));
     }
 
+    public static byte[] BuildBackgroundServiceIdentity()
+    {
+        return BuildSignature(ClientSignature);
+    }
+
     public static Rfc2217ExpectedAck[] BuildInitialExpectedAcks()
     {
         return

@@ -703,9 +703,15 @@ public sealed class TunnelOrchestrator
         StopEndpointConflicts(mapping);
         StopExisting(mapping.Id);
 
+        // com0com replays a both-lines-on snapshot whenever a local application
+        // opens the visible COM endpoint. Defer that ambiguous snapshot until
+        // the next observed state: an immediate both-off transition is the
+        // no-reset attach cycle and is discarded, while a one-line transition
+        // commits the ordered levels required by an explicit ESP reset.
+        var effectiveMapping = mapping with { SuppressInitialControlLineSync = true };
         return await StartManagedSessionAsync(
             mapping,
-            () => _com0comServiceSessionFactory(mapping, _log, (faultedSession, error) => OnSessionFaulted(mapping, faultedSession, error)),
+            () => _com0comServiceSessionFactory(effectiveMapping, _log, (faultedSession, error) => OnSessionFaulted(mapping, faultedSession, error)),
             cancellationToken,
             retryBackingPortRelease: true,
             logStartupFailure: logStartupFailure);

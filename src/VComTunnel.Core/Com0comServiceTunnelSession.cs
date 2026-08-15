@@ -23,6 +23,12 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     private static readonly TimeSpan SerialModemPollInterval = TimeSpan.FromMilliseconds(1);
     private static readonly TimeSpan SerialSettingsPollInterval = TimeSpan.FromMilliseconds(50);
+    // DTR/RTS forwarding is intentionally 1:1: every observed level change is
+    // forwarded as its own frame in arrival order with no reordering, merging,
+    // or hold windows. The device firmware owns the auto-reset interpretation
+    // and debounces the physical RESET commit, so driver open/close bursts do
+    // not reset the target while intentional monitor/esptool sequences pass
+    // through unchanged.
     private static readonly TimeSpan CommandAckTimeout = Rfc2217Client.RecommendedCommandAckTimeout;
     private static readonly TimeSpan KeepAliveInterval = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan KeepAlivePollInterval = TimeSpan.FromSeconds(5);
@@ -67,6 +73,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
     private Task? _serialRxLoop;
     private Task? _keepAliveLoop;
     private SerialPortSnapshot? _lastSerialSnapshot;
+    private PendingInitialControlLineSync? _pendingInitialControlLineSync;
     private bool _peerSettingsInsertionEnabled;
     private int _disposed;
 
@@ -140,6 +147,15 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                 Rfc2217Client.BuildInitialExpectedAcks(),
                 "initial-negotiation",
                 ContinueOnAckTimeout: true)).ConfigureAwait(false);
+
+        // Identify this always-on tunnel before it mirrors the local COM
+        // state. XC-WSER uses the standard SIGNATURE payload only to
+        // distinguish a preemptible background mapping from a foreground
+        // idf.py monitor; it does not grant UART ownership. Older servers may
+        // ignore the advisory query, so startup must not wait for an ACK.
+        await WriteNetworkAsync(
+            stream,
+            Rfc2217Client.BuildBackgroundServiceIdentity()).ConfigureAwait(false);
 
         var startupSnapshot = ApplyPeerSettingsInsertionEvents(_serial.GetSnapshot(), peerSettingsInsertion.InitialBytes);
         var startupSettingsFrame = BuildSettingsChangeFrame(
@@ -291,7 +307,8 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                 // the current peer state before the corresponding data batch.
                 var modemFrame = UpdateSerialModemState(
                     _serial!.GetModemStatus(),
-                    SerialPortSnapshot.EventNone);
+                    SerialPortSnapshot.EventNone,
+                    flushPendingInitialControlLineSync: true);
                 await WriteSerialStateFrameUnlockedAsync(
                     stream,
                     modemFrame.Bytes.Length == 0
@@ -416,7 +433,13 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             }
 
             _lastSerialSnapshot = current;
-            return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone, ForwardControlLines);
+            return CombineFrames(
+                BuildSettingsChangeFrame(previous, current),
+                BuildTrackedModemChangeFrame(
+                    previous,
+                    current,
+                    SerialPortSnapshot.EventNone,
+                    flushPendingInitialControlLineSync: false));
         }
     }
 
@@ -500,7 +523,10 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         return current;
     }
 
-    private Rfc2217OutboundFrame UpdateSerialModemState(uint currentModemStatus, uint eventMask)
+    private Rfc2217OutboundFrame UpdateSerialModemState(
+        uint currentModemStatus,
+        uint eventMask,
+        bool flushPendingInitialControlLineSync = false)
     {
         lock (_serialStateLock)
         {
@@ -512,20 +538,77 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
             var current = previous with { ModemStatus = currentModemStatus };
             _lastSerialSnapshot = current;
-            return BuildModemChangeFrame(previous, current, eventMask, ForwardControlLines);
+            return BuildTrackedModemChangeFrame(
+                previous,
+                current,
+                eventMask,
+                flushPendingInitialControlLineSync);
         }
     }
 
-    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, bool forwardControlLines)
+    private Rfc2217OutboundFrame BuildTrackedModemChangeFrame(
+        SerialPortSnapshot previous,
+        SerialPortSnapshot current,
+        uint eventMask,
+        bool flushPendingInitialControlLineSync)
     {
-        return BuildStateChangeFrame(previous, current, SerialPortSnapshot.EventNone, forwardControlLines);
-    }
+        if (!_mapping.SuppressInitialControlLineSync)
+        {
+            return BuildModemChangeFrame(
+                previous,
+                current,
+                eventMask,
+                ForwardControlLines,
+                suppressInitialControlLineSync: false);
+        }
 
-    private static Rfc2217OutboundFrame BuildStateChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, uint eventMask, bool forwardControlLines)
-    {
-        return CombineFrames(
-            BuildSettingsChangeFrame(previous, current),
-            BuildModemChangeFrame(previous, current, eventMask, forwardControlLines));
+        if (_pendingInitialControlLineSync is { } pending)
+        {
+            const uint peerControlMask = SerialPortSnapshot.Dsr | SerialPortSnapshot.Cts;
+            var currentPeerControl = current.ModemStatus & peerControlMask;
+            if (currentPeerControl == 0)
+            {
+                _pendingInitialControlLineSync = null;
+                return new Rfc2217OutboundFrame(
+                    [],
+                    [],
+                    $"Discarded synthetic com0com attach cycle raw=0x{pending.Previous.ModemStatus:X8}->0x{pending.Current.ModemStatus:X8}->0x{current.ModemStatus:X8}.",
+                    LogWhenEmpty: true);
+            }
+
+            if (flushPendingInitialControlLineSync || currentPeerControl != peerControlMask)
+            {
+                _pendingInitialControlLineSync = null;
+                return BuildDeferredInitialControlLineSyncFrame(
+                    pending.Previous,
+                    pending.Current,
+                    current,
+                    eventMask,
+                    ForwardControlLines);
+            }
+
+            return new Rfc2217OutboundFrame([], [], "initial com0com modem-control sync remains deferred");
+        }
+
+        if (ShouldSuppressInitialControlLineSync(
+                true,
+                previous.ModemStatus,
+                current.ModemStatus))
+        {
+            _pendingInitialControlLineSync = new PendingInitialControlLineSync(previous, current);
+            return new Rfc2217OutboundFrame(
+                [],
+                [],
+                $"Deferred ambiguous initial com0com modem-control sync raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}.",
+                LogWhenEmpty: true);
+        }
+
+        return BuildModemChangeFrame(
+            previous,
+            current,
+            eventMask,
+            ForwardControlLines,
+            suppressInitialControlLineSync: false);
     }
 
     private static Rfc2217OutboundFrame BuildSettingsChangeFrame(
@@ -564,7 +647,12 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         return BuildFrame(frames, descriptions);
     }
 
-    private static Rfc2217OutboundFrame BuildModemChangeFrame(SerialPortSnapshot previous, SerialPortSnapshot current, uint eventMask, bool forwardControlLines)
+    private static Rfc2217OutboundFrame BuildModemChangeFrame(
+        SerialPortSnapshot previous,
+        SerialPortSnapshot current,
+        uint eventMask,
+        bool forwardControlLines,
+        bool suppressInitialControlLineSync)
     {
         var frames = new List<byte[]>();
         var descriptions = new List<string>();
@@ -575,6 +663,18 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         bool? dtr = previousDtr != currentDtr ? currentDtr : null;
         bool? rts = previousRts != currentRts ? currentRts : null;
         var modemChanged = dtr is not null || rts is not null;
+
+        if (ShouldSuppressInitialControlLineSync(
+                suppressInitialControlLineSync,
+                previous.ModemStatus,
+                current.ModemStatus))
+        {
+            return new Rfc2217OutboundFrame(
+                [],
+                [],
+                $"Suppressed initial com0com modem-control sync raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}.",
+                LogWhenEmpty: true);
+        }
 
         // WaitCommEvent only says that a modem input changed before the current
         // snapshot was sampled. If the level is unchanged, the event may be a
@@ -600,6 +700,9 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
         if (modemChanged)
         {
+            // 1:1 forwarding: forward exactly the lines whose observed level
+            // changed, in the order the events arrived. No reordering or
+            // merging; the device debounces the physical RESET commit.
             frames.Add(Rfc2217Client.BuildSetModemControl(dtr, rts));
             descriptions.Add($"TX modem-control raw=0x{previous.ModemStatus:X8}->0x{current.ModemStatus:X8}, dtr={FormatNullableBool(dtr)}, rts={FormatNullableBool(rts)}");
         }
@@ -637,12 +740,82 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     public static bool MapCom0comPeerRts(uint modemStatus) => (modemStatus & SerialPortSnapshot.Cts) != 0;
 
-    public static byte[] BuildCom0comPeerModemControlFrames(uint previousModemStatus, uint currentModemStatus, uint eventMask, bool forwardControlLines = true)
+    public static bool ShouldSuppressInitialControlLineSync(
+        bool suppressEnabled,
+        uint previousModemStatus,
+        uint currentModemStatus)
+    {
+        const uint peerControlMask = SerialPortSnapshot.Dsr | SerialPortSnapshot.Cts;
+        return suppressEnabled
+            && (previousModemStatus & peerControlMask) == 0
+            && (currentModemStatus & peerControlMask) == peerControlMask;
+    }
+
+    public static byte[] BuildCom0comPeerModemControlFrames(
+        uint previousModemStatus,
+        uint currentModemStatus,
+        uint eventMask,
+        bool forwardControlLines = true,
+        bool suppressInitialControlLineSync = false)
     {
         var previous = new SerialPortSnapshot(previousModemStatus, 0, 0, 0, 0);
         var current = previous with { ModemStatus = currentModemStatus };
-        return BuildModemChangeFrame(previous, current, eventMask, forwardControlLines).Bytes;
+        return BuildModemChangeFrame(
+            previous,
+            current,
+            eventMask,
+            forwardControlLines,
+            suppressInitialControlLineSync).Bytes;
     }
+
+    public static byte[] BuildDeferredInitialControlLineSyncFrames(
+        SerialPortSnapshot pendingPrevious,
+        SerialPortSnapshot pendingCurrent,
+        SerialPortSnapshot current,
+        uint eventMask,
+        bool forwardControlLines = true)
+        => BuildDeferredInitialControlLineSyncFrame(
+            pendingPrevious,
+            pendingCurrent,
+            current,
+            eventMask,
+            forwardControlLines).Bytes;
+
+    private static Rfc2217OutboundFrame BuildDeferredInitialControlLineSyncFrame(
+        SerialPortSnapshot pendingPrevious,
+        SerialPortSnapshot pendingCurrent,
+        SerialPortSnapshot current,
+        uint eventMask,
+        bool forwardControlLines)
+    {
+        const uint peerControlMask = SerialPortSnapshot.Dsr | SerialPortSnapshot.Cts;
+        if ((current.ModemStatus & peerControlMask) == 0)
+        {
+            return new Rfc2217OutboundFrame(
+                [],
+                [],
+                $"Discarded synthetic com0com attach cycle raw=0x{pendingPrevious.ModemStatus:X8}->0x{pendingCurrent.ModemStatus:X8}->0x{current.ModemStatus:X8}.",
+                LogWhenEmpty: true);
+        }
+
+        return CombineFrames(
+            BuildModemChangeFrame(
+                pendingPrevious,
+                pendingCurrent,
+                SerialPortSnapshot.EventNone,
+                forwardControlLines,
+                suppressInitialControlLineSync: false),
+            BuildModemChangeFrame(
+                pendingCurrent,
+                current,
+                eventMask,
+                forwardControlLines,
+                suppressInitialControlLineSync: false));
+    }
+
+    private sealed record PendingInitialControlLineSync(
+        SerialPortSnapshot Previous,
+        SerialPortSnapshot Current);
 
     private async Task NetworkLoopAsync()
     {
@@ -1543,6 +1716,17 @@ public sealed class EspToolBaudRateMonitor
 public sealed class Win32SerialPortEndpointFactory : ISerialPortEndpointFactory
 {
     public ISerialPortEndpoint Open(string portName, bool exclusive = false) => Win32SerialPortEndpoint.Open(portName, exclusive);
+
+    /// <summary>
+    /// Opens a port for read-only background logging. The open clears the
+    /// stored DTR/RTS control bits before the first SetCommState so a logging
+    /// session never re-asserts lines left behind by a previous serial tool;
+    /// com0com would otherwise cross those lines to the tunnel session and the
+    /// device auto-reset state machine could drive the target BOOT/RESET pins.
+    /// The caller applies the explicit line policy afterwards.
+    /// </summary>
+    public ISerialPortEndpoint OpenForLogging(string portName, bool exclusive = true) =>
+        Win32SerialPortEndpoint.Open(portName, exclusive, clearModemControlBits: true);
 }
 
 internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
@@ -1600,6 +1784,9 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
     }
 
     public static Win32SerialPortEndpoint Open(string portName, bool exclusive = false)
+        => Open(portName, exclusive, clearModemControlBits: false);
+
+    public static Win32SerialPortEndpoint Open(string portName, bool exclusive, bool clearModemControlBits)
     {
         if (!OperatingSystem.IsWindows())
         {
@@ -1641,7 +1828,7 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
             throw new SerialPortOpenException(portName, path, error, "configure serial port timeouts for");
         }
 
-        if (!ConfigureBinaryBackingTransport(handle))
+        if (!ConfigureBinaryBackingTransport(handle, clearModemControlBits))
         {
             var error = Marshal.GetLastWin32Error();
             handle.Dispose();
@@ -1656,7 +1843,7 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         ? portName
         : $@"\\.\{portName}";
 
-    private static bool ConfigureBinaryBackingTransport(SafeFileHandle handle)
+    private static bool ConfigureBinaryBackingTransport(SafeFileHandle handle, bool clearModemControlBits)
     {
         var dcb = new Dcb { DCBlength = (uint)Marshal.SizeOf<Dcb>() };
         if (!GetCommState(handle, ref dcb))
@@ -1665,6 +1852,10 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
         }
 
         dcb.Flags = NormalizeLocalSerialFlags(dcb.Flags);
+        if (clearModemControlBits)
+        {
+            dcb.Flags = ClearModemControlBits(dcb.Flags);
+        }
         var transportSettings = NormalizeBackingTransportDataFormat(
             new SerialPortSettings(dcb.BaudRate, dcb.ByteSize, dcb.Parity, dcb.StopBits));
         dcb.ByteSize = transportSettings.ByteSize;
@@ -1685,6 +1876,13 @@ internal sealed class Win32SerialPortEndpoint : ISerialPortEndpoint
             | DcbAbortOnError);
         return flags;
     }
+
+    // Read-only logging opens must not re-assert DTR/RTS that a previous serial
+    // tool left enabled in the pair's stored DCB: com0com crosses those lines
+    // to the tunnel session, which forwards them to the device where the
+    // auto-reset state machine can drive the target BOOT/RESET pins.
+    internal static uint ClearModemControlBits(uint flags) =>
+        flags & ~(DcbDtrControlMask | DcbRtsControlMask);
 
     private static SerialPortSettings NormalizeBackingTransportDataFormat(SerialPortSettings settings)
     {

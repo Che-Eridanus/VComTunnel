@@ -30,7 +30,10 @@ Current scope:
   Driver installation or repair remains an explicit elevated setup step.
 - Does not require hub4com to be installed or detected.
 - Supports RFC2217 initial negotiation, line/modem notification masks,
-  startup serial/control status query, SIGNATURE response, remote
+  startup serial/control status query, SIGNATURE response, and an advisory
+  `VComTunnel` SIGNATURE identity for an always-on background mapping. The
+  identity lets XC-WSER distinguish that mapping from a foreground `idf.py`
+  session but never grants UART ownership. Also supports remote
   FLOWCONTROL-SUSPEND/RESUME, idle NOP keep-alive, OS TCP keepalive configured
   as 5 seconds idle / 1 second interval / 3 failed probes, and service-level
   restart after transient network faults. Keepalive only detects a dead peer;
@@ -39,6 +42,16 @@ Current scope:
   overlapped `WaitCommEvent` and maps the com0com peer state to RFC2217
   DTR/RTS changes, matching the `hub4com` `pinmap` direction for explicit
   control-line forwarding.
+- Forwards explicit DTR/RTS changes 1:1 and in arrival order. com0com also
+  reports an ambiguous both-lines-on snapshot whenever an application opens
+  the visible COM port. The service defers only that initial snapshot until
+  the next observed state: an immediate both-off attach cycle is discarded so
+  `idf.py monitor --no-reset` cannot reset the target, while a one-line change
+  commits the deferred levels before forwarding an intentional reset sequence.
+- Read-only background logging opens (Exclusive mode) clear the stored
+  DTR/RTS control bits before the first SetCommState, so a logging session
+  never re-asserts lines left behind by a previous serial tool; the
+  configured DTR/RTS policy is applied explicitly afterwards.
 - Configures the service-owned backing `CNCB` handle as an 8-bit binary byte
   transport. com0com ports can retain a legacy `7E1` DCB from their default or
   previous opener; inheriting that DCB clears payload bit 7 before the service

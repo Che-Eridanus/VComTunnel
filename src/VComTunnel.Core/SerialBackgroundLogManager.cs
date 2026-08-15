@@ -233,7 +233,14 @@ public sealed class SerialBackgroundLogManager : IAsyncDisposable
                 SerialTrafficRecorder? recorder = null;
                 try
                 {
-                    serial = _serialPorts.Open(_mapping.VisiblePort, exclusive: true);
+                    // Open with modem control bits cleared: a logging-only open
+                    // must never re-assert DTR/RTS that a previous serial tool
+                    // left enabled in the pair's stored DCB, because com0com
+                    // crosses those lines to the tunnel session and the device
+                    // auto-reset state machine can reset the target.
+                    serial = _serialPorts is Win32SerialPortEndpointFactory win32
+                        ? win32.OpenForLogging(_mapping.VisiblePort, exclusive: true)
+                        : _serialPorts.Open(_mapping.VisiblePort, exclusive: true);
                     serial.SetSettings(new SerialPortSettings((uint)_mapping.TrafficLog.BaudRate, 8, 0, 0));
                     serial.SetControlLines(
                         ToControlLineValue(_mapping.TrafficLog.Dtr),

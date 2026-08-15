@@ -40,6 +40,8 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("com0com create hints", () => Task.Run(Com0comCreateHints)),
     ("com0com service maps peer modem signals", () => Task.Run(Com0comServiceMapsPeerModemSignals)),
     ("com0com service does not synthesize unobserved RTS pulse", () => Task.Run(Com0comServiceDoesNotSynthesizeUnobservedRtsPulse)),
+    ("com0com service suppresses initial control-line sync", () => Task.Run(Com0comServiceSuppressesInitialControlLineSync)),
+    ("com0com service distinguishes no-reset attach from explicit reset", () => Task.Run(Com0comServiceDistinguishesNoResetAttachFromExplicitReset)),
     ("com0com service control-line switch blocks forwarding", () => Task.Run(Com0comServiceControlLineSwitchBlocksForwarding)),
     ("com0com service runtime control-line update blocks forwarding", () => Task.Run(Com0comServiceRuntimeControlLineUpdateBlocksForwarding)),
     ("com0com service remote serial settings do not overwrite local settings", () => Task.Run(Com0comServiceRemoteSerialSettingsDoNotOverwriteLocalSettings)),
@@ -56,6 +58,8 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("com0com service RX pipeline writes EmuBR-safe chunks", Com0comServiceRxPipelineWritesEmuBrSafeChunksAsync),
     ("com0com service drops closed-session RX history at peer baud boundary", Com0comServiceDropsClosedSessionRxHistoryAtPeerBaudBoundaryAsync),
     ("com0com service modem polling forwards RTS", Com0comServiceModemPollingForwardsRtsAsync),
+    ("com0com service forwards observed line changes 1:1", () => Task.Run(Com0comServiceForwardsObservedLineChangesOneToOne)),
+    ("com0com logging open clears modem control bits", () => Task.Run(Com0comLoggingOpenClearsModemControlBits)),
     ("com0com service backing transport is binary clean", () => Task.Run(Com0comServiceBackingTransportIsBinaryClean)),
     ("com0com service builds Win32 device paths", () => Task.Run(Com0comServiceBuildsWin32DevicePaths)),
     ("serial RX backpressure info reports remaining bytes", () => Task.Run(SerialRxBackpressureInfoReportsRemainingBytes)),
@@ -93,6 +97,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("KMDF mapping reports startup fault", KmdfMappingReportsStartupFaultAsync),
     ("KMDF session restarts after network fault", KmdfSessionRestartsAfterNetworkFaultAsync),
     ("KMDF default start suppresses initial control lines", KmdfDefaultStartSuppressesInitialControlLinesAsync),
+    ("com0com service default start suppresses initial control lines", Com0comServiceDefaultStartSuppressesInitialControlLinesAsync),
     ("KMDF permanent driver faults do not restart", KmdfPermanentDriverFaultDoesNotRestartAsync),
     ("fake hub4com process starts and stops", FakeHub4comProcessStartsAndStopsAsync),
     ("fake hub4com process restarts after exit", FakeHub4comProcessRestartsAfterExitAsync),
@@ -1112,6 +1117,57 @@ static void Com0comServiceDoesNotSynthesizeUnobservedRtsPulse()
         Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(0, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
 }
 
+static void Com0comServiceSuppressesInitialControlLineSync()
+{
+    var bothLinesOn = SerialPortSnapshot.Dsr | SerialPortSnapshot.Cts;
+    AssertBytes(
+        [],
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(
+            0,
+            bothLinesOn,
+            SerialPortSnapshot.EventDsr | SerialPortSnapshot.EventCts,
+            suppressInitialControlLineSync: true));
+    AssertBytes(
+        Rfc2217Client.BuildSetModemControl(true, true),
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(
+            0,
+            bothLinesOn,
+            SerialPortSnapshot.EventDsr | SerialPortSnapshot.EventCts,
+            suppressInitialControlLineSync: false));
+    AssertBytes(
+        Rfc2217Client.BuildSetModemControl(null, true),
+        Com0comServiceTunnelSession.BuildCom0comPeerModemControlFrames(
+            0,
+            SerialPortSnapshot.Cts,
+            SerialPortSnapshot.EventCts,
+            suppressInitialControlLineSync: true));
+}
+
+static void Com0comServiceDistinguishesNoResetAttachFromExplicitReset()
+{
+    var baseline = new SerialPortSnapshot(0, 0, 0, 0, 0);
+    var bothLinesOn = baseline with { ModemStatus = SerialPortSnapshot.Dsr | SerialPortSnapshot.Cts };
+    var dtrFellWhileRtsRemainedOn = baseline with { ModemStatus = SerialPortSnapshot.Cts };
+
+    AssertBytes(
+        [],
+        Com0comServiceTunnelSession.BuildDeferredInitialControlLineSyncFrames(
+            baseline,
+            bothLinesOn,
+            baseline,
+            SerialPortSnapshot.EventDsr | SerialPortSnapshot.EventCts));
+
+    AssertBytes(
+        Rfc2217Client.BuildSetModemControl(true, true)
+            .Concat(Rfc2217Client.BuildSetModemControl(false, null))
+            .ToArray(),
+        Com0comServiceTunnelSession.BuildDeferredInitialControlLineSyncFrames(
+            baseline,
+            bothLinesOn,
+            dtrFellWhileRtsRemainedOn,
+            SerialPortSnapshot.EventDsr));
+}
+
 static void Com0comServiceControlLineSwitchBlocksForwarding()
 {
     AssertBytes(
@@ -1155,6 +1211,75 @@ static void Com0comServiceRuntimeControlLineUpdateBlocksForwarding()
 
     session.UpdateMapping(mapping with { Hub4comForwardControlLines = true });
     AssertBytes(Rfc2217Client.BuildSetModemControl(null, true), InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
+}
+
+static Com0comServiceTunnelSession NewModemBurstSession(InMemoryLog log, RecordingSerialPortEndpoint serial)
+{
+    var session = new Com0comServiceTunnelSession(
+        new TunnelMapping
+        {
+            Name = "Open burst",
+            Backend = TunnelBackend.Com0comService,
+            VisiblePort = "COM91",
+            BackingPort = "CNCB91",
+            Host = "127.0.0.1",
+            Port = 5000,
+            Hub4comForwardControlLines = true
+        },
+        log,
+        (_, _) => { },
+        new RecordingSerialPortEndpointFactory(serial));
+    SetPrivateField(session, "_serial", serial);
+    SetPrivateField(session, "_lastSerialSnapshot", new SerialPortSnapshot(0, 115200, 8, 0, 0));
+    return session;
+}
+
+static void Com0comServiceForwardsObservedLineChangesOneToOne()
+{
+    using var temp = new TempDir();
+    using var log = new InMemoryLog(Path.Combine(temp.Path, "logs"));
+    var serial = new RecordingSerialPortEndpoint();
+
+    // The session forwards exactly the lines whose observed level changed, in
+    // arrival order, with no hold windows, merging, or reordering. The device
+    // firmware owns the auto-reset interpretation and debounces the physical
+    // RESET commit, so burst transients are its responsibility.
+    serial.SetModemStatus(SerialPortSnapshot.Cts);
+    using var session = NewModemBurstSession(log, serial);
+
+    // Lone RTS rise (esptool reset phase / monitor hard reset entry).
+    AssertBytes(Rfc2217Client.BuildSetModemControl(null, true), InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts, SerialPortSnapshot.EventCts));
+    // Lone DTR rise.
+    AssertBytes(Rfc2217Client.BuildSetModemControl(true, null), InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts | SerialPortSnapshot.Dsr, SerialPortSnapshot.EventDsr));
+    // Lone DTR fall while RTS stays asserted (esptool classic reset entry).
+    AssertBytes(Rfc2217Client.BuildSetModemControl(false, null), InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts, SerialPortSnapshot.EventDsr));
+    // Lone RTS fall.
+    AssertBytes(Rfc2217Client.BuildSetModemControl(null, false), InvokeCom0comUpdateSerialModemState(session, 0, SerialPortSnapshot.EventCts));
+    // Same-snapshot pair change forwards both changed lines in one batch.
+    AssertBytes(
+        Rfc2217Client.BuildSetModemControl(true, true),
+        InvokeCom0comUpdateSerialModemState(session, SerialPortSnapshot.Cts | SerialPortSnapshot.Dsr, SerialPortSnapshot.EventCts | SerialPortSnapshot.EventDsr));
+}
+
+static void Com0comLoggingOpenClearsModemControlBits()
+{
+    const uint DtrControlMask = 0x00000030;
+    const uint RtsControlMask = 0x00003000;
+
+    var endpointType = typeof(Com0comServiceTunnelSession).Assembly.GetType("VComTunnel.Core.Win32SerialPortEndpoint")
+        ?? throw new Exception("Win32SerialPortEndpoint reflection target missing.");
+    var method = endpointType.GetMethod(
+        "ClearModemControlBits",
+        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)
+        ?? throw new Exception("ClearModemControlBits reflection target missing.");
+
+    var flags = DtrControlMask | RtsControlMask | 0x00000001 | 0x00000002;
+    var cleared = (uint)(method.Invoke(null, [flags])
+        ?? throw new Exception("ClearModemControlBits returned null."));
+
+    AssertTrue((cleared & DtrControlMask) == 0, "DTR control bits must be cleared for read-only logging opens.");
+    AssertTrue((cleared & RtsControlMask) == 0, "RTS control bits must be cleared for read-only logging opens.");
+    AssertTrue((cleared & 0x00000003) == 0x00000003, "Unrelated DCB bits must survive the clearing.");
 }
 
 static void Com0comServiceRemoteSerialSettingsDoNotOverwriteLocalSettings()
@@ -2302,6 +2427,13 @@ static void Rfc2217CommandEncoding()
     AssertBytes(
         [0xFF, 0xFA, 0x2C, 0x00, 0x56, 0x43, 0x6F, 0x6D, 0xFF, 0xF0],
         Rfc2217Client.BuildSignature("VCom"));
+    AssertBytes(
+        [
+            0xFF, 0xFA, 0x2C, 0x00,
+            0x56, 0x43, 0x6F, 0x6D, 0x54, 0x75, 0x6E, 0x6E, 0x65, 0x6C,
+            0xFF, 0xF0
+        ],
+        Rfc2217Client.BuildBackgroundServiceIdentity());
 
     AssertRfc2217Notifications(
         Rfc2217Client.BuildQuerySerialSettings(),
@@ -3549,6 +3681,37 @@ static async Task KmdfDefaultStartSuppressesInitialControlLinesAsync()
     AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
 }
 
+static async Task Com0comServiceDefaultStartSuppressesInitialControlLinesAsync()
+{
+    using var temp = new TempDir();
+    var mapping = new TunnelMapping
+    {
+        Name = "Default safe com0com service",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM48",
+        BackingPort = "CNCB48",
+        RestartOnFailure = false
+    };
+    var store = await StoreWithMappingAsync(temp.Path, mapping);
+    bool? suppressInitialControlLineSync = null;
+    var orchestrator = CreateOrchestratorWithPorts(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: ""),
+        new InMemoryLog(Path.Combine(temp.Path, "logs")),
+        ["COM48", "CNCB48"],
+        com0comServiceSessionFactory: (sessionMapping, sessionLog, faulted) =>
+        {
+            suppressInitialControlLineSync = sessionMapping.SuppressInitialControlLineSync;
+            return new FakeManagedTunnelSession(faulted, failAfterStart: null);
+        });
+
+    await orchestrator.StartAsync(mapping.Id);
+
+    AssertTrue(suppressInitialControlLineSync == true, "com0com service default start should suppress the initial DTR/RTS sync event.");
+    var status = orchestrator.GetStatus().Tunnels.Single(t => t.Id == mapping.Id);
+    AssertEqual(TunnelRunState.Running.ToString(), status.State.ToString());
+}
+
 static async Task KmdfPermanentDriverFaultDoesNotRestartAsync()
 {
     using var temp = new TempDir();
@@ -4145,7 +4308,7 @@ static byte[] InvokeCom0comUpdateSerialModemState(Com0comServiceTunnelSession se
         "UpdateSerialModemState",
         System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
         ?? throw new Exception("UpdateSerialModemState reflection target missing.");
-    var frame = method.Invoke(session, [currentModemStatus, eventMask])
+    var frame = method.Invoke(session, [currentModemStatus, eventMask, false])
         ?? throw new Exception("UpdateSerialModemState returned null.");
     return (byte[])(frame.GetType().GetProperty("Bytes")?.GetValue(frame)
         ?? throw new Exception("UpdateSerialModemState returned a frame without Bytes."));
