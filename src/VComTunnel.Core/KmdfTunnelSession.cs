@@ -171,9 +171,15 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
         return $@"\\.\VComTunnelCtl_{normalized}";
     }
 
+    internal static IReadOnlyList<string> BuildControlDeviceOpenPaths(string visiblePort) =>
+        [BuildControlDevicePath(visiblePort)];
+
     private static SafeFileHandle OpenDriver(string visiblePort)
     {
-        var attempted = new[] { BuildControlDevicePath(visiblePort), @"\\.\VComTunnelCtl0" };
+        // VComTunnelCtl0 is a legacy process-wide alias. With multiple KMDF
+        // devices it belongs to whichever device created it first, so falling
+        // back to it can attach this mapping to a different COM port.
+        var attempted = BuildControlDeviceOpenPaths(visiblePort);
         foreach (var path in attempted)
         {
             var handle = CreateFileW(
@@ -195,7 +201,8 @@ public sealed class KmdfTunnelSession : IKmdfTunnelSession
 
         throw new Win32Exception(
             Marshal.GetLastWin32Error(),
-            $"Could not open KMDF control channel for {visiblePort}. Tried: {string.Join(", ", attempted)}.");
+            $"Could not open KMDF control channel for {visiblePort}. Port-specific path tried: {string.Join(", ", attempted)}. " +
+            "The legacy global VComTunnelCtl0 alias is not used because it cannot identify a port in multi-COM installations; reinstall or update the KMDF driver if the port-specific channel is missing.");
     }
 
     private void Attach()

@@ -2240,6 +2240,12 @@ static void EspToolBaudMonitorWaitsForResponse()
 static void KmdfControlPathUsesVisibleCom()
 {
     AssertEqual(@"\\.\VComTunnelCtl_COM27", KmdfTunnelSession.BuildControlDevicePath("com27"));
+    var openPaths = KmdfTunnelSession.BuildControlDeviceOpenPaths("com27");
+    AssertEqual("1", openPaths.Count.ToString());
+    AssertEqual(@"\\.\VComTunnelCtl_COM27", openPaths[0]);
+    AssertTrue(
+        !openPaths.Any(path => string.Equals(path, @"\\.\VComTunnelCtl0", StringComparison.OrdinalIgnoreCase)),
+        "KMDF multi-COM sessions must never fall back to the ambiguous legacy global control alias.");
 }
 
 static void KmdfControlLineSwitchBlocksForwarding()
