@@ -191,12 +191,12 @@ public sealed class Com0comSetupManager
                 WorkingDirectory = string.IsNullOrWhiteSpace(plan.WorkingDirectory)
                     ? Environment.CurrentDirectory
                     : plan.WorkingDirectory,
-                // setupc is a driver-management shell utility. Running it with
-                // redirected pipes from a Windows service can leave it waiting
-                // indefinitely before SetupAPI is entered. ShellExecute matches
-                // com0com's supported command-prompt/GUI wrapper path while the
-                // LocalSystem service remains the privilege boundary.
-                UseShellExecute = true,
+                // The LocalSystem service is the privilege boundary. Start
+                // setupc directly in Session 0 and do not redirect its pipes:
+                // ShellExecute can leave an interactive shell child detached
+                // from cancellation, while redirected setupc pipes can block
+                // before the driver operation reaches SetupAPI.
+                UseShellExecute = false,
                 CreateNoWindow = true
             }
         };
@@ -241,6 +241,7 @@ public sealed class Com0comSetupManager
             if (!process.HasExited)
             {
                 process.Kill(entireProcessTree: true);
+                process.WaitForExit((int)TimeSpan.FromSeconds(5).TotalMilliseconds);
             }
         }
         catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception)
