@@ -191,9 +191,12 @@ public sealed class Com0comSetupManager
                 WorkingDirectory = string.IsNullOrWhiteSpace(plan.WorkingDirectory)
                     ? Environment.CurrentDirectory
                     : plan.WorkingDirectory,
-                UseShellExecute = false,
-                RedirectStandardError = true,
-                RedirectStandardOutput = true,
+                // setupc is a driver-management shell utility. Running it with
+                // redirected pipes from a Windows service can leave it waiting
+                // indefinitely before SetupAPI is entered. ShellExecute matches
+                // com0com's supported command-prompt/GUI wrapper path while the
+                // LocalSystem service remains the privilege boundary.
+                UseShellExecute = true,
                 CreateNoWindow = true
             }
         };
@@ -201,23 +204,14 @@ public sealed class Com0comSetupManager
         try
         {
             process.Start();
-            var stdout = process.StandardOutput.ReadToEndAsync();
-            var stderr = process.StandardError.ReadToEndAsync();
             await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
-            var output = (await stderr.ConfigureAwait(false)).Trim();
-            if (string.IsNullOrWhiteSpace(output))
-            {
-                output = (await stdout.ConfigureAwait(false)).Trim();
-            }
 
             return new SetupcCommandRunResult(
                 process.ExitCode == 0,
                 process.ExitCode,
                 process.ExitCode == 0
                     ? null
-                    : string.IsNullOrWhiteSpace(output)
-                        ? $"setupc exited with code {process.ExitCode}."
-                        : output,
+                    : $"setupc exited with code {process.ExitCode}.",
                 plan.Description);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
