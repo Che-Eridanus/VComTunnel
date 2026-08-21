@@ -215,6 +215,7 @@ public sealed record WirelessSerialDeviceEndpoint(
     int? WifiRssi,
     bool? ConfigMode,
     int? Clients,
+    ulong? UptimeMs,
     DateTimeOffset LastSeenAt,
     string Source);
 
@@ -238,7 +239,8 @@ public sealed record WirelessSerialEndpointUpdateRequest(
     int? WifiRssi = null,
     bool? ConfigMode = null,
     int? Clients = null,
-    string? Source = null);
+    string? Source = null,
+    ulong? UptimeMs = null);
 
 [JsonSerializable(typeof(VComTunnelConfig))]
 [JsonSerializable(typeof(TunnelMapping))]

@@ -259,13 +259,15 @@ static void WirelessSerialEndpointRegistryUpdatesEndpoint()
         WifiRssi: -58,
         ConfigMode: false,
         Clients: 1,
-        Source: "test"));
+        Source: "test",
+        UptimeMs: 3_723_000));
 
     AssertEqual("AABBCCDDEEFF", device.Mac);
     AssertEqual("192.168.10.42", device.IpAddress);
     AssertEqual("2217", device.ServicePort?.ToString() ?? "");
     AssertEqual("-58", device.WifiRssi?.ToString() ?? "");
     AssertEqual("东侧机柜", device.Alias ?? "");
+    AssertEqual("3723000", device.UptimeMs?.ToString() ?? "");
 
     var endpoint = registry.FindEndpointByMac("AA-BB-CC-DD-EE-FF");
     AssertEqual("192.168.10.42", endpoint!.Host);
@@ -277,6 +279,7 @@ static void WirelessSerialEndpointRegistryUpdatesEndpoint()
           "proto":"xfg-discovery",
           "ver":1,
           "cmd":"announce",
+          "uptime_ms":9683729,
           "device":{"name":"XFG-N02","id":"unit-02","alias":"西侧机柜","mac":"11:22:33:44:55:66"},
           "net":{"ip":"192.168.10.43","port":5000,"mode":"rfc2217"}
         }
@@ -287,6 +290,7 @@ static void WirelessSerialEndpointRegistryUpdatesEndpoint()
     AssertEqual("112233445566", parsed!.Mac);
     AssertEqual("192.168.10.43", parsed.IpAddress);
     AssertEqual("西侧机柜", parsed.Alias ?? "");
+    AssertEqual("9683729", parsed.UptimeMs?.ToString() ?? "");
 
     var monitorPacket = """
         {

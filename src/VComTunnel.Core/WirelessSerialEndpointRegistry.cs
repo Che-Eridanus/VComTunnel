@@ -101,6 +101,7 @@ public sealed class WirelessSerialEndpointRegistry
             request.WifiRssi,
             request.ConfigMode,
             request.Clients,
+            request.UptimeMs,
             DateTimeOffset.UtcNow,
             EmptyToNull(request.Source) ?? "wireless-serial-app");
         _devices[mac] = endpoint;
@@ -277,7 +278,8 @@ public sealed class WirelessSerialEndpointRegistry
                 Board: GetString(deviceObject, "board"),
                 Firmware: GetString(deviceObject, "firmware"),
                 Mode: mode,
-                Source: "udp"));
+                Source: "udp",
+                UptimeMs: GetUInt64(root, "uptime_ms")));
             return true;
         }
         catch (JsonException)
@@ -636,6 +638,16 @@ public sealed class WirelessSerialEndpointRegistry
             && element.TryGetProperty(propertyName, out var value)
             && value.ValueKind == JsonValueKind.Number
             && value.TryGetInt32(out var result)
+            ? result
+            : null;
+    }
+
+    private static ulong? GetUInt64(JsonElement element, string propertyName)
+    {
+        return element.ValueKind == JsonValueKind.Object
+            && element.TryGetProperty(propertyName, out var value)
+            && value.ValueKind == JsonValueKind.Number
+            && value.TryGetUInt64(out var result)
             ? result
             : null;
     }
