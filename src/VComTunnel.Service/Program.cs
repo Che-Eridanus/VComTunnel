@@ -368,6 +368,58 @@ internal static class VComTunnelHost
             }
         });
 
+        app.MapPost("/api/com0com/mappings/{id}/reset", async (
+            string id,
+            Com0comSetupManager setup,
+            TunnelOrchestrator tunnels,
+            InMemoryLog log,
+            CancellationToken requestToken) =>
+        {
+            try
+            {
+                // Resolve the pair from the saved mapping before stopping it.
+                // The API never accepts an arbitrary PnP instance ID.
+                await setup.BuildRestartPairPlanAsync(id, requestToken);
+                tunnels.Stop(id);
+                var reset = await setup.RestartPairAsync(id, requestToken);
+                if (!reset.Ok)
+                {
+                    log.Error("com0com", $"{reset.Description}: {reset.Error}");
+                    return Results.BadRequest(new
+                    {
+                        error = reset.Error ?? reset.Description,
+                        code = "VCOM_PAIR_RESET_FAILED",
+                        reset
+                    });
+                }
+
+                log.Info("com0com", reset.Description);
+                await Task.Delay(TimeSpan.FromMilliseconds(500), requestToken);
+                var status = await tunnels.StartAsync(id, requestToken);
+                if (status.State != TunnelRunState.Running)
+                {
+                    return Results.BadRequest(new
+                    {
+                        error = status.LastError ?? $"Mapping restart ended in state {status.State}.",
+                        code = "VCOM_MAPPING_RESTART_FAILED",
+                        reset,
+                        status
+                    });
+                }
+
+                return Results.Ok(status);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                return Results.NotFound(new { error = ex.Message });
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or IOException)
+            {
+                log.Error("com0com", $"Mapping reset failed for {id}: {ex.Message}");
+                return Results.BadRequest(new { error = ex.Message });
+            }
+        });
+
         app.MapPost("/api/com0com/pairs/{pairNumber:int}/remove-plan", (
             int pairNumber,
             Com0comSetupManager setup) =>

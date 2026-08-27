@@ -63,6 +63,44 @@ public sealed class Com0comSetupManager
         return await RunPlanAsync(plan, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<SetupcCommandPlan> BuildRestartPairPlanAsync(
+        string mappingId,
+        CancellationToken cancellationToken = default)
+    {
+        var mapping = await GetMappingAsync(mappingId, cancellationToken).ConfigureAwait(false);
+        if (mapping.Backend is not (TunnelBackend.Com0comHub4com or TunnelBackend.Com0comService))
+        {
+            throw new InvalidOperationException("Only com0com mappings can restart a com0com pair.");
+        }
+
+        if (string.IsNullOrWhiteSpace(mapping.BackingPort))
+        {
+            throw new InvalidOperationException("backingPort is required for com0com pair restart.");
+        }
+
+        var pair = _comPortInventory.GetCom0comPairs()
+            .FirstOrDefault(item => item.IsComplete && PairMatchesMapping(item, mapping))
+            ?? throw new InvalidOperationException(
+                $"The complete com0com pair for {mapping.VisiblePort} <-> {mapping.BackingPort} was not found.");
+        var pnpUtil = _dependencyDetector.FindPnpUtil()
+            ?? throw new FileNotFoundException("Windows pnputil.exe was not found.");
+        var instanceId = $@"ROOT\COM0COM\{pair.PairNumber:D4}";
+        return new SetupcCommandPlan(
+            pnpUtil,
+            Path.GetDirectoryName(pnpUtil),
+            $"/restart-device \"{instanceId}\"",
+            RequiresElevation: true,
+            $"Restart com0com pair {pair.PairNumber} ({mapping.VisiblePort} <-> {mapping.BackingPort})");
+    }
+
+    public async Task<SetupcCommandRunResult> RestartPairAsync(
+        string mappingId,
+        CancellationToken cancellationToken = default)
+    {
+        var plan = await BuildRestartPairPlanAsync(mappingId, cancellationToken).ConfigureAwait(false);
+        return await RunPlanAsync(plan, cancellationToken).ConfigureAwait(false);
+    }
+
     private IReadOnlyList<SetupcCommandPlan> BuildRepairPlans(Com0comPairInfo pair, TunnelMapping mapping)
     {
         if (pair.PairNumber < 0)
@@ -206,21 +244,23 @@ public sealed class Com0comSetupManager
             process.Start();
             await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
 
+            var commandName = Path.GetFileName(plan.FileName);
             return new SetupcCommandRunResult(
                 process.ExitCode == 0,
                 process.ExitCode,
                 process.ExitCode == 0
                     ? null
-                    : $"setupc exited with code {process.ExitCode}.",
+                    : $"{commandName} exited with code {process.ExitCode}.",
                 plan.Description);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             TryKill(process);
+            var commandName = Path.GetFileName(plan.FileName);
             return new SetupcCommandRunResult(
                 false,
                 null,
-                $"setupc timed out after {SetupcRunTimeout.TotalSeconds:0} seconds.",
+                $"{commandName} timed out after {SetupcRunTimeout.TotalSeconds:0} seconds.",
                 plan.Description);
         }
         catch (OperationCanceledException)

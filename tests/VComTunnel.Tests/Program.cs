@@ -94,6 +94,7 @@ var tests = new List<(string Name, Func<Task> Test)>
     ("stale stopped session fault is ignored", StaleStoppedSessionFaultIsIgnoredAsync),
     ("com0com service backing open diagnostics", () => Task.Run(Com0comServiceBackingOpenDiagnostics)),
     ("com0com create and remove plans", Com0comCreateAndRemovePlansAsync),
+    ("com0com mapping reset plan is scoped to its pair", Com0comMappingResetPlanIsScopedAsync),
     ("KMDF mapping reports startup fault", KmdfMappingReportsStartupFaultAsync),
     ("KMDF session restarts after network fault", KmdfSessionRestartsAfterNetworkFaultAsync),
     ("KMDF default start suppresses initial control lines", KmdfDefaultStartSuppressesInitialControlLinesAsync),
@@ -3845,6 +3846,46 @@ static async Task Com0comCreateAndRemovePlansAsync()
     {
         AssertStringContains(ex.Message, "already exists");
     }
+}
+
+static async Task Com0comMappingResetPlanIsScopedAsync()
+{
+    using var temp = new TempDir();
+    CreateFakeDependencies(temp.Path);
+    var pnpUtil = Path.Combine(temp.Path, "pnputil.exe");
+    File.WriteAllText(pnpUtil, "");
+    var mapping = new TunnelMapping
+    {
+        Id = "xfg-wifi-com34",
+        Name = "ADL400(9600)",
+        Backend = TunnelBackend.Com0comService,
+        VisiblePort = "COM34",
+        BackingPort = "CNCB34",
+        Host = "10.0.3.31",
+        Port = 2217
+    };
+    var store = new ConfigStore(Path.Combine(temp.Path, "config.json"));
+    await store.SaveAsync(new VComTunnelConfig { Mappings = [mapping] });
+    var inventory = new FakeComPortInventory(
+        ["COM33", "CNCB33", "COM34", "CNCB34"],
+        [
+            new Com0comPairInfo(3, "COM33", "CNCB33", @"\Device\com0com13", @"\Device\com0com23", true),
+            new Com0comPairInfo(4, "CNCB34", "COM34", @"\Device\com0com14", @"\Device\com0com24", true)
+        ]);
+    var manager = new Com0comSetupManager(
+        store,
+        new DependencyDetector([temp.Path], pathOverride: temp.Path),
+        inventory);
+
+    var plan = await manager.BuildRestartPairPlanAsync(mapping.Id);
+
+    AssertEqual(pnpUtil, plan.FileName);
+    AssertEqual("/restart-device \"ROOT\\COM0COM\\0004\"", plan.Arguments);
+    AssertTrue(plan.RequiresElevation, "Pair restart must remain inside the elevated service boundary.");
+    AssertStringContains(plan.Description, "COM34 <-> CNCB34");
+    AssertTrue(
+        !plan.Arguments.Contains("0003", StringComparison.Ordinal),
+        "A mapping-level restart must not touch an unrelated com0com pair.");
 }
 
 static async Task FakeHub4comProcessStartsAndStopsAsync()

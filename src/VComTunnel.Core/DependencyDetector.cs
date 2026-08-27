@@ -17,7 +17,7 @@ public sealed class DependencyDetector
         var setupc = FindSetupc();
         var hub4com = FindExecutable("hub4com.exe");
         var com2tcp = FindExecutable("com2tcp-rfc2217.bat");
-        var pnputil = FindOnPath("pnputil.exe");
+        var pnputil = FindPnpUtil();
 
         var items = new List<DependencyStatus>
         {
@@ -40,6 +40,8 @@ public sealed class DependencyDetector
     public string? FindCom2TcpRfc2217() => FindExecutable("com2tcp-rfc2217.bat");
 
     public string? FindSetupc() => FindExecutable("setupc.exe", includeToolsCache: false);
+
+    public string? FindPnpUtil() => FindOnPath("pnputil.exe");
 
     private static DependencyStatus ToStatus(string name, string? path, string missingMessage)
     {
