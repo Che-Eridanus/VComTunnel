@@ -11,6 +11,7 @@ namespace VComTunnel.Core;
 public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 {
     private const int MaxFrameBytes = 4096;
+    private const int SerialInitialReadBytes = 1;
     // With EmuBR=no the com0com peer does not silently discard excess bytes.
     // Keep individual writes bounded so a slow visible-COM reader applies
     // backpressure before the driver's receive queue is overrun.
@@ -231,7 +232,15 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             var buffer = new byte[MaxFrameBytes];
             while (!_stop.IsCancellationRequested)
             {
-                var read = await _serial!.ReadAsync(buffer, _stop.Token).ConfigureAwait(false);
+                // Some com0com builds do not complete a large overlapped read
+                // when a short frame arrives. Arm the idle read for one byte so
+                // the first byte wakes the bridge immediately, then coalesce
+                // only bytes that the driver already reports as pending below.
+                var read = await _serial!.ReadAsync(
+                    buffer,
+                    0,
+                    SerialInitialReadBytes,
+                    _stop.Token).ConfigureAwait(false);
                 if (read <= 0)
                 {
                     continue;
