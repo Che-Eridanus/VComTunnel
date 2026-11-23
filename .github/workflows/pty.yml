@@ -1,0 +1,39 @@
+name: Unix PTY smoke
+
+on:
+  push:
+    branches: [dev/wserial-unix-pty]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pty:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            runtime: osx-arm64
+          - runner: macos-15-intel
+            runtime: osx-x64
+          - runner: ubuntu-22.04
+            runtime: linux-x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Publish PTY service
+        run: >-
+          dotnet publish src/VComTunnel.Service/VComTunnel.Service.csproj
+          -c Release -r ${{ matrix.runtime }} --self-contained true
+          -o "$RUNNER_TEMP/virtualcom"
+      - name: Test real PTY and RFC2217 loopback
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pty-test"
+          "$RUNNER_TEMP/pty-test/bin/pip" install pyserial==3.5
+          "$RUNNER_TEMP/pty-test/bin/python" scripts/tests/test_pty_transport.py "$RUNNER_TEMP/virtualcom/VComTunnel.Service"

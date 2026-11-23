@@ -23,7 +23,12 @@ public static class ConfigValidator
                 errors.Add($"Duplicate mapping id '{mapping.Id}'.");
             }
 
-            if (!IsComPort(mapping.VisiblePort))
+            var pty = mapping.Backend == TunnelBackend.Pty;
+            if (pty && !IsPtyPath(mapping.VisiblePort))
+            {
+                errors.Add($"{mapping.Name}: visiblePort must be an absolute PTY link path.");
+            }
+            else if (!pty && !IsComPort(mapping.VisiblePort))
             {
                 errors.Add($"{mapping.Name}: visiblePort must look like COM12.");
             }
@@ -54,6 +59,11 @@ public static class ConfigValidator
                 errors.Add($"{mapping.Name}: backingPort must be empty for kmdf mappings.");
             }
 
+            if (pty && !string.IsNullOrWhiteSpace(mapping.BackingPort))
+            {
+                errors.Add($"{mapping.Name}: backingPort must be empty for PTY mappings.");
+            }
+
             if (!IsValidHost(mapping.Host))
             {
                 errors.Add($"{mapping.Name}: host is not a valid DNS name or IP address.");
@@ -71,9 +81,9 @@ public static class ConfigValidator
 
             if (mapping.WirelessSerialAutoDiscover)
             {
-                if (mapping.Backend != TunnelBackend.Com0comService)
+                if (mapping.Backend is not (TunnelBackend.Com0comService or TunnelBackend.Pty))
                 {
-                    errors.Add($"{mapping.Name}: wirelessSerialAutoDiscover requires the com0comService backend.");
+                    errors.Add($"{mapping.Name}: wirelessSerialAutoDiscover requires the com0comService or pty backend.");
                 }
 
                 if (string.IsNullOrWhiteSpace(mapping.WirelessSerialMac))
@@ -94,9 +104,10 @@ public static class ConfigValidator
             }
             else
             {
-                if (trafficLog.Enabled && mapping.Backend != TunnelBackend.Com0comService)
+                if (trafficLog.Enabled && mapping.Backend != TunnelBackend.Com0comService
+                    && !(pty && trafficLog.Mode == SerialTrafficLogMode.InUse))
                 {
-                    errors.Add($"{mapping.Name}: trafficLog requires the com0comService backend.");
+                    errors.Add($"{mapping.Name}: trafficLog requires com0comService or an active PTY tunnel.");
                 }
 
                 if (trafficLog.Enabled && !trafficLog.CaptureRx && !trafficLog.CaptureTx)
@@ -143,6 +154,13 @@ public static class ConfigValidator
 
         return errors;
     }
+
+    private static bool IsPtyPath(string? path) =>
+        path is { Length: > 1 }
+        && path[0] == '/'
+        && path[^1] != '/'
+        && !path.Contains('\0')
+        && path.Split('/').All(segment => segment is not ("." or ".."));
 
     public static bool IsComPort(string? port)
     {

@@ -12,7 +12,9 @@ public static class AppPaths
                 return overrideRoot;
             }
 
-            var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            var programData = Environment.GetFolderPath(OperatingSystem.IsWindows()
+                ? Environment.SpecialFolder.CommonApplicationData
+                : Environment.SpecialFolder.LocalApplicationData);
             if (string.IsNullOrWhiteSpace(programData))
             {
                 programData = Environment.CurrentDirectory;

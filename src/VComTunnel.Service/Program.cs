@@ -2,6 +2,7 @@ using System.ServiceProcess;
 using System.IO.Pipes;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Runtime.Versioning;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Connections;
@@ -10,7 +11,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.AspNetCore.Server.Kestrel.Transport.NamedPipes;
 using VComTunnel.Core;
 
-if (ShouldRunAsWindowsService(args))
+if (OperatingSystem.IsWindows() && ShouldRunAsWindowsService(args))
 {
     ServiceBase.Run(new VComTunnelWindowsService(args));
 }
@@ -35,51 +36,18 @@ internal static class VComTunnelHost
         builder.WebHost.ConfigureKestrel(options =>
         {
             options.ListenLocalhost(ServiceEndpoint.GetBaseUri().Port);
-            options.ListenNamedPipe(ServiceEndpoint.GetControlPipeName(), listenOptions =>
+            if (OperatingSystem.IsWindows())
             {
-                listenOptions.Protocols = HttpProtocols.Http1;
-            });
-        });
-        builder.WebHost.UseNamedPipes(options =>
-        {
-            // The service is the privilege boundary. Interactive local users
-            // may request product-scoped operations without another UAC prompt;
-            // remote and anonymous tokens are denied at the transport layer.
-            var pipeSecurity = new PipeSecurity();
-            pipeSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-            var serviceIdentity = WindowsIdentity.GetCurrent().User;
-            if (serviceIdentity is not null)
-            {
-                pipeSecurity.AddAccessRule(new PipeAccessRule(
-                    serviceIdentity,
-                    PipeAccessRights.FullControl,
-                    AccessControlType.Allow));
+                options.ListenNamedPipe(ServiceEndpoint.GetControlPipeName(), listenOptions =>
+                {
+                    listenOptions.Protocols = HttpProtocols.Http1;
+                });
             }
-            pipeSecurity.AddAccessRule(CreatePipeRule(
-                WellKnownSidType.LocalSystemSid,
-                PipeAccessRights.FullControl,
-                AccessControlType.Allow));
-            pipeSecurity.AddAccessRule(CreatePipeRule(
-                WellKnownSidType.BuiltinAdministratorsSid,
-                PipeAccessRights.FullControl,
-                AccessControlType.Allow));
-            pipeSecurity.AddAccessRule(CreatePipeRule(
-                WellKnownSidType.BuiltinUsersSid,
-                PipeAccessRights.ReadWrite,
-                AccessControlType.Allow));
-            pipeSecurity.AddAccessRule(CreatePipeRule(
-                WellKnownSidType.NetworkSid,
-                PipeAccessRights.FullControl,
-                AccessControlType.Deny));
-            pipeSecurity.AddAccessRule(CreatePipeRule(
-                WellKnownSidType.AnonymousSid,
-                PipeAccessRights.FullControl,
-                AccessControlType.Deny));
-            options.CurrentUserOnly = false;
-            options.PipeSecurity = pipeSecurity;
-            options.MaxReadBufferSize = 1024 * 1024;
-            options.MaxWriteBufferSize = 1024 * 1024;
         });
+        if (OperatingSystem.IsWindows())
+        {
+            ConfigureWindowsPipe(builder.WebHost);
+        }
         builder.Services.AddSingleton<ConfigStore>();
         builder.Services.AddSingleton<DependencyDetector>();
         builder.Services.AddSingleton<DependencyInstaller>();
@@ -116,7 +84,8 @@ internal static class VComTunnelHost
             var protectedControlTransport = localEndpoint is NamedPipeEndPoint
                 || (context.Connection.LocalIpAddress is null
                     && context.Connection.RemoteIpAddress is null);
-            if (ServiceControlPolicy.RequiresProtectedTransport(context.Request.Method)
+            if (OperatingSystem.IsWindows()
+                && ServiceControlPolicy.RequiresProtectedTransport(context.Request.Method)
                 && !protectedControlTransport)
             {
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -125,6 +94,15 @@ internal static class VComTunnelHost
                     error = "State-changing VirtualCom requests require the protected local control channel.",
                     code = "VCOM_CONTROL_CHANNEL_REQUIRED"
                 });
+                return;
+            }
+
+            if (!OperatingSystem.IsWindows()
+                && (context.Request.Path.StartsWithSegments("/api/com0com")
+                    || context.Request.Path.StartsWithSegments("/api/kmdf")
+                    || context.Request.Path == "/api/dependencies/install"))
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
                 return;
             }
 
@@ -217,6 +195,11 @@ internal static class VComTunnelHost
             SerialBackgroundLogManager backgroundLogs,
             CancellationToken requestToken) =>
         {
+            if (!OperatingSystem.IsWindows() && mappings.Any(mapping => mapping.Backend != TunnelBackend.Pty))
+            {
+                return Results.BadRequest(new { errors = new[] { "Linux and macOS mappings require the pty backend." } });
+            }
+
             var errors = await tunnels.SaveConfigAsync(new VComTunnelConfig { Mappings = mappings }, requestToken);
             if (errors.Count > 0)
             {
@@ -515,6 +498,52 @@ internal static class VComTunnelHost
         await app.RunAsync(cancellationToken);
     }
 
+    [SupportedOSPlatform("windows")]
+    private static void ConfigureWindowsPipe(IWebHostBuilder webHost)
+    {
+        webHost.UseNamedPipes(options =>
+        {
+            // The service is the privilege boundary. Interactive local users
+            // may request product-scoped operations without another UAC prompt;
+            // remote and anonymous tokens are denied at the transport layer.
+            var pipeSecurity = new PipeSecurity();
+            pipeSecurity.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+            var serviceIdentity = WindowsIdentity.GetCurrent().User;
+            if (serviceIdentity is not null)
+            {
+                pipeSecurity.AddAccessRule(new PipeAccessRule(
+                    serviceIdentity,
+                    PipeAccessRights.FullControl,
+                    AccessControlType.Allow));
+            }
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.LocalSystemSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.BuiltinAdministratorsSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Allow));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.BuiltinUsersSid,
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.NetworkSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Deny));
+            pipeSecurity.AddAccessRule(CreatePipeRule(
+                WellKnownSidType.AnonymousSid,
+                PipeAccessRights.FullControl,
+                AccessControlType.Deny));
+            options.CurrentUserOnly = false;
+            options.PipeSecurity = pipeSecurity;
+            options.MaxReadBufferSize = 1024 * 1024;
+            options.MaxWriteBufferSize = 1024 * 1024;
+        });
+    }
+
+    [SupportedOSPlatform("windows")]
     private static PipeAccessRule CreatePipeRule(
         WellKnownSidType sidType,
         PipeAccessRights rights,
@@ -528,6 +557,7 @@ internal static class VComTunnelHost
     }
 }
 
+[SupportedOSPlatform("windows")]
 internal sealed class VComTunnelWindowsService : ServiceBase
 {
     private readonly string[] _args;
@@ -587,31 +617,34 @@ internal sealed class AutoStartHostedService : BackgroundService
     {
         try
         {
-            await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
-            try
+            if (OperatingSystem.IsWindows())
             {
-                using var repairTimeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-                repairTimeout.CancelAfter(TimeSpan.FromSeconds(15));
-                var repairs = await _com0comSetup.RepairConfiguredPairsAsync(repairTimeout.Token);
-                foreach (var repair in repairs)
+                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+                try
                 {
-                    if (repair.Ok)
+                    using var repairTimeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+                    repairTimeout.CancelAfter(TimeSpan.FromSeconds(15));
+                    var repairs = await _com0comSetup.RepairConfiguredPairsAsync(repairTimeout.Token);
+                    foreach (var repair in repairs)
                     {
-                        _log.Info("com0com", repair.Description);
-                    }
-                    else
-                    {
-                        _log.Error("com0com", $"{repair.Description}: {repair.Error}");
+                        if (repair.Ok)
+                        {
+                            _log.Info("com0com", repair.Description);
+                        }
+                        else
+                        {
+                            _log.Error("com0com", $"{repair.Description}: {repair.Error}");
+                        }
                     }
                 }
-            }
-            catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
-            {
-                _log.Warn("com0com", "Configured pair repair timed out; continuing with AutoStart mappings.");
-            }
-            catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or IOException)
-            {
-                _log.Warn("com0com", $"Configured pair repair skipped: {ex.Message}");
+                catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested)
+                {
+                    _log.Warn("com0com", "Configured pair repair timed out; continuing with AutoStart mappings.");
+                }
+                catch (Exception ex) when (ex is FileNotFoundException or InvalidOperationException or IOException)
+                {
+                    _log.Warn("com0com", $"Configured pair repair skipped: {ex.Message}");
+                }
             }
 
             try
@@ -639,6 +672,10 @@ internal sealed class AutoStartHostedService : BackgroundService
         }
         finally
         {
+            foreach (var tunnel in _tunnels.GetStatus().Tunnels.Where(tunnel => tunnel.Backend == "pty"))
+            {
+                _tunnels.Stop(tunnel.Id);
+            }
             await _backgroundLogs.DisposeAsync();
         }
     }

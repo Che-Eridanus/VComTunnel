@@ -88,7 +88,9 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
         _forwardControlLines = mapping.Hub4comForwardControlLines ? 1 : 0;
         _log = log;
         _faulted = faulted;
-        _serialPorts = serialPorts ?? new Win32SerialPortEndpointFactory();
+        _serialPorts = serialPorts ?? (mapping.Backend == TunnelBackend.Pty
+            ? new PtyPortEndpointFactory()
+            : new Win32SerialPortEndpointFactory());
         if (mapping.TrafficLog?.Enabled == true
             && mapping.TrafficLog.Mode == SerialTrafficLogMode.InUse)
         {
@@ -110,14 +112,16 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
-        if (string.IsNullOrWhiteSpace(_mapping.BackingPort))
+        var pty = _mapping.Backend == TunnelBackend.Pty;
+        var localPort = pty ? _mapping.VisiblePort : _mapping.BackingPort;
+        if (string.IsNullOrWhiteSpace(localPort))
         {
             throw new InvalidOperationException("backingPort is required for com0comService mappings.");
         }
 
         try
         {
-            _serial = _serialPorts.Open(_mapping.BackingPort, exclusive: true);
+            _serial = _serialPorts.Open(localPort, exclusive: true);
         }
         catch (SerialPortOpenException ex)
         {
@@ -172,12 +176,12 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                 "startup-control-state-query")).ConfigureAwait(false);
 
         State = TunnelRunState.Running;
-        _log.Info(_mapping.Name, $"Started com0com service tunnel {_mapping.BackingPort} -> {_mapping.Host}:{_mapping.Port}.");
-        if (_peerSettingsInsertionEnabled)
+        _log.Info(_mapping.Name, $"Started {(pty ? "PTY" : "com0com service")} tunnel {localPort} -> {_mapping.Host}:{_mapping.Port}.");
+        if (!pty && _peerSettingsInsertionEnabled)
         {
             _log.Info(_mapping.Name, "com0com peer serial-setting events enabled through IOCTL_SERIAL_LSRMST_INSERT for baud/data/parity/stop.");
         }
-        else
+        else if (!pty)
         {
             var peerSettingsMessage = string.IsNullOrWhiteSpace(peerSettingsInsertion.Message) ? "" : $" ({peerSettingsInsertion.Message})";
             _log.Info(_mapping.Name, $"com0com peer serial-setting events unavailable; falling back to {SerialSettingsPollInterval.TotalMilliseconds:0} ms local DCB polling for baud/data/parity/stop{peerSettingsMessage}.");
@@ -188,12 +192,12 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
             _lastSerialSnapshot = startupSnapshot;
         }
 
-        if (!_serial.SupportsModemStatusEvents)
+        if (!pty && !_serial.SupportsModemStatusEvents)
         {
             _log.Warn(_mapping.Name, $"Serial modem-control events are unavailable; falling back to dedicated {SerialModemPollInterval.TotalMilliseconds:0} ms polling for DTR/RTS.");
             _serialModemLoop = Task.Run(SerialModemPollingLoopAsync);
         }
-        else
+        else if (!pty)
         {
             _log.Info(_mapping.Name, "Serial modem-control events enabled through overlapped WaitCommEvent for DTR/RTS.");
             _serialModemLoop = Task.Run(SerialModemEventLoopAsync);
@@ -239,7 +243,7 @@ public sealed class Com0comServiceTunnelSession : IManagedTunnelSession
                 var read = await _serial!.ReadAsync(
                     buffer,
                     0,
-                    SerialInitialReadBytes,
+                    _mapping.Backend == TunnelBackend.Pty ? buffer.Length : SerialInitialReadBytes,
                     _stop.Token).ConfigureAwait(false);
                 if (read <= 0)
                 {

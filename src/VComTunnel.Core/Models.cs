@@ -6,7 +6,8 @@ public enum TunnelBackend
 {
     Com0comHub4com,
     Com0comService,
-    Kmdf
+    Kmdf,
+    Pty
 }
 
 public enum TunnelProtocol

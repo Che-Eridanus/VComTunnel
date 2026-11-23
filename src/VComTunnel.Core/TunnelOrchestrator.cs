@@ -406,6 +406,17 @@ public sealed class TunnelOrchestrator
             ?? throw new KeyNotFoundException($"Mapping '{id}' was not found.");
         var mapping = await ResolveWirelessSerialEndpointAsync(configuredMapping, cancellationToken).ConfigureAwait(false);
 
+        if (mapping.Backend == TunnelBackend.Pty)
+        {
+            StopEndpointConflicts(mapping);
+            StopExisting(mapping.Id);
+            return await StartManagedSessionAsync(
+                mapping,
+                () => new Com0comServiceTunnelSession(mapping, _log, (session, error) => OnSessionFaulted(mapping, session, error)),
+                cancellationToken,
+                logStartupFailure: logStartupFailure);
+        }
+
         if (mapping.Backend == TunnelBackend.Kmdf)
         {
             StopEndpointConflicts(mapping);
@@ -508,9 +519,9 @@ public sealed class TunnelOrchestrator
             return mapping;
         }
 
-        if (mapping.Backend != TunnelBackend.Com0comService)
+        if (mapping.Backend is not (TunnelBackend.Com0comService or TunnelBackend.Pty))
         {
-            _log.Warn(mapping.Name, "Wireless serial endpoint binding is only supported by the com0comService backend; using the saved endpoint.");
+            _log.Warn(mapping.Name, "Wireless serial endpoint binding requires a managed serial backend; using the saved endpoint.");
             return mapping;
         }
 
@@ -623,7 +634,7 @@ public sealed class TunnelOrchestrator
 
     private static bool IsMappingBoundToWirelessMac(TunnelMapping mapping, string normalizedMac)
     {
-        return mapping.Backend == TunnelBackend.Com0comService
+        return mapping.Backend is (TunnelBackend.Com0comService or TunnelBackend.Pty)
             && mapping.WirelessSerialAutoDiscover
             && string.Equals(
                 WirelessSerialEndpointRegistry.NormalizeMac(mapping.WirelessSerialMac),
@@ -1138,6 +1149,7 @@ public sealed class TunnelOrchestrator
         {
             TunnelBackend.Kmdf => "KMDF",
             TunnelBackend.Com0comService => "com0comService",
+            TunnelBackend.Pty => "pty",
             _ => backend.ToString()
         };
     }
@@ -1360,7 +1372,7 @@ public sealed class TunnelOrchestrator
             return new TunnelStatus(
                 Mapping.Id,
                 state,
-                Mapping.Backend.ToString(),
+                Mapping.Backend == TunnelBackend.Pty ? "pty" : Mapping.Backend.ToString(),
                 Process?.HasExited == false ? Process.Id : null,
                 StartedAt,
                 lastError,
